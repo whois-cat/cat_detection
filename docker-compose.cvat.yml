@@ -1,0 +1,21 @@
+services:
+  cvat_server:
+    environment:
+      CVAT_SHARE_URL: /home/django/share
+    volumes:
+      - ../data/frames:/home/django/share/frames
+      - ../data/cvat_exports:/home/django/share/exports
+
+  cvat_worker_import:
+    environment:
+      CVAT_SHARE_URL: /home/django/share
+    volumes:
+      - ../data/frames:/home/django/share/frames
+      - ../data/cvat_exports:/home/django/share/exports
+
+  cvat_worker_export:
+    environment:
+      CVAT_SHARE_URL: /home/django/share
+    volumes:
+      - ../data/frames:/home/django/share/frames
+      - ../data/cvat_exports:/home/django/share/exports

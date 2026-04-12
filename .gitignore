@@ -1,0 +1,8 @@
+cvat/
+data/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+__MACOSX/
+yolov8n.pt
