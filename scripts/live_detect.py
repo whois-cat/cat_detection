@@ -15,21 +15,31 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import time
+from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
-from pipeline_db import PROJECT_ROOT, connect_db, make_uid
+from pipeline_db import DEFAULT_MODEL_PATH, connect_db, make_uid
+from metrics import push_metric
 
 
 COCO_CAT_CLASS_ID = 15
 DEFAULT_YOLO_MODEL = "yolov8n.pt"
-DEFAULT_CLASSIFIER = PROJECT_ROOT / "data" / "models" / "cat_classifier_best.pt"
-DEFAULT_INTERVAL = 1.0
-DEFAULT_THRESHOLD = 0.6
+DEFAULT_CLASSIFIER = DEFAULT_MODEL_PATH
+DEFAULT_INTERVAL = float(os.environ.get("LIVE_INTERVAL", "1.0"))
+DEFAULT_THRESHOLD = float(os.environ.get("LIVE_THRESHOLD", "0.6"))
 DEFAULT_YOLO_CONFIDENCE = 0.3
+DEFAULT_VM_URL = os.environ.get("VM_URL", "http://victoriametrics:8428")
+DEFAULT_WEBHOOK: str | None = os.environ.get("WEBHOOK_URL") or None
+DEFAULT_WINDOW_SIZE = 5
+DEFAULT_WINDOW_MAJORITY = 4
+DEFAULT_COOLDOWN = 30
+MODEL_RELOAD_INTERVAL_SECONDS = 3600
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -94,7 +104,7 @@ def post_webhook(url: str, payload: dict) -> None:
 @click.option("--source", required=True, help="RTSP URL or camera device index.")
 @click.option(
     "--model",
-    type=click.Path(path_type=Path, exists=True, file_okay=True, dir_okay=False),
+    type=click.Path(path_type=Path, file_okay=True, dir_okay=False),
     default=DEFAULT_CLASSIFIER,
     show_default=True,
     help="Path to the trained classifier checkpoint.",
@@ -120,7 +130,35 @@ def post_webhook(url: str, payload: dict) -> None:
     show_default=True,
     help="Minimum classifier confidence to accept a prediction.",
 )
-@click.option("--webhook", type=str, default=None, help="POST JSON to this URL on match.")
+@click.option("--webhook", type=str, default=DEFAULT_WEBHOOK, help="POST JSON to this URL on match (default: $WEBHOOK_URL).")
+@click.option(
+    "--vm-url",
+    type=str,
+    default=DEFAULT_VM_URL,
+    show_default=True,
+    help="VictoriaMetrics push URL.",
+)
+@click.option(
+    "--window-size",
+    type=click.IntRange(min=1),
+    default=DEFAULT_WINDOW_SIZE,
+    show_default=True,
+    help="Number of recent predictions kept in the sliding window.",
+)
+@click.option(
+    "--window-majority",
+    type=click.IntRange(min=1),
+    default=DEFAULT_WINDOW_MAJORITY,
+    show_default=True,
+    help="Minimum predictions for the same cat to trigger a webhook.",
+)
+@click.option(
+    "--cooldown",
+    type=click.IntRange(min=0),
+    default=DEFAULT_COOLDOWN,
+    show_default=True,
+    help="Seconds before re-sending a webhook for the same cat.",
+)
 @click.option("--show", is_flag=True, help="Show video window with bboxes.")
 @click.option("--save-log", is_flag=True, help="Append detections to DuckDB.")
 def main(
@@ -130,6 +168,10 @@ def main(
     interval: float,
     threshold: float,
     webhook: str | None,
+    vm_url: str,
+    window_size: int,
+    window_majority: int,
+    cooldown: int,
     show: bool,
     save_log: bool,
 ) -> None:
@@ -142,6 +184,10 @@ def main(
         interval=interval,
         threshold=threshold,
         webhook=webhook,
+        vm_url=vm_url,
+        window_size=window_size,
+        window_majority=window_majority,
+        cooldown=cooldown,
         show=show,
         save_log=save_log,
     )
@@ -154,6 +200,10 @@ def run_live_detect(
     interval: float = DEFAULT_INTERVAL,
     threshold: float = DEFAULT_THRESHOLD,
     webhook: str | None = None,
+    vm_url: str = DEFAULT_VM_URL,
+    window_size: int = DEFAULT_WINDOW_SIZE,
+    window_majority: int = DEFAULT_WINDOW_MAJORITY,
+    cooldown: int = DEFAULT_COOLDOWN,
     show: bool = False,
     save_log: bool = False,
 ) -> None:
@@ -162,15 +212,29 @@ def run_live_detect(
     from PIL import Image
     from ultralytics import YOLO
 
+    _shutdown = False
+
+    def _handle_signal(signum, frame):
+        nonlocal _shutdown
+        _shutdown = True
+        click.echo("live: shutdown signal received")
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     device = select_device()
     click.echo(f"live: device={device}")
 
     detector = YOLO(yolo_model)
     detector.to(str(device))
 
+    model_path = Path(model_path)
     classifier, class_names = load_classifier(model_path, device)
     transform = build_classifier_transform()
     click.echo(f"live: classes={class_names}")
+
+    model_mtime = model_path.stat().st_mtime if model_path.exists() else 0.0
+    last_reload_wall = time.monotonic()
 
     resolved_source = resolve_source(source)
     capture = cv2.VideoCapture(resolved_source)
@@ -181,17 +245,35 @@ def run_live_detect(
 
     click.echo(
         f"live: source={source} interval={interval}s threshold={threshold} "
-        f"webhook={'on' if webhook else 'off'} show={show} save_log={save_log}"
+        f"window={window_size}/{window_majority} cooldown={cooldown}s "
+        f"webhook={'on' if webhook else 'off'} vm_url={vm_url} show={show} save_log={save_log}"
     )
+
+    # Sliding window state: (cat_name, confidence, x1, y1, x2, y2)
+    window: deque[tuple[str, float, int, int, int, int]] = deque(maxlen=window_size)
+    cooldown_until: dict[str, float] = {}
+    last_fired_cat: str | None = None
 
     last_check = 0.0
 
     try:
-        while True:
+        while not _shutdown:
             grabbed, frame_bgr = capture.read()
             if not grabbed:
                 click.echo("live: failed to read frame, stopping")
                 break
+
+            # Model hot-reload every 60 minutes if mtime changed
+            now_wall = time.monotonic()
+            if now_wall - last_reload_wall >= MODEL_RELOAD_INTERVAL_SECONDS and model_path.exists():
+                new_mtime = model_path.stat().st_mtime
+                if new_mtime != model_mtime:
+                    click.echo(f"live: reloading model from {model_path}")
+                    classifier, class_names = load_classifier(model_path, device)
+                    transform = build_classifier_transform()
+                    model_mtime = new_mtime
+                    click.echo(f"live: reloaded classes={class_names}")
+                last_reload_wall = now_wall
 
             now = time.perf_counter()
             if now - last_check < interval:
@@ -269,15 +351,41 @@ def run_live_detect(
                     f"confidence={top_confidence:.4f}"
                 )
 
-                payload = {
-                    "timestamp": timestamp.isoformat(),
-                    "cat_name": top_name,
-                    "confidence": top_confidence,
-                    "source": source,
-                }
+                # Per-frame metrics — unchanged
+                push_metric("cat_detected", 1.0, {"cat_name": top_name}, vm_url)
+                push_metric("cat_confidence", top_confidence, {"cat_name": top_name}, vm_url)
 
-                if webhook:
-                    post_webhook(webhook, payload)
+                # Sliding window
+                window.append((top_name, top_confidence, x1, y1, x2, y2))
+
+                if len(window) == window_size:
+                    counts = Counter(name for name, *_ in window)
+                    majority_cat, majority_count = counts.most_common(1)[0]
+                    if majority_count >= window_majority:
+                        cat_entries = [
+                            (conf, bx1, by1, bx2, by2)
+                            for name, conf, bx1, by1, bx2, by2 in window
+                            if name == majority_cat
+                        ]
+                        mean_conf = sum(c for c, *_ in cat_entries) / len(cat_entries)
+                        if mean_conf >= threshold:
+                            now_mono = time.monotonic()
+                            if majority_cat != last_fired_cat:
+                                cooldown_until[majority_cat] = 0.0
+                            if now_mono >= cooldown_until.get(majority_cat, 0.0):
+                                _, lx1, ly1, lx2, ly2 = cat_entries[-1]
+                                model_version = model_path.stat().st_mtime if model_path.exists() else 0
+                                payload = {
+                                    "timestamp": timestamp.isoformat(),
+                                    "cat_name": majority_cat,
+                                    "confidence": round(mean_conf, 4),
+                                    "model_version": str(int(model_version)),
+                                    "bbox": {"x": lx1, "y": ly1, "w": lx2 - lx1, "h": ly2 - ly1},
+                                }
+                                if webhook:
+                                    post_webhook(webhook, payload)
+                                cooldown_until[majority_cat] = now_mono + cooldown
+                                last_fired_cat = majority_cat
 
                 if connection is not None:
                     detection_uid = make_uid(
@@ -302,9 +410,8 @@ def run_live_detect(
                 cv2.imshow("live_detect", frame_bgr)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
-    except KeyboardInterrupt:
-        click.echo("live: interrupted")
     finally:
+        click.echo("live: shutting down")
         capture.release()
         if show:
             cv2.destroyAllWindows()

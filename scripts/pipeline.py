@@ -448,7 +448,7 @@ def scatter_groups_command(groups_dir: Path | None, crops_dir: Path | None) -> N
     "--output",
     type=click.Path(path_type=Path, file_okay=True, dir_okay=False),
     default=None,
-    help="Path to save the best model checkpoint. Defaults to data/models/cat_classifier_best.pt.",
+    help="Path to save the best model checkpoint. Defaults to models/cat_classifier_best.pt.",
 )
 def train_command(
     crops_dir: Path | None,
@@ -478,7 +478,7 @@ def train_command(
     "--model",
     type=click.Path(path_type=Path, exists=True, file_okay=True, dir_okay=False),
     default=None,
-    help="Path to the trained model checkpoint. Defaults to data/models/cat_classifier_best.pt.",
+    help="Path to the trained model checkpoint. Defaults to models/cat_classifier_best.pt.",
 )
 @click.option(
     "--input",
@@ -510,9 +510,9 @@ def predict_command(model: Path | None, input_path: Path, threshold: float) -> N
 @click.option("--source", required=True, help="RTSP URL or camera device index.")
 @click.option(
     "--model",
-    type=click.Path(path_type=Path, exists=True, file_okay=True, dir_okay=False),
+    type=click.Path(path_type=Path, file_okay=True, dir_okay=False),
     default=None,
-    help="Path to the trained classifier checkpoint. Defaults to data/models/cat_classifier_best.pt.",
+    help="Path to the trained classifier checkpoint. Defaults to models/cat_classifier_best.pt.",
 )
 @click.option(
     "--yolo",
@@ -536,6 +536,15 @@ def predict_command(model: Path | None, input_path: Path, threshold: float) -> N
     help="Minimum classifier confidence to accept a prediction.",
 )
 @click.option("--webhook", type=str, default=None, help="POST JSON to this URL on match.")
+@click.option(
+    "--vm-url",
+    type=str,
+    default=None,
+    help="VictoriaMetrics push URL (default: $VM_URL or http://victoriametrics:8428).",
+)
+@click.option("--window-size", type=click.IntRange(min=1), default=5, show_default=True, help="Sliding window size.")
+@click.option("--window-majority", type=click.IntRange(min=1), default=4, show_default=True, help="Majority threshold in window.")
+@click.option("--cooldown", type=click.IntRange(min=0), default=30, show_default=True, help="Seconds before re-sending webhook for same cat.")
 @click.option("--show", is_flag=True, help="Show video window with bboxes.")
 @click.option("--save-log", is_flag=True, help="Append detections to DuckDB.")
 def live_command(
@@ -545,12 +554,16 @@ def live_command(
     interval: float,
     threshold: float,
     webhook: str | None,
+    vm_url: str | None,
+    window_size: int,
+    window_majority: int,
+    cooldown: int,
     show: bool,
     save_log: bool,
 ) -> None:
     """Live cat detection from camera."""
 
-    from live_detect import DEFAULT_CLASSIFIER, run_live_detect
+    from live_detect import DEFAULT_CLASSIFIER, DEFAULT_VM_URL, run_live_detect
 
     run_live_detect(
         source=source,
@@ -559,9 +572,115 @@ def live_command(
         interval=interval,
         threshold=threshold,
         webhook=webhook,
+        vm_url=vm_url if vm_url is not None else DEFAULT_VM_URL,
+        window_size=window_size,
+        window_majority=window_majority,
+        cooldown=cooldown,
         show=show,
         save_log=save_log,
     )
+
+
+@cli.command("auto-label")
+@click.option(
+    "--threshold",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=0.8,
+    show_default=True,
+    help="Minimum confidence to accept; below → delete crop.",
+)
+def auto_label_command(threshold: float) -> None:
+    """Auto-label unsorted crops using the trained classifier."""
+
+    from auto_label import run_auto_label
+
+    run_auto_label(threshold=threshold)
+
+
+@cli.command("retrain")
+@click.option(
+    "--sample-videos",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Number of unprocessed videos to sample (uniform by date).",
+)
+@click.option(
+    "--auto-label-threshold",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=0.8,
+    show_default=True,
+    help="Confidence threshold for auto-labelling crops.",
+)
+def retrain_command(sample_videos: int, auto_label_threshold: float) -> None:
+    """Sample unprocessed videos and run the full retrain pipeline."""
+
+    import random
+
+    from auto_label import run_auto_label
+    from auto_crop_cats import run_auto_crop_cats
+    from build_cat_intervals import run_build_cat_intervals
+    from deduplicate_frames import run_deduplicate_crops, run_deduplicate_frames
+    from extract_interval_frames import run_extract_interval_frames
+    from pipeline_db import DEFAULT_RAW_VIDEOS_DIR, connect_db
+    from scan_cat_detections import run_scan_cat_detections
+    from train_classifier import run_train_classifier
+
+    connection = connect_db()
+    scanned_names = {
+        row[0]
+        for row in connection.execute("SELECT DISTINCT video_name FROM detections").fetchall()
+    }
+
+    all_videos = sorted(DEFAULT_RAW_VIDEOS_DIR.glob("*.mkv"))
+    unprocessed = [p for p in all_videos if p.name not in scanned_names]
+
+    if not unprocessed:
+        click.echo("retrain: no unprocessed videos found")
+        return
+
+    # Sample uniformly by date (use filename sort as date proxy since names encode date)
+    sample_size = min(sample_videos, len(unprocessed))
+    step = max(1, len(unprocessed) // sample_size)
+    sampled = [unprocessed[i] for i in range(0, len(unprocessed), step)][:sample_size]
+    random.shuffle(sampled)
+
+    click.echo(f"retrain: sampled {len(sampled)} of {len(unprocessed)} unprocessed videos")
+    for p in sampled:
+        click.echo(f"  {p.name}")
+
+    click.echo("retrain: scan")
+    run_scan_cat_detections(video_names=[p.name for p in sampled])
+    click.echo("retrain: intervals")
+    run_build_cat_intervals()
+    click.echo("retrain: frames")
+    run_extract_interval_frames()
+    click.echo("retrain: deduplicate frames")
+    run_deduplicate_frames()
+    click.echo("retrain: auto-crop")
+    run_auto_crop_cats()
+    click.echo("retrain: deduplicate crops")
+    run_deduplicate_crops()
+    click.echo("retrain: auto-label")
+    run_auto_label(threshold=auto_label_threshold)
+    click.echo("retrain: train")
+    run_train_classifier()
+    click.echo("retrain: done")
+
+
+@cli.command("stats")
+def stats_command() -> None:
+    """Print DuckDB table counts and crops per cat."""
+
+    from pipeline_db import DEFAULT_DB_PATH, connect_db, print_crop_stats
+
+    connection = connect_db()
+    for table in ["videos", "detections", "intervals", "frames", "crops"]:
+        count = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        click.echo(f"{table}: {count}")
+
+    click.echo("")
+    print_crop_stats()
 
 
 if __name__ == "__main__":

@@ -17,12 +17,11 @@ import torch
 from PIL import Image
 from torchvision import models, transforms
 
-from pipeline_db import PROJECT_ROOT
+from pipeline_db import DEFAULT_MODEL_PATH
 
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "data" / "models" / "cat_classifier_best.pt"
 DEFAULT_THRESHOLD = 0.5
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 

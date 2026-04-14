@@ -14,4 +14,8 @@ dependencies = [
     "imagehash>=4.3.0",
     "torch>=2.0.0",
     "torchvision>=0.15.0",
+    "opencv-python>=4.10.0",
+    "requests>=2.32.0",
+    "mlflow>=2.0.0",
+    "apache-airflow>=2.8.0",
 ]
