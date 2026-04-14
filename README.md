@@ -1,170 +1,279 @@
 # cat_detection
 
-## What this is
+Self-hosted system that learns to tell your cats apart using a security camera. It watches a live RTSP feed, identifies which cat is in frame, and sends a webhook, designed to work with autofeeder that need to know who's eating.
 
-A self-hosted system for detecting and identifying four cats — Alisa, Chuzh, Ellie, and Felisis — from an RTSP security camera. YOLO detects cat presence in the frame; a fine-tuned EfficientNet-B0 classifier identifies which cat it is. The system runs continuously, feeds detections to a webhook (e.g. an auto-feeder controller), retrains weekly from new footage, and stores all metrics in Grafana.
+Works with any number of cats. You label them once, and the system retrains itself weekly on new footage.
 
----
+## How it works
 
-## Architecture
+The system has three layers that run independently:
 
-| Component | Role | Profile |
-|---|---|---|
-| **ffmpeg** | Records RTSP stream → segmented `.mkv` files in `data/raw_videos/` | _(always on)_ |
-| **cat-live** | 24/7 live detection: YOLO → classifier → sliding window → webhook | `live` |
-| **Airflow** | Weekly retrain DAG: sample videos → scan → crop → auto-label → train | `airflow` |
-| **MLflow** | Tracks training experiments, logs metrics and model artifacts | `monitoring` |
-| **VictoriaMetrics** | Stores time-series metrics pushed by live detection and retrain | `monitoring` |
-| **Grafana** | Dashboards: detections per cat, confidence, model accuracy, crop counts | `monitoring` |
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  RECORDING (always on)                                          │
+│                                                                 │
+│  RTSP camera ──► ffmpeg ──► data/raw_videos/*.mkv               │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────┐
+│  WEEKLY RETRAIN (Airflow DAG)                                   │
+│                                                                 │
+│  Sample N new videos                                            │
+│    └► YOLO scan (find cat in frame)                             │
+│         └► Build time intervals                                 │
+│              └► Extract frames                                  │
+│                   └► Deduplicate (perceptual hash)              │
+│                        └► Auto-crop (YOLO bbox ──► cat cutouts) │
+│                             └► Auto-label (model classifies)    │
+│                                  └► Train (EfficientNet-B0)     │
+│                                       └► Log to MLflow          │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ updated model
+┌──────────────────────────────▼──────────────────────────────────┐
+│  LIVE DETECTION (24/7)                                          │
+│                                                                 │
+│  RTSP stream ──► YOLO ──► Crop ──► Classifier ──► Sliding      │
+│  (1 fps)        detect    bbox     which cat?     window        │
+│                                                     │           │
+│                                                     ▼           │
+│                                              Webhook POST       │
+│                                              → auto-feeder      │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-All services are defined in a single `docker-compose.yml` using [Compose profiles](https://docs.docker.com/compose/profiles/). `just up` starts everything.
+**Recording** — ffmpeg captures the camera and writes 2-hour MKV segments to disk continuously.
 
----
+**Weekly retrain** — An Airflow DAG picks N unprocessed videos, runs them through the pipeline, and retrains the classifier. The model labels new data itself (high-confidence predictions get auto-sorted into training folders), so it improves without manual work after the initial setup.
 
-## Quick start
+**Live detection** — Reads the camera at 1 fps. YOLO finds the cat, the classifier identifies it, and a sliding window smooths the predictions before sending a webhook. This prevents the feeder from getting conflicting signals frame-to-frame.
+
+## Stack
+
+| Tool | Purpose |
+|---|---|
+| **YOLOv8** | Detects cats in frames — pretrained on COCO, no training needed |
+| **EfficientNet-B0** | Classifies which cat — fine-tuned on your labeled crops |
+| **DuckDB** | Tracks pipeline state: which videos are processed, detections, frames |
+| **Airflow** | Orchestrates the weekly retrain pipeline |
+| **MLflow** | Logs training runs: accuracy, confusion matrix, model artifacts |
+| **VictoriaMetrics** | Stores time-series metrics (detections, confidence, model accuracy) |
+| **Grafana** | Dashboards: activity per cat, model health, detection confidence |
+| **CVAT** | Web-based annotation tool for initial manual labeling (optional) |
+| **Docker Compose** | Runs everything via profiles |
+| **uv** | Python dependency management |
+
+## Getting started
 
 ### Prerequisites
 
 - Docker + Docker Compose v2
 - Python 3.10+ and [uv](https://github.com/astral-sh/uv) (for local development)
-- RTSP camera
+- An RTSP camera (tested with Tapo C200)
+- [just](https://github.com/casey/just) command runner
+- At least 15 minutes of video footage with your cats
 
-### Setup
+### 1. Clone and configure
 
 ```bash
+git clone https://github.com/whois-cat/cat_detection.git
+cd cat_detection
 cp .env.example .env
-# Edit .env — at minimum set RTSP_URL and change passwords
+```
+
+Edit `.env` — set `RTSP_URL` to your camera and change default passwords.
+
+### 2. Initial training
+
+The system needs to learn your cats once. There are two paths:
+
+#### Option A: Quick method (no CVAT)
+
+Best when your cats are visually distinct.
+
+```bash
+# Install dependencies
+just setup
+
+# Put your .mkv video files into data/raw_videos/, then:
+just retrain --sample-videos 20
+
+# YOLO finds cats, crops them -> data/crops/unsorted/
+# Group similar crops by time proximity:
+uv run scripts/pipeline.py group-crops
+```
+
+Open `data/crops/groups/` in your file manager. Each `group_NNN` folder contains crops from one time cluster — usually the same cat. Look at the images and rename the folder to your cat's name (e.g. `group_001` → `mars`, `group_002` → `luna`). Skip groups where you can't tell or there's no cat.
+
+You can use any naming scheme. One folder per cat. Groups that contain the cat's name as a substring will be matched (e.g. `luna_1`, `luna_2` both map to `luna/`).
+
+```bash
+uv run scripts/pipeline.py scatter-groups
+uv run scripts/pipeline.py train
+```
+
+Aim for ~200 crops per cat. The training output shows a confusion matrix — if two cats are being confused, add more diverse crops of those two (different angles, lighting, distances).
+
+#### Option B: CVAT annotation
+
+Best when cats look similar and you need precise bounding boxes.
+
+```bash
+just setup
+
+# Process videos:
+uv run scripts/pipeline.py prepare
+
+# Start CVAT:
+just cvat-up
+just cvat-create-user
+# Open http://localhost:8080
+```
+
+In CVAT:
+1. Create a project with one label per cat
+2. Create a task, upload frames from `data/frames/` (via Connected file share or drag-and-drop)
+3. For each frame with a cat: draw a rectangle around the cat, select the label
+4. Export as **COCO 1.0** format, unzip into `data/cvat_exports/`
+
+```bash
+uv run scripts/pipeline.py import-annotations --export-json data/cvat_exports/your_task/instances_default.json
+uv run scripts/pipeline.py export-crops
+uv run scripts/pipeline.py train
+```
+
+Not every frame needs labeling. 300–500 frames with good variety (different cats, poses, lighting) is a solid start.
+
+### 3. Deploy
+
+```bash
 just build
 just up
 just status
 ```
 
-### First-time training
+This starts all services. You'll see:
 
-Before the weekly DAG can run, you need an initial labelled dataset:
-
-1. **Record footage** — ffmpeg is already writing to `data/raw_videos/`
-2. **Scan + crop** — detect cats and extract crops:
-   ```bash
-   uv run scripts/pipeline.py prepare    # scan → intervals → frames → dedup
-   uv run scripts/pipeline.py auto-crop  # YOLO crop from frames
-   uv run scripts/pipeline.py group-crops  # cluster unsorted crops by time
-   ```
-3. **Label** — open `data/crops/groups/` in Finder, rename group folders to cat names (e.g. `alisa`, `ellie`)
-4. **Scatter + train**:
-   ```bash
-   uv run scripts/pipeline.py scatter-groups  # move named groups → per-cat folders
-   uv run scripts/pipeline.py train
-   ```
-
-Run `just --list` to see all available commands.
-
----
-
-## Commands
-
-| Command | Description |
+| UI | URL |
 |---|---|
-| `just up` | Start all Docker services |
-| `just down` | Stop all Docker services |
-| `just build` | Build Docker images |
-| `just logs [service]` | Stream logs (all or one service) |
-| `just ps` | Show running containers |
-| `just status` | Running containers + UI URLs |
-| `just retrain` | Run full retrain pipeline locally |
-| `just predict` | Run classifier on an image or folder |
-| `just stats` | DuckDB row counts + crops per cat |
-| `just setup` | Install Python dependencies (`uv sync`) |
+| Airflow | http://localhost:8081 |
+| MLflow | http://localhost:5050 |
+| Grafana | http://localhost:3000 |
 
----
+Live detection starts immediately. Check it:
 
-## How retrain works
+```bash
+just logs cat-live
+```
 
-The Airflow DAG `cat_retrain` runs weekly and chains these steps:
+## How the retrain cycle works
 
-1. **Sample** — query DuckDB for videos with no detections yet, pick N uniformly by date
-2. **Scan** — run YOLO on sampled videos, write detections to DuckDB
-3. **Intervals** — merge nearby detections into time intervals
-4. **Frames** — extract JPEG frames from intervals
-5. **Dedup frames** — remove near-duplicate frames via perceptual hash
-6. **Auto-crop** — run YOLO on frames, save bboxes as crops to `data/crops/unsorted/`
-7. **Dedup crops** — remove near-duplicate crops
-8. **Auto-label** — run the classifier on unsorted crops; confident predictions (≥ 0.8) are moved to per-cat folders, the rest are deleted
-9. **Train** — fine-tune EfficientNet-B0 on all labelled crops, save to `models/cat_classifier_best.pt`, log to MLflow, push metrics to VictoriaMetrics
+The Airflow DAG `cat_retrain` runs every Monday and does the following:
 
-The same pipeline is available locally as `just retrain [--sample-videos N] [--auto-label-threshold 0.8]`.
+1. **Sample** — picks N unprocessed videos from `data/raw_videos/`, distributed evenly across dates
+2. **Scan** — YOLO scans each video at 5-second intervals, records timestamps where a cat appears
+3. **Intervals** — merges nearby detections into continuous time ranges (with padding)
+4. **Frames** — extracts 1 JPEG per second within each interval
+5. **Deduplicate** — removes near-identical frames using perceptual hashing
+6. **Auto-crop** — runs YOLO again on frames, saves tight crops of each cat
+7. **Deduplicate crops** — removes near-identical crops
+8. **Auto-label** — runs the current classifier on unlabeled crops. Crops predicted with ≥ 80% confidence are moved to the corresponding cat's training folder. Low-confidence crops are discarded
+9. **Train** — retrains the classifier on all labeled crops, logs metrics to MLflow, pushes results to VictoriaMetrics
 
----
+The same pipeline runs locally with `just retrain`.
 
 ## How live detection works
 
-```
-RTSP frame → YOLO (cat present?) → EfficientNet-B0 (which cat?) → sliding window → webhook
-```
+The `cat-live` container reads the RTSP stream at 1 frame per second:
 
-1. **YOLO** detects cat bounding boxes in the frame (class `cat`, COCO id 15)
-2. **Classifier** runs on each crop; if confidence ≥ `--threshold`, the prediction is logged and metrics are pushed to VictoriaMetrics
-3. **Sliding window** keeps the last N predictions (`--window-size`, default 5). When ≥ majority (`--window-majority`, default 4) predictions agree on the same cat and their mean confidence ≥ threshold, a webhook fires
-4. **Cooldown** — after firing, the same cat won't trigger another webhook for `--cooldown` seconds (default 30). If a different cat reaches majority, the cooldown resets and a new webhook fires immediately
-5. **Model hot-reload** — every 60 minutes the process checks if `models/cat_classifier_best.pt` was updated on disk; if so, it reloads without restarting
+1. **YOLO** checks if there's a cat in the frame
+2. **Classifier** identifies which cat from the cropped bounding box
+3. **Sliding window** (default: 5 frames) accumulates predictions. When 4 out of 5 agree on the same cat with sufficient confidence, that's a detection
+4. **Cooldown** (default: 30 seconds) prevents duplicate webhooks. If a different cat appears, cooldown resets
+5. **Model hot-reload** — every 60 minutes, checks if the model file was updated on disk and reloads it
 
----
+## Webhook
 
-## Webhook format
+When a cat is detected, a JSON POST is sent to `WEBHOOK_URL` (if configured):
 
 ```json
 {
-  "timestamp": "2025-04-13T14:32:01.123456+00:00",
-  "cat_name": "alisa",
-  "confidence": 0.9241,
+  "timestamp": "2026-04-13T14:32:01.123Z",
+  "cat_name": "mars",
+  "confidence": 0.92,
   "model_version": "1744552800",
   "bbox": {"x": 412, "y": 180, "w": 134, "h": 98}
 }
 ```
 
-`confidence` is the mean confidence of the majority cat across the window. `model_version` is the Unix mtime of the model file. `bbox` coordinates are in pixels relative to the original frame.
-
----
+The `confidence` is the mean across the sliding window. `model_version` is the file's Unix mtime. If `WEBHOOK_URL` is empty, detections are only logged to stdout and VictoriaMetrics.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and edit. All variables have defaults so `.env` is optional for local development.
+All variables are in `.env`. Everything has defaults — `.env` is optional for local development.
 
-| Variable | Default | Description |
+| Variable | Default | What it does |
 |---|---|---|
-| `RTSP_URL` | `rtsp://camera:password@192.168.0.213:554/stream1` | Camera stream URL |
-| `LIVE_INTERVAL` | `1.0` | Seconds between detection frames |
-| `LIVE_THRESHOLD` | `0.6` | Minimum classifier confidence |
-| `WEBHOOK_URL` | _(empty)_ | POST target for detections |
-| `AIRFLOW_ADMIN_PASSWORD` | `admin` | Airflow web UI password |
-| `GRAFANA_ADMIN_PASSWORD` | `admin` | Grafana web UI password |
-| `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow server (override for local scripts) |
-| `VM_URL` | `http://victoriametrics:8428` | VictoriaMetrics push URL |
-| `PUID` / `PGID` | `1000` | ffmpeg container filesystem permissions |
-| `VM_RETENTION` | `365d` | VictoriaMetrics data retention period |
+| `RTSP_URL` | — | Camera RTSP stream address |
+| `WEBHOOK_URL` | *(empty)* | Where to POST detections. Leave empty to just log |
+| `LIVE_INTERVAL` | `1.0` | Seconds between frames in live detection |
+| `LIVE_THRESHOLD` | `0.6` | Minimum confidence to consider a detection |
+| `RETRAIN_SAMPLE_VIDEOS` | `10` | How many new videos to process per retrain cycle |
+| `AUTO_LABEL_THRESHOLD` | `0.8` | Minimum confidence for auto-labeling crops |
+| `AIRFLOW_ADMIN_PASSWORD` | `admin` | Airflow UI login |
+| `GRAFANA_ADMIN_PASSWORD` | `admin` | Grafana UI login |
+| `VM_RETENTION` | `365d` | How long VictoriaMetrics keeps metrics |
 
----
+## Commands
+
+```
+just up              Start all services
+just down            Stop all services
+just build           Build Docker images
+just logs [service]  Stream logs
+just status          Running containers + UI links
+
+just retrain         Run full pipeline locally
+just predict         Test classifier on an image
+just stats           Show DB counts and crops per cat
+just setup           Install Python deps (uv sync)
+
+just cvat-up         Start CVAT for manual annotation
+just cvat-down       Stop CVAT
+```
 
 ## Project structure
 
 ```
-scripts/
-├── pipeline.py                   # CLI entry point — all pipeline commands
-├── pipeline_db.py                # Shared DB schema, constants, utilities
-├── scan_cat_detections.py        # YOLO scan of raw videos → detections table
-├── build_cat_intervals.py        # Merge detections → time intervals
-├── extract_interval_frames.py    # Extract JPEG frames from intervals
-├── deduplicate_frames.py         # Perceptual-hash dedup for frames and crops
-├── auto_crop_cats.py             # YOLO crop cats from frames → crops/unsorted/
-├── auto_label.py                 # Classify unsorted crops → move to per-cat folders
-├── group_crops.py                # Cluster unsorted crops into time-based groups
-├── scatter_groups.py             # Move named group folders → per-cat label folders
-├── train_classifier.py           # Fine-tune EfficientNet-B0 on labelled crops
-├── predict_cat.py                # Run classifier on image(s)
-├── live_detect.py                # 24/7 live detection with sliding window
-├── metrics.py                    # push_metric() → VictoriaMetrics
-├── export_cat_crops.py           # Export CVAT-annotated crops for training
-├── import_cvat_annotations.py    # Import CVAT COCO annotations into DuckDB
-├── assign_labels_from_folders.py # Sync crop labels from folder layout to DuckDB
-└── build_videos_index.py         # Build videos_index.csv from raw_videos/
+cat_detection/
+├── scripts/
+│   ├── pipeline.py                # CLI — all commands
+│   ├── pipeline_db.py             # DuckDB schema, shared utilities
+│   ├── scan_cat_detections.py     # YOLO scan videos → detections
+│   ├── build_cat_intervals.py     # Detections → time intervals
+│   ├── extract_interval_frames.py # Intervals → JPEG frames
+│   ├── deduplicate_frames.py      # Perceptual hash dedup (frames + crops)
+│   ├── auto_crop_cats.py          # YOLO → crop cat from frame
+│   ├── auto_label.py              # Classify unsorted crops → sort into folders
+│   ├── group_crops.py             # Cluster crops by time
+│   ├── scatter_groups.py          # Named folders → per-cat training dirs
+│   ├── train_classifier.py        # Fine-tune EfficientNet-B0
+│   ├── predict_cat.py             # Run classifier on images
+│   ├── live_detect.py             # 24/7 detection with sliding window
+│   ├── metrics.py                 # Push metrics to VictoriaMetrics
+│   ├── import_cvat_annotations.py # Import COCO JSON from CVAT
+│   ├── export_cat_crops.py        # Crop from CVAT annotations
+│   └── build_videos_index.py      # Video metadata CSV
+├── dags/
+│   └── retrain_dag.py             # Airflow weekly DAG
+├── grafana/provisioning/          # Auto-provisioned datasource + dashboard
+├── models/                        # Trained classifier
+├── data/
+│   ├── raw_videos/                # MKV from camera
+│   ├── frames/                    # Extracted JPEGs
+│   ├── crops/                     # Per-cat training images
+│   └── metadata/                  # DuckDB, indexes
+├── docker-compose.yml             # All services (profiles)
+├── Dockerfile.pipeline            # Shared image
+├── .env.example                   # Configuration template
+└── justfile                       # Command runner
 ```
