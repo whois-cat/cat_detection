@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import random
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,54 +18,7 @@ DEFAULT_ARGS = {
 }
 
 VM_URL = os.environ.get("VM_URL", "http://victoriametrics:8428")
-SAMPLE_VIDEOS = 10
 AUTO_LABEL_THRESHOLD = 0.8
-
-
-def _sample_and_scan() -> None:
-    from pipeline_db import DEFAULT_RAW_VIDEOS_DIR, connect_db
-    from scan_cat_detections import run_scan_cat_detections
-
-    connection = connect_db()
-    scanned_names = {
-        row[0]
-        for row in connection.execute("SELECT DISTINCT video_name FROM detections").fetchall()
-    }
-
-    all_videos = sorted(DEFAULT_RAW_VIDEOS_DIR.glob("*.mkv"))
-    unprocessed = [p for p in all_videos if p.name not in scanned_names]
-
-    if not unprocessed:
-        print("sample_and_scan: no unprocessed videos")
-        return
-
-    sample_size = min(SAMPLE_VIDEOS, len(unprocessed))
-    step = max(1, len(unprocessed) // sample_size)
-    sampled = [unprocessed[i] for i in range(0, len(unprocessed), step)][:sample_size]
-    random.shuffle(sampled)
-
-    print(f"sample_and_scan: sampled {len(sampled)} videos")
-    run_scan_cat_detections(video_names=[p.name for p in sampled])
-
-
-def _build_intervals() -> None:
-    from build_cat_intervals import run_build_cat_intervals
-    run_build_cat_intervals()
-
-
-def _extract_frames() -> None:
-    from extract_interval_frames import run_extract_interval_frames
-    run_extract_interval_frames()
-
-
-def _deduplicate_frames() -> None:
-    from deduplicate_frames import run_deduplicate_frames
-    run_deduplicate_frames()
-
-
-def _auto_crop() -> None:
-    from auto_crop_cats import run_auto_crop_cats
-    run_auto_crop_cats()
 
 
 def _dedup_crops() -> None:
@@ -194,13 +146,8 @@ with DAG(
     tags=["cat_detection"],
 ) as dag:
 
-    t1 = PythonOperator(task_id="sample_and_scan", python_callable=_sample_and_scan)
-    t2 = PythonOperator(task_id="build_intervals", python_callable=_build_intervals)
-    t3 = PythonOperator(task_id="extract_frames", python_callable=_extract_frames)
-    t4 = PythonOperator(task_id="deduplicate_frames", python_callable=_deduplicate_frames)
-    t5 = PythonOperator(task_id="auto_crop", python_callable=_auto_crop)
-    t6 = PythonOperator(task_id="dedup_crops", python_callable=_dedup_crops)
-    t7 = PythonOperator(task_id="auto_label", python_callable=_auto_label)
-    t8 = PythonOperator(task_id="train_and_log", python_callable=_train_and_log)
+    t1 = PythonOperator(task_id="dedup_crops", python_callable=_dedup_crops)
+    t2 = PythonOperator(task_id="auto_label", python_callable=_auto_label)
+    t3 = PythonOperator(task_id="train_and_log", python_callable=_train_and_log)
 
-    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8
+    t1 >> t2 >> t3

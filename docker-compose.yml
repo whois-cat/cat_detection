@@ -1,24 +1,5 @@
 services:
 
-  # ── ffmpeg (no profile — always included) ───────────────────────────────────
-  ffmpeg:
-    image: linuxserver/ffmpeg:latest
-    environment:
-      PUID: ${PUID:-1000}
-      PGID: ${PGID:-1000}
-    volumes:
-      - ./data/raw_videos:/data/raw_videos
-    command: >
-      -rtsp_transport tcp
-      -i ${RTSP_URL:-rtsp://camera:password@192.168.0.213:554/stream1}
-      -c copy
-      -f segment
-      -segment_time 600
-      -segment_format mkv
-      -strftime 1
-      /data/raw_videos/%Y-%m-%d_%H-%M-%S.mkv
-    restart: unless-stopped
-
   # ── Airflow (profile: airflow) ───────────────────────────────────────────────
   airflow-init:
     profiles: [airflow]
@@ -35,7 +16,7 @@ services:
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
       _AIRFLOW_WWW_USER_USERNAME: admin
       _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
-      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5050}
       VM_URL: ${VM_URL:-http://victoriametrics:8428}
     volumes: &airflow-vols
       - ./dags:/app/dags
@@ -49,7 +30,7 @@ services:
     profiles: [airflow]
     build: {context: ., dockerfile: Dockerfile.pipeline}
     command: airflow api-server --port 8080
-    ports: ["8081:8080"]
+    ports: ["${PORT_AIRFLOW:-9081}:8080"]
     environment: *airflow-env
     volumes: *airflow-vols
     depends_on:
@@ -75,17 +56,34 @@ services:
     command: >
       python scripts/live_detect.py
       --source ${RTSP_URL:-rtsp://camera:password@192.168.0.213:554/stream1}
-      --interval ${LIVE_INTERVAL:-1.0}
+      --inference-fps ${INFERENCE_FPS:-5}
       --threshold ${LIVE_THRESHOLD:-0.6}
       --vm-url ${VM_URL:-http://victoriametrics:8428}
+      --reclassify-every ${RECLASSIFY_EVERY:-30}
+      --snapshot-retention-days ${MULTI_CAT_SNAPSHOT_RETENTION_DAYS:-30}
+      --web-port ${WEB_PORT:-0}
+      --crop-save-cooldown ${CROP_SAVE_COOLDOWN:-10}
+      --crop-retention-days ${CROP_RETENTION_DAYS:-60}
+      --door-close-timeout ${DOOR_CLOSE_TIMEOUT_SEC:-30}
+    ports:
+      - "${WEB_PORT:-0}:${WEB_PORT:-0}"
     volumes:
       - ./models:/app/models:ro
       - ./scripts:/app/scripts:ro
       - ./yolov8n.pt:/app/yolov8n.pt:ro
+      - ./data:/app/data
     environment:
       RTSP_URL: ${RTSP_URL:-rtsp://camera:password@192.168.0.213:554/stream1}
-      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      FEEDER_API_URL: ${FEEDER_API_URL:-}
+      DOOR_CLOSE_TIMEOUT_SEC: ${DOOR_CLOSE_TIMEOUT_SEC:-30}
       VM_URL: ${VM_URL:-http://victoriametrics:8428}
+      FEEDER_ALLOWED_CATS: ${FEEDER_ALLOWED_CATS:-}
+      INFERENCE_FPS: ${INFERENCE_FPS:-5}
+      RECLASSIFY_EVERY: ${RECLASSIFY_EVERY:-30}
+      WEB_PORT: ${WEB_PORT:-0}
+      MULTI_CAT_SNAPSHOT_RETENTION_DAYS: ${MULTI_CAT_SNAPSHOT_RETENTION_DAYS:-30}
+      CROP_SAVE_COOLDOWN: ${CROP_SAVE_COOLDOWN:-10}
+      CROP_RETENTION_DAYS: ${CROP_RETENTION_DAYS:-60}
     restart: unless-stopped
 
   # ── Monitoring (profile: monitoring) ────────────────────────────────────────
@@ -96,14 +94,14 @@ services:
       mlflow server --host 0.0.0.0 --port 5050
       --backend-store-uri sqlite:////app/data/mlflow/mlflow.db
       --default-artifact-root /app/data/mlflow/artifacts
-    ports: ["5050:5050"]
+    ports: ["${PORT_MLFLOW:-9050}:5050"]
     volumes: [./data:/app/data]
     restart: unless-stopped
 
   victoriametrics:
     profiles: [monitoring]
     image: victoriametrics/victoria-metrics:latest
-    ports: ["8428:8428"]
+    ports: ["${PORT_VICTORIAMETRICS:-9428}:8428"]
     volumes: [vm_data:/victoria-metrics-data]
     command: -retentionPeriod=${VM_RETENTION:-365d}
     restart: unless-stopped
@@ -111,7 +109,7 @@ services:
   grafana:
     profiles: [monitoring]
     image: grafana/grafana:latest
-    ports: ["3000:3000"]
+    ports: ["${PORT_GRAFANA:-9300}:3000"]
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_AUTH_ANONYMOUS_ENABLED: "true"

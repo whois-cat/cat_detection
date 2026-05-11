@@ -599,66 +599,19 @@ def auto_label_command(threshold: float) -> None:
 
 @cli.command("retrain")
 @click.option(
-    "--sample-videos",
-    type=click.IntRange(min=1),
-    default=10,
-    show_default=True,
-    help="Number of unprocessed videos to sample (uniform by date).",
-)
-@click.option(
     "--auto-label-threshold",
     type=click.FloatRange(min=0.0, max=1.0),
     default=0.8,
     show_default=True,
     help="Confidence threshold for auto-labelling crops.",
 )
-def retrain_command(sample_videos: int, auto_label_threshold: float) -> None:
-    """Sample unprocessed videos and run the full retrain pipeline."""
-
-    import random
+def retrain_command(auto_label_threshold: float) -> None:
+    """Run the retrain pipeline starting from data/crops/unsorted/."""
 
     from auto_label import run_auto_label
-    from auto_crop_cats import run_auto_crop_cats
-    from build_cat_intervals import run_build_cat_intervals
-    from deduplicate_frames import run_deduplicate_crops, run_deduplicate_frames
-    from extract_interval_frames import run_extract_interval_frames
-    from pipeline_db import DEFAULT_RAW_VIDEOS_DIR, connect_db
-    from scan_cat_detections import run_scan_cat_detections
+    from deduplicate_frames import run_deduplicate_crops
     from train_classifier import run_train_classifier
 
-    connection = connect_db()
-    scanned_names = {
-        row[0]
-        for row in connection.execute("SELECT DISTINCT video_name FROM detections").fetchall()
-    }
-
-    all_videos = sorted(DEFAULT_RAW_VIDEOS_DIR.glob("*.mkv"))
-    unprocessed = [p for p in all_videos if p.name not in scanned_names]
-
-    if not unprocessed:
-        click.echo("retrain: no unprocessed videos found")
-        return
-
-    # Sample uniformly by date (use filename sort as date proxy since names encode date)
-    sample_size = min(sample_videos, len(unprocessed))
-    step = max(1, len(unprocessed) // sample_size)
-    sampled = [unprocessed[i] for i in range(0, len(unprocessed), step)][:sample_size]
-    random.shuffle(sampled)
-
-    click.echo(f"retrain: sampled {len(sampled)} of {len(unprocessed)} unprocessed videos")
-    for p in sampled:
-        click.echo(f"  {p.name}")
-
-    click.echo("retrain: scan")
-    run_scan_cat_detections(video_names=[p.name for p in sampled])
-    click.echo("retrain: intervals")
-    run_build_cat_intervals()
-    click.echo("retrain: frames")
-    run_extract_interval_frames()
-    click.echo("retrain: deduplicate frames")
-    run_deduplicate_frames()
-    click.echo("retrain: auto-crop")
-    run_auto_crop_cats()
     click.echo("retrain: deduplicate crops")
     run_deduplicate_crops()
     click.echo("retrain: auto-label")

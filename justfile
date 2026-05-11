@@ -23,15 +23,20 @@ ps:
 status:
     @docker compose --profile airflow --profile live --profile monitoring ps
     @echo ""
-    @echo "Airflow:  http://localhost:8081"
-    @echo "MLflow:   http://localhost:5000"
-    @echo "Grafana:  http://localhost:3000"
+    @echo "Airflow:  http://localhost:${PORT_AIRFLOW:-19081}"
+    @echo "MLflow:   http://localhost:${PORT_MLFLOW:-19050}"
+    @echo "Grafana:  http://localhost:${PORT_GRAFANA:-19300}"
+    @echo "Web view: http://localhost:${WEB_PORT:-19082}  (requires WEB_PORT set)"
 
 # Build Docker images
 build:
     docker compose --profile airflow --profile live --profile monitoring build
 
 # === Local ===
+
+# Run live detection locally (no Docker)
+live *args:
+    uv run scripts/live_detect.py {{args}}
 
 # Run full retrain pipeline locally
 retrain *args:

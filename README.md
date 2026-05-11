@@ -2,7 +2,7 @@
 
 ## What this is
 
-A self-hosted system for detecting and identifying four cats — Alisa, Chuzh, Ellie, and Felisis — from an RTSP security camera. YOLO detects cat presence in the frame; a fine-tuned EfficientNet-B0 classifier identifies which cat it is. The system runs continuously, feeds detections to a webhook (e.g. an auto-feeder controller), retrains weekly from new footage, and stores all metrics in Grafana.
+A self-hosted system for detecting and identifying four cats — Alisa, Chuzh, Ellie, and Felisis — from an RTSP security camera. YOLO + ByteTrack tracks each cat across frames with a stable ID; a fine-tuned EfficientNet-B0 classifier identifies which cat it is per track. The system runs continuously, drives an auto-feeder via REST API, retrains weekly from live crops, stores all metrics in Grafana, and optionally streams annotated video over MJPEG.
 
 ---
 
@@ -10,9 +10,8 @@ A self-hosted system for detecting and identifying four cats — Alisa, Chuzh, E
 
 | Component | Role | Profile |
 |---|---|---|
-| **ffmpeg** | Records RTSP stream → segmented `.mkv` files in `data/raw_videos/` | _(always on)_ |
-| **cat-live** | 24/7 live detection: YOLO → classifier → sliding window → webhook | `live` |
-| **Airflow** | Weekly retrain DAG: sample videos → scan → crop → auto-label → train | `airflow` |
+| **cat-live** | 24/7 live detection: YOLO → classifier → sliding window → door state machine; saves crops to `data/crops/unsorted/` | `live` |
+| **Airflow** | Weekly retrain DAG: dedup crops → auto-label → train | `airflow` |
 | **MLflow** | Tracks training experiments, logs metrics and model artifacts | `monitoring` |
 | **VictoriaMetrics** | Stores time-series metrics pushed by live detection and retrain | `monitoring` |
 | **Grafana** | Dashboards: detections per cat, confidence, model accuracy, crop counts | `monitoring` |
@@ -43,15 +42,13 @@ just status
 
 Before the weekly DAG can run, you need an initial labelled dataset:
 
-1. **Record footage** — ffmpeg is already writing to `data/raw_videos/`
-2. **Scan + crop** — detect cats and extract crops:
+1. **Let cat-live run** — it saves crops to `data/crops/unsorted/` automatically.
+2. **Group + label** — cluster unsorted crops by time and rename to cat names:
    ```bash
-   uv run scripts/pipeline.py prepare    # scan → intervals → frames → dedup
-   uv run scripts/pipeline.py auto-crop  # YOLO crop from frames
    uv run scripts/pipeline.py group-crops  # cluster unsorted crops by time
    ```
-3. **Label** — open `data/crops/groups/` in Finder, rename group folders to cat names (e.g. `alisa`, `ellie`)
-4. **Scatter + train**:
+   Open `data/crops/groups/` in Finder, rename group folders to cat names (e.g. `alisa`, `ellie`).
+3. **Scatter + train**:
    ```bash
    uv run scripts/pipeline.py scatter-groups  # move named groups → per-cat folders
    uv run scripts/pipeline.py train
@@ -80,49 +77,52 @@ Run `just --list` to see all available commands.
 
 ## How retrain works
 
-The Airflow DAG `cat_retrain` runs weekly and chains these steps:
+`cat-live` continuously saves bbox crops to `data/crops/unsorted/` as cats are detected. The Airflow DAG `cat_retrain` runs weekly and chains these steps:
 
-1. **Sample** — query DuckDB for videos with no detections yet, pick N uniformly by date
-2. **Scan** — run YOLO on sampled videos, write detections to DuckDB
-3. **Intervals** — merge nearby detections into time intervals
-4. **Frames** — extract JPEG frames from intervals
-5. **Dedup frames** — remove near-duplicate frames via perceptual hash
-6. **Auto-crop** — run YOLO on frames, save bboxes as crops to `data/crops/unsorted/`
-7. **Dedup crops** — remove near-duplicate crops
-8. **Auto-label** — run the classifier on unsorted crops; confident predictions (≥ 0.8) are moved to per-cat folders, the rest are deleted
-9. **Train** — fine-tune EfficientNet-B0 on all labelled crops, save to `models/cat_classifier_best.pt`, log to MLflow, push metrics to VictoriaMetrics
+1. **Dedup crops** — remove near-duplicate crops via perceptual hash
+2. **Auto-label** — run the classifier on unsorted crops; confident predictions (≥ 0.8) are moved to per-cat folders, the rest are deleted
+3. **Train** — fine-tune EfficientNet-B0 on all labelled crops, save to `models/cat_classifier_best.pt`, log to MLflow, push metrics to VictoriaMetrics
 
-The same pipeline is available locally as `just retrain [--sample-videos N] [--auto-label-threshold 0.8]`.
+The same pipeline is available locally as `just retrain [--auto-label-threshold 0.8]`.
 
 ---
 
 ## How live detection works
 
 ```
-RTSP frame → YOLO (cat present?) → EfficientNet-B0 (which cat?) → sliding window → webhook
+RTSP frames (camera rate)
+  └─ capture thread ──────────────────────────────────────────── display FPS counter
+  └─ inference loop (--inference-fps, default 5/s)
+       └─ YOLO + ByteTrack  → per-track IDs
+            └─ classifier gated on detection (per track, every --reclassify-every frames)
+                 └─ per-track sliding window → door state machine → feeder API
 ```
 
-1. **YOLO** detects cat bounding boxes in the frame (class `cat`, COCO id 15)
-2. **Classifier** runs on each crop; if confidence ≥ `--threshold`, the prediction is logged and metrics are pushed to VictoriaMetrics
-3. **Sliding window** keeps the last N predictions (`--window-size`, default 5). When ≥ majority (`--window-majority`, default 4) predictions agree on the same cat and their mean confidence ≥ threshold, a webhook fires
-4. **Cooldown** — after firing, the same cat won't trigger another webhook for `--cooldown` seconds (default 30). If a different cat reaches majority, the cooldown resets and a new webhook fires immediately
-5. **Model hot-reload** — every 60 minutes the process checks if `models/cat_classifier_best.pt` was updated on disk; if so, it reloads without restarting
+1. **ByteTrack** (`model.track(persist=True)`) assigns a stable numeric `track_id` to each cat across frames. The classifier only runs when YOLO returns ≥1 detection with an assigned track.
+2. **Per-track classification** — each track is classified on first sight, then re-classified every `--reclassify-every` inference frames (default 30) or when confidence drops below `--threshold`.
+3. **Per-track sliding window** — each track keeps its own window of N confident predictions (`--window-size`, default 5). Window majority drives the door state machine.
+4. **Door state machine** — evaluated every inference tick:
+   - **Multi-cat** (>1 active track) → close door; counter `cat_detection_multi_cat_events_total` incremented, annotated frame saved to `data/multi_cat_snapshots/`.
+   - **Blocked cat** (any active track classified as not in allowlist, e.g. `felisis`) → close door; counter `cat_detection_blocked_events_total{cat="..."}` incremented.
+   - **Single allowed cat with window majority** → open door.
+   - **No cats for ≥ `DOOR_CLOSE_TIMEOUT_SEC`** → close door.
+   - Otherwise → no change (wait for more evidence).
+5. **Idempotent** — the door is only called when the desired state differs from the last known state. Resync from `GET /api/status` every 60 seconds in the background.
+6. **Model hot-reload** — every 60 minutes if `models/cat_classifier_best.pt` mtime changes, reloads without restarting.
 
 ---
 
-## Webhook format
+## Feeder API integration
 
-```json
-{
-  "timestamp": "2025-04-13T14:32:01.123456+00:00",
-  "cat_name": "alisa",
-  "confidence": 0.9241,
-  "model_version": "1744552800",
-  "bbox": {"x": 412, "y": 180, "w": 134, "h": 98}
-}
-```
+`live_detect.py` calls the feeder's REST API directly. Set `FEEDER_API_URL` to the feeder's base URL (e.g. `http://192.168.0.50:8000`). Leave it unset to run detection-only with no feeder control.
 
-`confidence` is the mean confidence of the majority cat across the window. `model_version` is the Unix mtime of the model file. `bbox` coordinates are in pixels relative to the original frame.
+| Endpoint | When called |
+|---|---|
+| `POST /api/door/open` | Single allowed cat reaches sliding-window majority |
+| `POST /api/door/close` | Multi-cat, blocked cat, or no cat for ≥ `DOOR_CLOSE_TIMEOUT_SEC` |
+| `GET /api/status` | On startup (to sync initial state) and every 60 s (background resync) |
+
+Calls use a 3 s timeout and retry once on connection error or 5xx. On failure the local state is not updated, so the next inference tick retries automatically.
 
 ---
 
@@ -133,15 +133,36 @@ Copy `.env.example` to `.env` and edit. All variables have defaults so `.env` is
 | Variable | Default | Description |
 |---|---|---|
 | `RTSP_URL` | `rtsp://camera:password@192.168.0.213:554/stream1` | Camera stream URL |
-| `LIVE_INTERVAL` | `1.0` | Seconds between detection frames |
 | `LIVE_THRESHOLD` | `0.6` | Minimum classifier confidence |
-| `WEBHOOK_URL` | _(empty)_ | POST target for detections |
+| `INFERENCE_FPS` | `5` | Inference loop rate (detector + tracker ticks/sec) |
+| `RECLASSIFY_EVERY` | `30` | Re-run classifier on a track every N inference frames |
+| `FEEDER_API_URL` | _(empty = disabled)_ | Base URL of the feeder REST API (e.g. `http://192.168.0.50:8000`) |
+| `DOOR_CLOSE_TIMEOUT_SEC` | `30` | Seconds with no cat before closing the door |
+| `FEEDER_ALLOWED_CATS` | _(empty = all except felisis)_ | Comma-separated cat allowlist for the feeder |
+| `MULTI_CAT_SNAPSHOT_RETENTION_DAYS` | `30` | Delete multi-cat snapshot JPEGs older than N days |
+| `CROP_SAVE_COOLDOWN` | `10` | Seconds between saved crops per track for known (confident) cats |
+| `CROP_RETENTION_DAYS` | `60` | Delete live-detection crops older than N days |
+| `WEB_PORT` | _(unset = off)_ | Set to a port number (e.g. `8082`) to enable the MJPEG web viewer |
 | `AIRFLOW_ADMIN_PASSWORD` | `admin` | Airflow web UI password |
 | `GRAFANA_ADMIN_PASSWORD` | `admin` | Grafana web UI password |
 | `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow server (override for local scripts) |
 | `VM_URL` | `http://victoriametrics:8428` | VictoriaMetrics push URL |
-| `PUID` / `PGID` | `1000` | ffmpeg container filesystem permissions |
 | `VM_RETENTION` | `365d` | VictoriaMetrics data retention period |
+
+## Web viewer
+
+When `WEB_PORT` is set to a positive integer (e.g. `WEB_PORT=8082`), `live_detect.py` starts an MJPEG server on that port:
+
+| Endpoint | Description |
+|---|---|
+| `GET /` | HTML page with embedded live stream and stats |
+| `GET /stream.mjpg` | MJPEG stream of annotated frames (no double inference) |
+| `GET /health` | `{"ok": true}` |
+| `GET /stats.json` | Current FPS, active tracks, last 10 detections, uptime |
+
+The stream is decoupled via a `Queue(maxsize=1)` — frames are dropped rather than buffered when the viewer is slow.
+
+**Optional WebRTC sidecar**: for sub-second latency add a [go2rtc](https://github.com/AlexxIT/go2rtc) container pointing at `http://cat-live:8082/stream.mjpg` as an RTSP/MJPEG source and expose the WebRTC endpoint. go2rtc handles the protocol conversion; `live_detect.py` stays unchanged.
 
 ---
 
@@ -151,20 +172,22 @@ Copy `.env.example` to `.env` and edit. All variables have defaults so `.env` is
 scripts/
 ├── pipeline.py                   # CLI entry point — all pipeline commands
 ├── pipeline_db.py                # Shared DB schema, constants, utilities
-├── scan_cat_detections.py        # YOLO scan of raw videos → detections table
-├── build_cat_intervals.py        # Merge detections → time intervals
-├── extract_interval_frames.py    # Extract JPEG frames from intervals
 ├── deduplicate_frames.py         # Perceptual-hash dedup for frames and crops
-├── auto_crop_cats.py             # YOLO crop cats from frames → crops/unsorted/
 ├── auto_label.py                 # Classify unsorted crops → move to per-cat folders
 ├── group_crops.py                # Cluster unsorted crops into time-based groups
 ├── scatter_groups.py             # Move named group folders → per-cat label folders
 ├── train_classifier.py           # Fine-tune EfficientNet-B0 on labelled crops
 ├── predict_cat.py                # Run classifier on image(s)
-├── live_detect.py                # 24/7 live detection with sliding window
+├── live_detect.py                # 24/7 live detection with sliding window + crop saving
 ├── metrics.py                    # push_metric() → VictoriaMetrics
 ├── export_cat_crops.py           # Export CVAT-annotated crops for training
 ├── import_cvat_annotations.py    # Import CVAT COCO annotations into DuckDB
 ├── assign_labels_from_folders.py # Sync crop labels from folder layout to DuckDB
-└── build_videos_index.py         # Build videos_index.csv from raw_videos/
+│
+│   # Unused — these processed raw videos recorded by ffmpeg (removed):
+├── scan_cat_detections.py        # (unused) YOLO scan of raw videos → detections table
+├── build_cat_intervals.py        # (unused) Merge detections → time intervals
+├── extract_interval_frames.py    # (unused) Extract JPEG frames from intervals
+├── auto_crop_cats.py             # (unused) YOLO crop cats from frames → crops/unsorted/
+└── build_videos_index.py         # (unused) Build videos_index.csv from raw_videos/
 ```
