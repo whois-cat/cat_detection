@@ -1,0 +1,43 @@
+# Per-camera configuration. Single source of truth — everything else
+# (mediamtx paths, docker-compose detector services, webui nginx routing,
+# the UI's camera picker) is generated from this file by tools/configure.py.
+#
+# Workflow:
+#   cp cameras.yaml.example cameras.yaml
+#   $EDITOR cameras.yaml
+#   just configure         # regenerates derived files
+#   just devserver         # docker compose up
+#
+# Field reference per camera:
+#   id              — short slug. Used as mediamtx path name, recordings
+#                     subdir name, CAMERA_ID tag on events, and routing
+#                     prefix in webui (/detector/<id>/, /whep/<id>/).
+#                     Must match [a-z0-9-]+.
+#   rtsp            — full RTSP URL (with credentials). Don't quote.
+#   label           — optional pretty name for the UI picker. Defaults to
+#                     a title-cased version of `id`.
+#   detector_type   — "blob" or "yolo".
+#   yolo_weights    — path inside container (default works for the baked
+#                     INT8 IR).
+#   yolo_conf       — YOLO confidence threshold.
+#   rotate_deg      — internal-to-model rotation, 0/90/180/270.
+#   detect_roi      — camera-coord rectangle, "x0,y0,x1,y1" in [0..1].
+#   action_polygon  — camera-coord polygon (rect or N-vertex; see .env.example).
+#   blob_bright_threshold, blob_min_area — for DETECTOR_TYPE=blob.
+#   artificial_delay_ms — initial value for the UI delay slider.
+#
+# Globals at the top apply to all cameras.
+
+webrtc_host: 192.168.0.10        # public IP/host the browser dials for WebRTC ICE
+
+cameras:
+  - id: living
+    label: Living room
+    rtsp: rtsp://camera:CHANGEME@192.168.0.214:554/stream1
+    detector_type: yolo
+    rotate_deg: 0
+
+  - id: kitchen
+    rtsp: rtsp://camera:CHANGEME@192.168.0.215:554/stream1
+    detector_type: yolo
+    rotate_deg: 90

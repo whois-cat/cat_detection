@@ -1,8 +1,9 @@
 # live2 — single-decode video + detection pipeline
 
-A self-hosted cat-detection setup whose entire job is: ingest one camera's
-H.264 once, decode it once, run detection, and surface both **live** and
-**historical** detections in a browser UI without ever re-encoding video.
+A self-hosted cat-detection setup. Ingests **one or more cameras'** H.264
+streams once via mediamtx, decodes each once inside a per-camera detector
+container, and surfaces both **live** and **historical** detections in a
+browser UI — without ever re-encoding video.
 
 ```
 camera RTSP ──► mediamtx ─┬── WebRTC (WHEP)            ──► browser <video>
@@ -34,21 +35,34 @@ does it look like that" doc. This file is just the "how do I run it".
 ## Run
 
 ```bash
-cp .env.example .env
-# Edit RTSP_URL and WEBRTC_HOST at minimum
-just devserver        # vite HMR + watchfiles detector
-# or: docker compose up -d --build
+cp .env.example   .env             # WEB_PORT + pruner knobs
+cp cameras.yaml.example cameras.yaml
+# Edit cameras.yaml — at minimum: webrtc_host, and one RTSP URL per camera.
+just devserver                     # runs `just configure` then docker compose up
+# or step-by-step:
+#   just configure                 # render mediamtx.yml, compose overlays, nginx.conf
+#   docker compose -f docker-compose.yml -f docker-compose.cameras.yml up -d --build
 # Open http://localhost:8090  (WEB_PORT)
 ```
+
+Each camera in `cameras.yaml` becomes:
+- one mediamtx path (`paths.<id>`)
+- one detector container (`detector-<id>`)
+- one entry in the UI's camera picker
+- a per-camera recordings directory (`data/recordings/<id>/`)
+
+Generated files (`mediamtx/mediamtx.yml`, `docker-compose.cameras*.yml`,
+`webui/nginx.conf`, `webui/public/cameras.json`) ARE committed for
+inspectability; rerun `just configure` after editing `cameras.yaml`.
 
 ## Services
 
 | Service | Role | Ports |
 |---|---|---|
-| `mediamtx` | RTSP ingest, WebRTC (WHEP) egress, RTSP republish, fMP4 recording, playback server | 8554, 8889, 9996, 9997 |
-| `detector` | PyAV decode → configurable detector (`blob`/`yolo`) → SQLite + WS | 8091, 8092 |
-| `pruner`   | Detection-aware deletion of recording segments older than `KEEP_RECENT_HOURS` | — |
-| `webui`    | Svelte 5 SPA (vite dev or nginx prod), proxies WS + mediamtx + detector | `${WEB_PORT}` (default 8090) |
+| `mediamtx`       | RTSP ingest, WebRTC (WHEP) egress, RTSP republish, fMP4 recording, playback server | 8554, 8889, 9996, 9997 (host network) |
+| `detector-<id>`  | PyAV decode → configurable detector (`blob`/`yolo`) → SQLite + WS. One per camera in `cameras.yaml`. | internal 8091, 8092 (proxied by webui) |
+| `pruner`         | Detection-aware deletion of recording segments older than `KEEP_RECENT_HOURS` | — |
+| `webui`          | Svelte 5 SPA (vite dev or nginx prod), proxies WS + mediamtx + detector(s) | `${WEB_PORT}` (default 8090) |
 
 ## Detectors
 
@@ -68,18 +82,23 @@ To train your own model on the recorded data, see [`training/`](training/).
 
 ```
 live2/
-├── README.md           — this file (run + what-is-it)
-├── NOTES.md            — design rationale, decisions, quirks, deferred
-├── justfile            — dev / prod / down / logs / rebuild-*
-├── docker-compose.yml
-├── docker-compose.dev.yml
-├── .env.example
-├── mediamtx/mediamtx.yml
-├── detector/           — PyAV → swappable Detector → SQLite + WS
-├── pruner/             — detection-aware segment GC
-├── webui/              — Svelte 5 SPA
-└── training/           — extract datasets from recordings + events.db
-                          (separate package, modeller-facing)
+├── README.md                       — this file (run + what-is-it)
+├── NOTES.md                        — design rationale, decisions, quirks, deferred
+├── justfile                        — configure / dev / prod / down / logs
+├── cameras.yaml.example            — per-camera config; copy → cameras.yaml
+├── tools/configure.py              — renders all multi-camera derived files
+├── docker-compose.yml              — base stack (mediamtx, pruner, webui)
+├── docker-compose.cameras.yml      — GENERATED — one detector service per camera
+├── docker-compose.dev.yml          — webui dev overlay (vite HMR)
+├── docker-compose.cameras.dev.yml  — GENERATED — per-detector watchfiles overlay
+├── .env.example                    — pruner + WEB_PORT
+├── mediamtx/mediamtx.yml           — GENERATED — multi-path server config
+├── detector/                       — PyAV → swappable Detector → SQLite + WS
+├── pruner/                         — detection-aware segment GC
+├── webui/                          — Svelte 5 SPA
+│   ├── nginx.conf                  — GENERATED — per-camera proxy rules
+│   └── public/cameras.json         — GENERATED — UI camera picker source
+└── training/                       — extract datasets from recordings + events.db
 ```
 
 ## Data on disk

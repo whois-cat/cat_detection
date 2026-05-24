@@ -219,25 +219,69 @@ has returned at least once — no false positives during initial load.
 
 ---
 
+### Multi-camera
+
+`cameras.yaml` at the project root is the single source of truth. Each
+entry produces:
+
+- one mediamtx `paths:` block (same `id` as the camera).
+- one `detector-<id>` service in `docker-compose.cameras.yml`.
+- one nginx proxy stanza in `webui/nginx.conf`.
+- one entry in `webui/public/cameras.json`, which the UI fetches at
+  startup to populate the camera picker.
+
+`tools/configure.py` renders all five derived files. `just configure`
+runs it; `just devserver` / `just almostprod` run configure first
+automatically. Generated files are committed so diffs are inspectable.
+
+Networking topology:
+- mediamtx stays on the host network (WebRTC ICE needs it).
+- Per-camera detectors run on the default bridge network. They reach
+  mediamtx as `host.docker.internal:8554` and pull
+  `rtsp://host.docker.internal:8554/<camera_id>`.
+- webui (also on the bridge) talks to each detector by container DNS
+  name (`detector-<id>:8091`). nginx fans out `/detector/<id>/*` to the
+  matching upstream. Dev (`vite`) does the same routing via its `proxy`
+  table, built from `public/cameras.json` at start.
+- A single shared `events.db` receives writes from all detectors. Rows
+  are tagged with `camera_id`; the UI filters by selected camera.
+
+URL hash: `#camera=<id>` is added to the existing `#from=&to=` pan/zoom
+state. Reloading or sharing a URL restores both the timeline view and
+the selected camera.
+
+UI behaviour on camera switch (`switchCamera()` in App.svelte):
+- Close the WS for the previous camera; open a new WS for the new one.
+- Tear down WebRTC PeerConnection and recreate against the new WHEP URL.
+- Reset `allEvents`, `recentLive`, `hlsRanges`, `stats`, `detectRoi`,
+  `actionPolygon` — they're per-camera state.
+- Reload model picker (each camera may run its own DETECTOR_TYPE /
+  YOLO_WEIGHTS).
+- Refresh recordings list for the new path.
+
+---
+
 ## 4. Component reference
 
 | Component | Role | Key files |
 |---|---|---|
-| `mediamtx` | RTSP ingest, WHEP egress, RTSP republish, fMP4 recording, playback | `mediamtx/mediamtx.yml` |
-| `detector` | PyAV decode → swappable Detector → SQLite + WS | `detector/{main.py,detectors.py,storage.py}` |
-| `pruner` | Detection-aware segment GC | `pruner/pruner.py` |
-| `webui` | Svelte 5 SPA + reverse proxies to detector & mediamtx | `webui/src/{App,Timeline}.svelte`, `webui/nginx.conf` |
-| `training/` | Extract datasets (classifier crops, YOLO labels) from recordings + events.db | `training/{README,db,segments,sources,extract_*}.py` |
+| `mediamtx`        | RTSP ingest, WHEP egress, RTSP republish, fMP4 recording, playback | `mediamtx/mediamtx.yml` (generated) |
+| `detector-<id>`   | PyAV decode → swappable Detector → SQLite + WS. One per camera. | `detector/{main.py,detectors.py,storage.py}` |
+| `pruner`          | Detection-aware segment GC | `pruner/pruner.py` |
+| `webui`           | Svelte 5 SPA + reverse proxies to detectors & mediamtx | `webui/src/{App,Timeline}.svelte`, `webui/nginx.conf` (generated) |
+| `tools/configure.py` | Renders all multi-camera derived files from `cameras.yaml` | `tools/configure.py` |
+| `training/`       | Extract datasets (classifier crops, YOLO labels) from recordings + events.db | `training/{README,db,segments,sources,extract_*}.py` |
 
 ### Ports
 
-- `8554` — mediamtx RTSP (detector pulls from here)
+- `8554` — mediamtx RTSP (detectors pull from `host.docker.internal:8554/<id>`)
 - `8889` — mediamtx WebRTC (WHEP)
-- `8091` — detector WebSocket + `/events` REST
-- `8092` — detector control endpoint (artificial delay knob)
+- `8091` — per-detector WebSocket + `/events` REST (internal; webui proxies)
+- `8092` — per-detector control endpoint (internal; webui proxies)
 - `9996` — mediamtx playback server (`/list`, `/get`)
 - `9997` — mediamtx HTTP API
-- `${WEB_PORT}` — webui (nginx in prod, vite in dev; default 8090)
+- `${WEB_PORT}` — webui (nginx in prod, vite in dev; default 8090). Only
+  externally-published port besides mediamtx's host-network ones.
 
 ### Detector event format
 
@@ -298,35 +342,40 @@ useful for testing UI behaviour under a deliberately slow model.
 
 ## 5. Configuration
 
-`.env` (template in `.env.example`). Most-used:
+**Per-camera config**: `cameras.yaml` (template in `cameras.yaml.example`).
+Each camera's knobs (RTSP URL, detector type, ROIs, rotation, …) live
+here. After editing, run `just configure`.
+
+**Per-camera knobs** (in `cameras.yaml`):
+
+| Field | Default | Purpose |
+|---|---|---|
+| `id` | — | Slug used as mediamtx path, recordings dir, CAMERA_ID, and URL prefix |
+| `rtsp` | — | Camera RTSP URL with credentials |
+| `label` | title-cased id | Display name in the UI picker |
+| `detector_type` | `blob` | `blob` or `yolo` |
+| `yolo_weights` | `/opt/models/yolov8n_int8_openvino_model/` | Pre-quantised INT8 by default |
+| `yolo_conf` | 0.25 | YOLO confidence threshold |
+| `blob_bright_threshold` | 240 | Blob detector grayscale threshold |
+| `blob_min_area` | 500 | Minimum blob area (px) |
+| `detect_roi` | `0,0,1,1` | Inference crop (camera-frame fractions) |
+| `action_polygon` | `0,0,1,1` | Box-center gate (rect or N-vertex polygon, camera coords) |
+| `rotate_deg` | 0 | Internal-to-model rotation, 0/90/180/270 |
+| `artificial_delay_ms` | 0 | Default detector-emit delay (live-tunable via UI) |
+
+**Global knobs** (in `.env`):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `RTSP_URL` | — | Camera RTSP URL (with credentials) |
-| `WEBRTC_HOST` | — | Public IP/hostname the browser uses for WebRTC media (LAN IP for home use) |
-| `CAMERA_ID` | `default` | Tag for every event + recording dir |
-| `DETECTOR_TYPE` | `blob` | `blob` or `yolo` |
-| `YOLO_WEIGHTS` | `/opt/models/yolov8n_int8_openvino_model/` | Pre-quantised INT8 by default; swap to `.pt` or a fine-tune |
-| `YOLO_CONF` | 0.25 | YOLO confidence threshold |
-| `BLOB_BRIGHT_THRESHOLD` | 240 | Blob detector grayscale threshold |
-| `BLOB_MIN_AREA` | 500 | Minimum blob area (px) |
-| `DETECT_ROI` | `0,0,1,1` | Inference crop (camera-frame fractions) |
-| `ACTION_POLYGON` | `0,0,1,1` | Box-center gate for downstream actions (camera-frame fractions; 4 values = rect, more = explicit polygon) |
-| `FRAME_ROTATE_DEG` | 0 | Internal-to-model rotation, 0/90/180/270 (no UI effect) |
-| `ARTIFICIAL_DELAY_MS` | 0 | Default detector-emit delay (live-tunable via UI) |
+| `WEB_PORT` | 8090 | Browser-facing port |
 | `PRUNER_PRE_ROLL_SEC` | 30 | Keep this much before each detection |
 | `PRUNER_POST_ROLL_SEC` | 30 | Keep this much after each detection |
 | `PRUNER_KEEP_RECENT_HOURS` | 24 | Never prune segments newer than this |
 | `PRUNER_INTERVAL_SEC` | 3600 | Pruner cadence |
 | `PRUNER_DRY_RUN` | 0 | Set to 1 to log without deleting |
-| `WEB_PORT` | 8090 | Browser-facing port |
 
-mediamtx-specific overrides via `MTX_<UPPERCASE>` env vars on the
-mediamtx container (mediamtx does NOT substitute `${VAR}` inside its
-YAML):
-
-- `MTX_PATHS_CAMERA_SOURCE` — camera RTSP URL
-- `MTX_WEBRTCADDITIONALHOSTS` — WebRTC public host
+`cameras.yaml` also has a top-level `webrtc_host` (the public host the
+browser dials for WebRTC ICE — usually the docker host's LAN IP).
 
 ---
 

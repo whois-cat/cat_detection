@@ -2,7 +2,8 @@
 .env
 .env~
 .env.local
-cameras.yaml          # secrets; commit cameras.yaml.example instead
+# Per-camera config carries RTSP credentials — commit cameras.yaml.example instead.
+cameras.yaml
 data/
 
 # Python
