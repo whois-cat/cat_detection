@@ -1,0 +1,38 @@
+# Runtime / state — should never live in the repo.
+.env
+.env~
+.env.local
+cameras.yaml          # secrets; commit cameras.yaml.example instead
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / vite (webui)
+webui/node_modules/
+webui/dist/
+webui/.vite/
+*.log
+npm-debug.log*
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Downloaded model weights (re-fetched on container build).
+# Keep training-produced models out unless explicitly committed.
+detector/yolov8n.pt
+detector/yolov8n_int8_openvino_model/
+detector/datasets/

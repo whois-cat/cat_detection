@@ -1,0 +1,259 @@
+# live2 training pipeline
+
+This directory contains the bridge between the live2 detection pipeline
+and any model-training workflow you want to run. The live2 pipeline
+captures recordings + per-frame detection events; this package turns that
+on-disk data into datasets you can feed to a YOLO fine-tune (object
+detection) or a classifier (per-cat identity).
+
+> If you are picking this up cold: read [../README.md](../README.md) first
+> to understand the rest of the system. The short version: a camera RTSP
+> stream is recorded as 30-second fMP4 segments to `data/recordings/`, and
+> a Python detector writes per-box rows to a SQLite DB at
+> `data/events/events.db`.
+
+---
+
+## What "internal public API" means here
+
+The live2 system has two surfaces:
+
+| Consumer | Video | Labels |
+|---|---|---|
+| **Browser / UI** (live, interactive) | mediamtx WebRTC + playback HTTP (chunked fMP4) | detector `GET /events` |
+| **Training / batch extraction** (this package) | recording files on disk | SQLite directly |
+
+The browser surfaces are streaming-shaped and not suitable for batch
+random access. The training surfaces are the **on-disk files and the
+SQLite schema** — that's the contract the modeller depends on:
+
+- `data/recordings/<camera_id>/<YYYY-MM-DD_HH-MM-SS-ffffff>.mp4`
+  (mediamtx-written, segment start is the filename in local wall-clock).
+- `data/events/events.db` — schema in [`../detector/storage.py`](../detector/storage.py).
+
+If those layouts ever change, this package is the single place that needs
+updating.
+
+---
+
+## Joining events to frames — wall-clock, not PTS
+
+See the docstring in [`segments.py`](segments.py) for the full reasoning.
+Short version: the detector and mediamtx are two independent consumers of
+the RTSP source. Their PTS values do not share an origin. The shared
+authoritative key is **wall-clock**: events carry `wall_ms`, segments
+carry their start in the filename. So the extractor:
+
+1. Locates the segment that covers `event.wall_ms` (bisect on segment
+   filenames).
+2. Computes the segment-local seek time `(event.wall_ms − segment.start_ms) / 1000`.
+3. PyAV-seeks inside the segment to that media time.
+
+Precision is sub-frame in practice. `event.pts` is preserved in the event
+row but unused by the extractor — kept for future cross-system anchoring
+work or for in-stream debugging.
+
+---
+
+## Abstract base + two concrete sources
+
+A *Sample* is `(BGR ndarray, list[Box], wall_ms, camera_id, model)`.
+
+```python
+from training import FullFrameSource, CropSource
+
+# One Sample per frame, all boxes attached. For training a detector.
+for sample in FullFrameSource(db_path, recordings_root,
+                              camera_id="default", model="yolov8n"):
+    img = sample.image            # H×W×3 BGR uint8 (camera orientation)
+    for b in sample.boxes:        # all detected cats in this frame
+        ...
+
+# One Sample per BOX, image is the crop (with optional context padding).
+# For training a per-cat classifier.
+for sample in CropSource(db_path, recordings_root,
+                         cat=None,            # all cats; or filter to one
+                         pad_frac=0.15):
+    crop = sample.image           # padded cat crop, camera orientation
+    [box] = sample.boxes          # exactly one, coords relative to crop
+    label = box.cat
+```
+
+Both classes share `SampleSource` (in [`sources.py`](sources.py)). It
+handles the SQLite query, the segment lookup, and the PyAV seek
+batching — so segments are opened once each and frames are decoded in
+PTS-monotonic order regardless of which subclass you use. The subclass
+implements only `_emit(frame, img) -> Iterator[Sample]`. Adding a third
+shape (e.g. *fixed-size patches around the box centre*, or *both crop and
+full frame in one Sample*) is a five-line subclass.
+
+Why two surfaces:
+
+- Detector training (YOLO, RT-DETR, …) wants the **full frame plus all
+  boxes**. The model learns to localise and to score; crops would
+  destroy that supervision.
+- Classifier training (EfficientNet, ResNet, …) wants the **box crop
+  only**, paired with the cat label. The model has been spared
+  localisation; the localiser already chose the patch.
+
+Both shapes come from the same `(frame, image)` pair, so we never decode
+twice. If you need the third shape (full-frame *and* crop together,
+e.g. to train a head that takes context features into account), subclass
+`SampleSource` and emit two related samples per frame — still one decode.
+
+---
+
+## In-memory path: skip the disk roundtrip for PyTorch training
+
+The disk-extractor recipes below encode crops as JPEGs because that's the
+universal interchange format (CVAT review, hand-off to other workstations,
+inspectable on the filesystem). But for a one-laptop PyTorch training run
+the JPEG step is a CPU-cost cache that you can side-step entirely.
+
+[`torch_dataset.py`](torch_dataset.py) provides two adapters around the
+same `SampleSource`:
+
+- `TorchStreamingDataset` (IterableDataset) — each epoch re-iterates the
+  source, re-decoding segments. Right for one-shot training or huge
+  streaming datasets.
+- `TorchCachedDataset` (map-style Dataset) — materialises the source
+  into RAM once, serves random-access lookups thereafter. Right for the
+  standard multi-epoch classifier loop. Rule of thumb: ~1 GB RAM per 5k
+  ~250² crops.
+
+See the docstring at the top of [`torch_dataset.py`](torch_dataset.py)
+for a complete usage sketch (a CropSource feeding torchvision
+transforms into an EfficientNet/ResNet/whatever loop).
+
+When to prefer disk JPEGs anyway:
+
+- You want to hand the dataset to CVAT for review.
+- You want to share the dataset across machines / persist it for repro.
+- The dataset doesn't fit in RAM (tens of thousands of crops, full size).
+- You're training Ultralytics YOLO — its trainer hard-wires
+  YAML/directory layout, so disk is the only path.
+
+YOLO fine-tune always uses [`extract_detector.py`](extract_detector.py)
+(disk). Per-cat classifier training has both options.
+
+## Recipe: per-cat classifier
+
+```bash
+cd live2
+uv run python -m training.extract_classifier \
+    --recordings data/recordings \
+    --db data/events/events.db \
+    --out data/datasets/classifier \
+    --model yolov8n \
+    --min-score 0.3 \
+    --val-frac 0.1 \
+    --split-by-track   # keep all crops from one track in one split
+```
+
+Output is a torchvision `ImageFolder`-compatible tree:
+
+```
+data/datasets/classifier/
+    train/
+        alisa/   13_........jpg ...
+        chuzh/   ...
+        ellie/   ...
+        felisis/ ...
+    val/
+        alisa/  ...
+        ...
+```
+
+Train a classifier with the parent project's existing EfficientNet-B0
+recipe (see [`../../scripts/`](../../scripts/) and [`../../models/`](../../models/)
+in the parent repo). The 4-cat label set should be identical.
+
+> `--split-by-track` matters. Within one track, consecutive frames are
+> near-duplicates. Random per-image splitting leaks frame n+1 of a track
+> into val while frame n is in train, inflating val accuracy. Splitting
+> per `track_id` keeps each cat-appearance entirely on one side.
+
+---
+
+## Recipe: YOLO fine-tune (per-cat detector)
+
+```bash
+cd live2
+uv run python -m training.extract_detector \
+    --recordings data/recordings \
+    --db data/events/events.db \
+    --out data/datasets/detector \
+    --model yolov8n \
+    --val-frac 0.1
+    # add --collapse-to-single-class to train a "cat or not" detector
+```
+
+Output is Ultralytics-compatible:
+
+```
+data/datasets/detector/
+    data.yaml
+    images/{train,val}/*.jpg
+    labels/{train,val}/*.txt    # `class cx cy w h`, normalised
+```
+
+Train:
+
+```bash
+uv pip install ultralytics
+yolo train data=data/datasets/detector/data.yaml \
+          model=yolov8n.pt imgsz=640 epochs=50
+```
+
+After training, drop the resulting `best.pt` into the detector container
+and point `YOLO_WEIGHTS` at it. You can also export to OpenVINO INT8
+for the same ~3-4× CPU speedup the off-the-shelf weights get — see the
+Dockerfile in [`../detector/`](../detector/) for the recipe.
+
+---
+
+## What's missing (intentionally) and how to add it
+
+These are deliberate not-yet-done bits. None of them block the v1 dataset:
+
+- **Hard-negative sampling.** The detector only writes rows when it sees
+  something. Empty frames aren't logged. For a robust detector you want
+  a sampling of empty frames as negatives — easy add: scan segment files
+  by media-time stride, decode the frame, and emit a Sample with
+  `boxes=[]` if no event from any model is within ±100 ms.
+
+- **Label review / correction UI.** Events as-recorded are the detector's
+  opinion, not ground truth. The expected workflow is to extract a
+  dataset, review and re-label visually (existing tooling: CVAT in the
+  parent repo), and feed corrections back. The path back into the live2
+  events DB isn't wired — events from a human reviewer would use
+  `source != 'detector'`. Schema already supports it.
+
+- **Track-aware temporal sampling.** Right now the extractor takes every
+  detection. For classifier training you usually want at most a few
+  diverse frames per track. Drop-in: read events ordered by
+  `(track_id, wall_ms)`, take every Nth, or use a perceptual hash to
+  skip near-duplicates.
+
+- **Live evaluation harness.** "Does the new model do better than the
+  current one on the last 24 hours of recordings?" Two ways: (a) script
+  that runs both models over a date range and produces a confusion
+  matrix; (b) the detector already supports running multiple `model`
+  rows in parallel, so you can run a candidate alongside production and
+  compare in the UI.
+
+---
+
+## Code map
+
+```
+training/
+├── README.md         (this file)
+├── pyproject.toml    (just deps for extraction — no torch in here)
+├── __init__.py
+├── db.py             (events.db queries; per-row → per-frame regrouping)
+├── segments.py       (wall_ms → segment file + offset; see docstring)
+├── sources.py        (SampleSource ABC + FullFrameSource + CropSource)
+├── extract_classifier.py   (one-shot script wrapping CropSource)
+└── extract_detector.py     (one-shot script wrapping FullFrameSource)
+```

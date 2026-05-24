@@ -1,0 +1,16 @@
+[project]
+name = "live2-training"
+version = "0.1.0"
+description = "Training-data extraction + boilerplate for live2 detection pipeline."
+requires-python = ">=3.10"
+dependencies = [
+    "av",
+    "numpy",
+    "opencv-python-headless",
+]
+
+# Optional extras the modeller will add when they actually train a model.
+# Kept out of the base set so the extraction step alone is fast to install.
+[project.optional-dependencies]
+yolo       = ["ultralytics"]
+classifier = ["torch", "torchvision", "scikit-learn"]

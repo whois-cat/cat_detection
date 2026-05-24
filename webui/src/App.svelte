@@ -1,0 +1,736 @@
+<script>
+  // Combined live + history view (Svelte 5, runes).
+  //
+  // Two <video> elements share the same overlay <canvas>:
+  //   - liveVideo (WebRTC, always playing)
+  //   - historyVideo (native fMP4 from mediamtx /recordings/get)
+  // The visible one is determined by `mode`, which is derived from the
+  // playhead's distance from nowMs. `follow=true` keeps the playhead pinned
+  // to now and shifts the timeline viewport along with it.
+  //
+  // Sync between video and overlay:
+  //   - live: WS pushes events; the latest non-empty event drives the overlay
+  //   - history: the wall-clock of the displayed frame is
+  //     playbackWindowStartMs + historyVideo.currentTime (corrected on
+  //     loadedmetadata where possible); we look up the closest event in
+  //     `allEvents` and draw it.
+  //
+  // Retention ranges shown in the timeline come from mediamtx /recordings/list
+  // — that endpoint is the canonical record of
+  // what's actually playable.
+  import { onMount, onDestroy, untrack } from 'svelte';
+  import Timeline from './Timeline.svelte';
+
+  // ---- DOM refs (plain let) ----
+  let liveVideo, historyVideo, canvas, wrap, appRoot;
+
+  // ---- Non-reactive (imperative state used only in handlers / draw) ----
+  let pc, ws;
+  let recentLive = [];
+  let seekTimer = 0;
+  let nowTimer = 0;
+  let _prevMode = 'live';
+  // Wall-clock at t=0 of the loaded fMP4 stream. mediamtx /get?start=T
+  // returns video starting from the most recent segment boundary BEFORE T
+  // (up to ~SEGMENT_DURATION earlier), not exactly at T. We correct this
+  // via video.getStartDate() once loadedmetadata fires; until then we use
+  // our requested T as a best guess.
+  let playbackWindowStartMs = 0;
+  let playbackWindowEndMs = 0;
+  // Where the user actually clicked. We re-seek to this once we know the
+  // true segment start (currentTime = playbackTargetMs - playbackWindowStartMs).
+  let playbackTargetMs = 0;
+  const PLAYBACK_WINDOW_SEC = 15 * 60;
+
+  // ---- Reactive state ----
+  let nowMs        = $state(Date.now());
+  let playheadMs   = $state(Date.now());
+  let allEvents    = $state([]);
+  let hlsRanges    = $state([]);
+  let hlsErrorText = $state('');
+  // historyPaused reflects the actual <video>.paused flag for the UI.
+  // userWantsPlaying is what the user intends — set by the play/pause button
+  // and used to decide whether to resume after a src reload (every seek).
+  let historyPaused    = $state(true);
+  let userWantsPlaying = $state(true);
+  let follow           = $state(true);
+  // Latest stats frame from the detector ({fps_in, fps_processed, active_tracks, model, camera_id})
+  let stats            = $state(null);
+  // detectRoi: axis-aligned rect [x0,y0,x1,y1] in [0..1], CAMERA coords.
+  // actionPolygon: array of [x,y] vertices in [0..1] (closed polygon), CAMERA coords.
+  // Null until first stats frame arrives. Detector may internally rotate frames
+  // for the model (FRAME_ROTATE_DEG), but everything outside that — including
+  // these overlays and the displayed video — stays in camera orientation.
+  let detectRoi        = $state(null);
+  let actionPolygon    = $state(null);
+  // mediamtx path name = detector's CAMERA_ID, fetched from /detector/config
+  // at startup. Used for WHEP URL and recording playback URLs. Single source
+  // of truth so the UI doesn't hardcode "camera".
+  let cameraId         = $state(null);
+  // Model picker: empty string means "all models". availableModels is populated
+  // from /detector/models on mount.
+  let availableModels  = $state([]);
+  let selectedModel    = $state('');
+
+  // ---- Derived ----
+  const LIVE_THRESHOLD_MS = 5_000;
+  let mode = $derived(playheadMs >= nowMs - LIVE_THRESHOLD_MS ? 'live' : 'history');
+  let ranges = $derived(
+    hlsRanges.length
+      ? hlsRanges
+      : [{ from_ms: nowMs - 24 * 3600_000, to_ms: nowMs }]
+  );
+
+  // Filtered view of events for whichever model the user picked.
+  let visibleEvents = $derived(
+    selectedModel
+      ? allEvents.filter(e => e.model === selectedModel)
+      : allEvents
+  );
+
+  // History playhead falls outside any actual recording range (pruned by
+  // the detection-based cleanup, or before recording started).
+  // Only true once we have real ranges from /list — before that we
+  // optimistically assume "everything's there".
+  let inGap = $derived(
+    mode === 'history'
+    && hlsRanges.length > 0
+    && !hlsRanges.some(r => playheadMs >= r.from_ms && playheadMs < r.to_ms)
+  );
+  let nextRangeStartMs = $derived.by(() => {
+    let best = null;
+    for (const r of hlsRanges) {
+      if (r.from_ms > playheadMs && (best === null || r.from_ms < best)) {
+        best = r.from_ms;
+      }
+    }
+    return best;
+  });
+
+
+  // ---- Overlay constants ----
+  const OVERLAY_MAX_AGE_MS = 1500;
+  const BOX_RGB = [0, 255, 136];
+  const BOX_STROKE = `rgb(${BOX_RGB.join(',')})`;
+  const BOX_SHADOW = (() => {
+    const [r, g, b] = BOX_RGB;
+    const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    return lum > 0.5 ? 'rgba(0,0,0,0.85)' : 'rgba(255,255,255,0.85)';
+  })();
+
+  // ---- Overlay drawing ----
+  function findHistoryEventAt(referenceMs) {
+    let best = null, bestDist = OVERLAY_MAX_AGE_MS;
+    for (let i = allEvents.length - 1; i >= 0; i--) {
+      const e = allEvents[i];
+      if (!e.boxes || !e.boxes.length) continue;
+      const d = Math.abs(referenceMs - e.wall_ms);
+      if (d < bestDist) { bestDist = d; best = e; }
+      if (e.wall_ms < referenceMs - OVERLAY_MAX_AGE_MS - 60_000) break;
+    }
+    return best;
+  }
+
+  function drawOverlay() {
+    if (!canvas) return;
+    const v = mode === 'live' ? liveVideo : historyVideo;
+    if (!v) return;
+    const vw = v.videoWidth, vh = v.videoHeight;
+    if (vw && (canvas.width !== vw || canvas.height !== vh)) {
+      canvas.width = vw; canvas.height = vh;
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // ROI overlays (drawn first so detection boxes sit on top). Only render
+    // when the region is a sub-region of the frame; full-frame ROIs would just
+    // be a border. ACTION_ROI may be an arbitrary polygon (perspective).
+    const FULL_RECT = (r) => r && r[0] === 0 && r[1] === 0 && r[2] === 1 && r[3] === 1;
+    const FULL_POLY = (p) => p && p.length === 4
+      && p[0][0] === 0 && p[0][1] === 0 && p[1][0] === 1 && p[1][1] === 0
+      && p[2][0] === 1 && p[2][1] === 1 && p[3][0] === 0 && p[3][1] === 1;
+
+    const drawPath = (stroke, label, makePath, labelXY) => {
+      ctx.save();
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 6]);
+      ctx.strokeStyle = stroke;
+      ctx.beginPath();
+      makePath();
+      ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.font = '600 14px system-ui';
+      ctx.fillStyle = stroke;
+      ctx.fillText(label, labelXY[0] + 4, labelXY[1] + 16);
+      ctx.restore();
+    };
+    if (detectRoi && !FULL_RECT(detectRoi)) {
+      const [x0, y0, x1, y1] = detectRoi;
+      const rx = x0 * canvas.width, ry = y0 * canvas.height;
+      const rw = (x1 - x0) * canvas.width, rh = (y1 - y0) * canvas.height;
+      drawPath('#5ec8ff', 'DETECT',
+        () => ctx.rect(rx, ry, rw, rh),
+        [rx, ry]);
+    }
+    if (actionPolygon && !FULL_POLY(actionPolygon)) {
+      let minX = Infinity, minY = Infinity;
+      drawPath('#ffd454', 'ACTION', () => {
+        actionPolygon.forEach(([x, y], i) => {
+          const px = x * canvas.width, py = y * canvas.height;
+          if (px < minX) minX = px;
+          if (py < minY) minY = py;
+          if (i === 0) ctx.moveTo(px, py);
+          else         ctx.lineTo(px, py);
+        });
+      }, [minX, minY]);
+    }
+
+    let referenceMs, ev;
+    if (mode === 'live') {
+      referenceMs = Date.now();
+      while (recentLive.length && recentLive[0].wall_ms < referenceMs - OVERLAY_MAX_AGE_MS) {
+        recentLive.shift();
+      }
+      if (!recentLive.length) return;
+      ev = recentLive[recentLive.length - 1];
+    } else {
+      // Reference = wall-clock of the currently-displayed historyVideo frame.
+      referenceMs = playbackWindowStartMs
+                  ? playbackWindowStartMs + historyVideo.currentTime * 1000
+                  : playheadMs;
+      ev = findHistoryEventAt(referenceMs);
+      if (!ev) return;
+    }
+
+    const ageMs = Math.max(0, referenceMs - ev.wall_ms);
+    if (ageMs > OVERLAY_MAX_AGE_MS) return;
+    const sx = canvas.width / ev.w, sy = canvas.height / ev.h;
+    const dashFactor = 1 - ageMs / OVERLAY_MAX_AGE_MS;
+    const segLen = 14;
+    ctx.setLineDash(segLen * (1 - dashFactor) > 0.5 ? [segLen * dashFactor, segLen - segLen * dashFactor] : []);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = BOX_STROKE;
+    ctx.fillStyle = `rgba(${BOX_RGB.join(',')},0.15)`;
+    ctx.font = '600 16px system-ui';
+    ctx.shadowColor = BOX_SHADOW;
+    ctx.shadowBlur = 6;
+    for (const b of ev.boxes) {
+      ctx.fillRect(b.x * sx, b.y * sy, b.w * sx, b.h * sy);
+      ctx.strokeRect(b.x * sx, b.y * sy, b.w * sx, b.h * sy);
+    }
+    ctx.setLineDash([]);
+    ctx.fillStyle = BOX_STROKE;
+    for (const b of ev.boxes) {
+      ctx.fillText(`${ev.cat || 'blob'}  age ${ageMs.toFixed(0)}ms`,
+                   b.x * sx + 4, b.y * sy - 6);
+    }
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+  }
+
+  function drawLoop() {
+    drawOverlay();
+    requestAnimationFrame(drawLoop);
+  }
+
+  // ---- WebRTC (WHEP) ----
+  // mediamtx exposes WHEP at /<path>/whep — standard SDP offer/answer over HTTP.
+  async function startWebRTC() {
+    pc = new RTCPeerConnection({ iceServers: [] });
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.ontrack = (e) => {
+      if (e.track.kind !== 'video') return;
+      if (!liveVideo.srcObject) liveVideo.srcObject = new MediaStream();
+      liveVideo.srcObject.addTrack(e.track);
+      liveVideo.play().catch(() => {});
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const resp = await fetch(`/whep/${cameraId}/whep`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/sdp' },
+      body: offer.sdp,
+    });
+    if (!resp.ok) {
+      console.error('[webrtc] WHEP signalling failed', resp.status, await resp.text());
+      return;
+    }
+    const answerSdp = await resp.text();
+    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+  }
+
+  // ---- History playback (via mediamtx /recordings/get) ----
+  //
+  // mediamtx's /get returns a fragmented MP4 stream (NOT an HLS playlist),
+  // which browsers can play natively via <video src>. We load one big window
+  // (PLAYBACK_WINDOW_HOURS) ending at "now" and track its start wall-clock
+  // so we can map between target wall-time and historyVideo.currentTime.
+  //
+  // /recordings/list returns the available recording intervals; we use those
+  // for the timeline retention band.
+
+  // mediamtx /list may return `duration` as either a Go-style string
+  // ("1h2m3s"), seconds-as-number, or nanoseconds-as-number depending on
+  // version. Best-effort: detect and normalize to ms.
+  function durationToMs(d) {
+    if (typeof d === 'number') {
+      // > 1e10 looks like ns (would be >2.7h in seconds), < 1e10 like seconds
+      return d > 1e10 ? d / 1e6 : d * 1000;
+    }
+    if (typeof d === 'string') {
+      let total = 0;
+      for (const m of d.matchAll(/(\d+(?:\.\d+)?)([hms])/g)) {
+        const n = parseFloat(m[1]);
+        total += n * (m[2] === 'h' ? 3600 : m[2] === 'm' ? 60 : 1);
+      }
+      return total * 1000;
+    }
+    return 0;
+  }
+
+  async function refreshRecordingsList() {
+    try {
+      if (!cameraId) return;
+      const r = await fetch(`/recordings/list?path=${encodeURIComponent(cameraId)}`);
+      if (!r.ok) return;
+      const arr = await r.json();
+      hlsRanges = arr.map(x => {
+        const start = new Date(x.start).getTime();
+        return { from_ms: start, to_ms: start + durationToMs(x.duration) };
+      });
+    } catch (e) {
+      console.warn('[recordings/list] failed', e);
+    }
+  }
+
+  // Load a fresh playback window starting *at* `startMs` (wall-clock ms).
+  // currentTime=0 == startMs. mediamtx /get is chunked without Range support,
+  // so we can only play forward from whatever first bytes the server sends.
+  function loadPlaybackWindowAt(startMs) {
+    if (!historyVideo) return;
+    playbackTargetMs       = startMs;             // where the user clicked
+    playbackWindowStartMs  = startMs;             // pre-load guess (corrected on loadedmetadata)
+    playbackWindowEndMs    = startMs + PLAYBACK_WINDOW_SEC * 1000;
+    const startIso = new Date(startMs).toISOString();
+    const url = `/recordings/get?path=${encodeURIComponent(cameraId)}&start=${encodeURIComponent(startIso)}`
+              + `&duration=${PLAYBACK_WINDOW_SEC}s&format=fmp4`;
+    historyVideo.src = url;
+    hlsErrorText = '';
+    historyVideo.onerror = () => {
+      const err = historyVideo.error;
+      hlsErrorText = err ? `playback err code=${err.code} ${err.message || ''}` : 'playback failed';
+    };
+    // Correct the wall-clock anchor once we have stream metadata. mediamtx
+    // returns video starting at the most recent segment boundary <= start,
+    // not exactly at start. video.getStartDate() reads the actual t=0 from
+    // the fMP4's creation_time when available.
+    const onMeta = () => {
+      historyVideo.removeEventListener('loadedmetadata', onMeta);
+      let actualStart = null;
+      try {
+        const sd = historyVideo.getStartDate?.();
+        if (sd && !isNaN(sd.getTime())) actualStart = sd.getTime();
+      } catch {}
+      if (actualStart !== null) {
+        const diff = playbackTargetMs - actualStart;       // how much lead-in mediamtx gave us
+        if (diff >= 0 && diff < 5 * 60_000) {
+          playbackWindowStartMs = actualStart;
+          playbackWindowEndMs   = actualStart + PLAYBACK_WINDOW_SEC * 1000;
+          // Skip the lead-in: seek to the user's actual target moment.
+          if (diff > 250) historyVideo.currentTime = diff / 1000;
+          console.log('[playback] anchor corrected: target', new Date(playbackTargetMs).toISOString(),
+                      '→ actual start', new Date(actualStart).toISOString(),
+                      '(lead-in', diff, 'ms)');
+        }
+      } else {
+        // TODO: getStartDate() returns null for mediamtx fMP4 streams. To fix the
+        // ~2s overlay offset (mediamtx /get aligns to the previous 30s segment
+        // boundary), parse mvhd.creation_time from the fMP4 bytes via mp4box.js,
+        // or query mediamtx for the actual segment boundary and use that as anchor.
+        console.log('[playback] video.getStartDate() unavailable; using requested start as anchor');
+      }
+    };
+    historyVideo.addEventListener('loadedmetadata', onMeta);
+    if (userWantsPlaying) {
+      const onReady = () => {
+        historyVideo.removeEventListener('canplay', onReady);
+        historyVideo.play().catch(() => {});
+      };
+      historyVideo.addEventListener('canplay', onReady);
+    }
+  }
+
+  // Every seek triggers a fresh fetch starting exactly at the target.
+  // mediamtx can't Range-serve a single fMP4, so this is the only way to get
+  // snappy scrubs — we accept the per-seek HTTP request cost.
+  function seekHistory(targetMs) {
+    if (!historyVideo) return;
+    loadPlaybackWindowAt(targetMs);
+  }
+
+  function scheduleHistorySeek(target) {
+    clearTimeout(seekTimer);
+    // Longer debounce than before — each fire is a full media reload now,
+    // so we want the user to settle before we fetch.
+    seekTimer = setTimeout(() => seekHistory(target), 200);
+  }
+
+  function onHistoryTime() {
+    if (mode !== 'history' || !historyVideo || !playbackWindowStartMs) return;
+    const t = playbackWindowStartMs + historyVideo.currentTime * 1000;
+    if (Math.abs(t - playheadMs) > 100) playheadMs = t;
+  }
+
+  function toggleHistoryPlay() {
+    if (!historyVideo) return;
+    if (historyVideo.paused) {
+      userWantsPlaying = true;
+      historyVideo.play().catch(() => {});
+    } else {
+      userWantsPlaying = false;
+      historyVideo.pause();
+    }
+  }
+
+  // ---- WS live event stream ----
+  function startWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/detector/ws`);
+    ws.onmessage = (m) => {
+      const ev = JSON.parse(m.data);
+      if (ev.kind === 'stats') {
+        stats = ev;
+        if (Array.isArray(ev.detect_roi) && ev.detect_roi.length === 4) detectRoi = ev.detect_roi;
+        if (Array.isArray(ev.action_polygon) && ev.action_polygon.length >= 3) actionPolygon = ev.action_polygon;
+        return;
+      }
+      allEvents = [...allEvents, ev];
+      recentLive.push(ev);
+      if (recentLive.length > 40) recentLive.shift();
+    };
+    ws.onclose = () => setTimeout(startWS, 1000);
+  }
+
+  async function loadModels() {
+    try {
+      const r = await fetch('/detector/models');
+      const j = await r.json();
+      availableModels = j.models || [];
+    } catch (e) {
+      console.warn('[models] fetch failed', e);
+    }
+  }
+
+  // ---- Initial history fetch ----
+  async function loadHistory() {
+    const to = Date.now();
+    const from = to - 24 * 3600_000;
+    let url = `/detector/events?from=${from}&to=${to}`;
+    if (selectedModel) url += `&model=${encodeURIComponent(selectedModel)}`;
+    try {
+      const r = await fetch(url);
+      const arr = await r.json();
+      const known = new Set(allEvents.map(e => `${e.wall_ms}:${e.pts}:${e.model}`));
+      const merged = arr.filter(e => !known.has(`${e.wall_ms}:${e.pts}:${e.model}`)).concat(allEvents);
+      allEvents = merged;
+    } catch (e) {
+      console.warn('[history] fetch failed', e);
+    }
+  }
+
+  function onModelChange() {
+    // Drop stale events and refetch for the newly-selected model. Live WS
+    // events with the right model will flow in automatically.
+    allEvents = [];
+    recentLive = [];
+    loadHistory();
+  }
+
+  function tickNow() {
+    nowMs = Date.now();
+    if (follow) playheadMs = nowMs;
+  }
+
+  // ---- Timeline callback props ----
+  function onSeek(t) {
+    follow = false;
+    playheadMs = t;
+    scheduleHistorySeek(t);          // explicitly user-initiated reload
+  }
+  function onEnterLive()     { follow = true;  playheadMs = Date.now(); nowMs = playheadMs; }
+  function onBreakFollow()   { follow = false; }
+
+  // ---- Fullscreen ----
+  function toggleFullscreen(target) {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else target.requestFullscreen();
+  }
+  function toggleVideoFullscreen() { toggleFullscreen(wrap); }
+  function toggleAppFullscreen()   { toggleFullscreen(appRoot); }
+
+  function fmtAbs(ms) { return new Date(ms).toLocaleString(); }
+  function fmtRelative(targetMs) {
+    const delta = targetMs - playheadMs;
+    const abs = Math.abs(delta);
+    const sign = delta >= 0 ? 'in' : 'ago';
+    let s;
+    if (abs < 60_000) s = `${Math.round(abs/1000)}s`;
+    else if (abs < 3600_000) s = `${Math.round(abs/60_000)}min`;
+    else if (abs < 86_400_000) s = `${(abs/3600_000).toFixed(1)}h`;
+    else s = `${(abs/86_400_000).toFixed(1)}d`;
+    return sign === 'in' ? `in ${s}` : `${s} ago`;
+  }
+
+  let rangesTimer = 0;
+  let modelsTimer = 0;
+  async function loadConfig() {
+    try {
+      const r = await fetch('/detector/config');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      cameraId = j.camera_id;
+    } catch (e) {
+      console.error('[config] failed to fetch /detector/config — falling back to "default"', e);
+      cameraId = 'default';
+    }
+  }
+
+  onMount(async () => {
+    // Camera id must be known before WHEP + recordings URLs are constructed.
+    await loadConfig();
+    startWS();
+    loadModels();
+    loadHistory();
+    refreshRecordingsList();
+    // Don't pre-load playback — wait until the user actually enters
+    // history mode. Saves a 15-min fetch on every page load.
+    await startWebRTC();
+    nowTimer = setInterval(tickNow, 1000);
+    rangesTimer = setInterval(refreshRecordingsList, 30_000);
+    modelsTimer = setInterval(loadModels, 60_000);
+    requestAnimationFrame(drawLoop);
+  });
+  onDestroy(() => {
+    clearInterval(nowTimer);
+    clearInterval(rangesTimer);
+    clearInterval(modelsTimer);
+    try { ws && ws.close(); } catch {}
+    try { pc && pc.close(); } catch {}
+  });
+
+  // ---- Effect: mode transitions only ----
+  // We deliberately don't reseek on every playheadMs change here — the
+  // timeupdate event during playback advances playheadMs ~5x/sec, which
+  // would otherwise reload the src every tick (50 MB fetch each time).
+  // User-initiated seeks come through onSeek; playback-extension comes
+  // through onHistoryTime when nearing window end.
+  $effect(() => {
+    const m = mode;
+    untrack(() => {
+      if (m === 'history' && _prevMode === 'live') {
+        userWantsPlaying = true;
+        scheduleHistorySeek(playheadMs);     // initial load on entering history
+      }
+      if (m === 'live' && historyVideo && !historyVideo.paused) {
+        historyVideo.pause();
+      }
+      _prevMode = m;
+    });
+  });
+</script>
+
+<div class="app" bind:this={appRoot}>
+  <header>
+    <h1>cat-live2</h1>
+    <span class="mode-pill mode-{mode}">{mode}</span>
+    <span class="now">{fmtAbs(playheadMs)}</span>
+
+    <label class="model-picker">
+      model:
+      <select bind:value={selectedModel} onchange={onModelChange}>
+        <option value="">all</option>
+        {#each availableModels as m (m)}
+          <option value={m}>{m}</option>
+        {/each}
+      </select>
+    </label>
+
+    {#if stats && mode === 'live'}
+      <span class="stats">
+        {stats.fps_in.toFixed(1)} fps in · {stats.fps_processed.toFixed(1)} proc · {stats.active_tracks} tracks
+      </span>
+    {/if}
+
+    <span class="spacer"></span>
+    <button class="fs-app" onclick={toggleAppFullscreen} title="Fullscreen the whole app">⛶ app</button>
+  </header>
+
+  <main>
+    <div class="player">
+      <div class="wrap" bind:this={wrap}>
+        <video bind:this={liveVideo}
+               autoplay playsinline muted
+               ondblclick={toggleVideoFullscreen}
+               hidden={mode !== 'live'}></video>
+        <video bind:this={historyVideo}
+               playsinline muted
+               ondblclick={toggleVideoFullscreen}
+               ontimeupdate={onHistoryTime}
+               onplay={() => historyPaused = false}
+               onpause={() => historyPaused = true}
+               hidden={mode !== 'history'}></video>
+        <canvas bind:this={canvas} ondblclick={toggleVideoFullscreen}></canvas>
+        {#if mode === 'history' && inGap}
+          <div class="history-overlay">
+            <div>no recording at this time</div>
+            <div class="dim">
+              {nextRangeStartMs === null
+                ? 'no recordings after this point'
+                : `next recording: ${fmtRelative(nextRangeStartMs)} (${fmtAbs(nextRangeStartMs)})`}
+            </div>
+          </div>
+        {:else if mode === 'history' && hlsErrorText}
+          <div class="history-overlay">
+            <div>HLS error</div>
+            <div class="dim">{hlsErrorText}</div>
+          </div>
+        {/if}
+        {#if mode === 'history' && !inGap}
+          <button class="play-pause" onclick={toggleHistoryPlay}
+                  title={historyPaused ? 'Play' : 'Pause'}>
+            {historyPaused ? '▶' : '⏸'}
+          </button>
+        {/if}
+        <button class="fs" onclick={toggleVideoFullscreen} title="Fullscreen video only (or double-click video)">⛶</button>
+      </div>
+    </div>
+
+    <Timeline
+      {ranges}
+      events={visibleEvents}
+      {nowMs}
+      {playheadMs}
+      {follow}
+      onseek={onSeek}
+      onenterLive={onEnterLive}
+      onbreakFollow={onBreakFollow}
+    />
+  </main>
+</div>
+
+<style>
+  :global(body) { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+  header { display: flex; align-items: center; gap: 1rem; padding: 0.5rem 1rem; background: #222; border-bottom: 1px solid #333; }
+  header h1 { margin: 0; font-size: 1rem; font-weight: 600; }
+  header .spacer { flex: 1; }
+  .mode-pill { padding: 0.1rem 0.5rem; border-radius: 3px; font-size: 0.75rem; letter-spacing: 1px; text-transform: uppercase; font-weight: 700; }
+  .mode-live    { background: #c0392b; color: white; }
+  .mode-history { background: #555; color: #ddd; }
+  header .now { color: #888; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+  header .fs-app {
+    background: #333; color: #ddd; border: 1px solid #555;
+    padding: 0.2rem 0.6rem; border-radius: 3px; cursor: pointer; font-size: 0.85rem;
+  }
+  header .fs-app:hover { background: #444; }
+  .model-picker {
+    color: #aaa; font-size: 0.85rem; display: flex; align-items: center; gap: 0.3rem;
+  }
+  .model-picker select {
+    background: #2a2a2a; color: #ddd; border: 1px solid #555;
+    padding: 0.15rem 0.3rem; border-radius: 3px;
+    font: inherit;
+  }
+  header .stats {
+    color: #9c9; font-family: ui-monospace, monospace; font-size: 0.8rem;
+  }
+  main { padding: 1rem; }
+
+  .player { margin-bottom: 0.6rem; }
+  .wrap {
+    position: relative;
+    width: 100%;
+    max-width: 1280px;
+    aspect-ratio: 16 / 9;
+    background: #000;
+  }
+  video {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    object-fit: contain;
+    background: #000;
+  }
+  video[hidden] { display: none; }
+  canvas {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    background: transparent;
+  }
+  .history-overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.55); color: #ddd; text-align: center;
+    font-family: ui-monospace, monospace; gap: 0.5rem;
+  }
+  .history-overlay .dim { color: #888; font-size: 0.85rem; }
+  .fs {
+    position: absolute; right: 8px; bottom: 8px;
+    background: rgba(0,0,0,0.55); color: #fff; border: 1px solid #555;
+    font-size: 1.1rem; padding: 0.1rem 0.5rem; border-radius: 3px; cursor: pointer;
+  }
+  .fs:hover { background: rgba(0,0,0,0.8); }
+  .play-pause {
+    position: absolute; left: 8px; bottom: 8px;
+    background: rgba(0,0,0,0.55); color: #fff; border: 1px solid #555;
+    font-size: 1.1rem; padding: 0.1rem 0.6rem; border-radius: 3px; cursor: pointer;
+    line-height: 1;
+  }
+  .play-pause:hover { background: rgba(0,0,0,0.8); }
+  .wrap:fullscreen { width: 100vw; height: 100vh; background: #000; display: flex; align-items: center; justify-content: center; }
+  .wrap:fullscreen video,
+  .wrap:fullscreen canvas { width: 100%; height: 100%; max-width: none; object-fit: contain; }
+  .wrap:fullscreen canvas { position: absolute; inset: 0; }
+
+  .app:fullscreen {
+    height: 100vh;
+    width: 100vw;
+    display: flex;
+    flex-direction: column;
+    background: #111;
+    overflow: hidden;
+  }
+  .app:fullscreen main {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 0.5rem 1rem;
+    gap: 0.5rem;
+  }
+  .app:fullscreen .player {
+    flex: 1;
+    min-height: 0;
+    margin-bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .app:fullscreen .wrap {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+  }
+  .app:fullscreen .wrap video,
+  .app:fullscreen .wrap canvas {
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    object-fit: contain;
+  }
+  .app:fullscreen .wrap canvas { position: absolute; inset: 0; }
+</style>
