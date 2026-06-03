@@ -1,5 +1,5 @@
 # Per-camera configuration. Single source of truth — everything else
-# (mediamtx paths, docker-compose detector services, webui nginx routing,
+# (mediamtx paths, docker-compose detector/feeder services, webui nginx routing,
 # the UI's camera picker) is generated from this file by tools/configure.py.
 #
 # Workflow:
@@ -9,22 +9,33 @@
 #   just devserver         # docker compose up
 #
 # Field reference per camera:
-#   id              — short slug. Used as mediamtx path name, recordings
-#                     subdir name, CAMERA_ID tag on events, and routing
-#                     prefix in webui (/detector/<id>/, /whep/<id>/).
-#                     Must match [a-z0-9-]+.
+#   id              — short slug. Must match [a-z0-9-]+.
 #   rtsp            — full RTSP URL (with credentials). Don't quote.
-#   label           — optional pretty name for the UI picker. Defaults to
-#                     a title-cased version of `id`.
-#   detector_type   — "blob" or "yolo".
-#   yolo_weights    — path inside container (default works for the baked
-#                     INT8 IR).
+#   label           — optional pretty name for the UI picker.
+#   detector_type   — "blob" | "yolo" | "yolo_cat"
+#                     yolo_cat: YOLO detects cats, EfficientNet-B0 identifies them.
+#   yolo_weights    — path inside container (default: baked INT8 IR).
 #   yolo_conf       — YOLO confidence threshold.
+#   classifier_weights  — OpenVINO IR dir for the cat identity classifier
+#                         (default: /opt/models/cat_classifier_openvino/).
+#   classifier_min_conf — minimum confidence to assign an identity; below this
+#                         the cat is recorded as "unknown" (default: 0.5).
 #   rotate_deg      — internal-to-model rotation, 0/90/180/270.
 #   detect_roi      — camera-coord rectangle, "x0,y0,x1,y1" in [0..1].
 #   action_polygon  — camera-coord polygon (rect or N-vertex; see .env.example).
 #   blob_bright_threshold, blob_min_area — for DETECTOR_TYPE=blob.
 #   artificial_delay_ms — initial value for the UI delay slider.
+#
+#   feeder (optional) — if present, configure.py generates a feeder-<id> service.
+#     id             — feeder slug. Must match [a-z0-9-]+.
+#     api_base_url   — base URL of the feeder REST API, e.g. http://192.168.0.100
+#     serial_number  — hardware serial used in API paths (/api/<serial>/door/...)
+#     allowed_cats   — list of cat names allowed to open this feeder. Names must
+#                      match class_names in the classifier model. Nothing hardcoded
+#                      here — add/remove names freely.
+#     cooldown_hours — optional map of cat → cooldown in hours. Cats not listed
+#                      have no cooldown (can open repeatedly). Example:
+#                        alisa: 4.0    # 4-hour cooldown after Alisa opens the feeder
 #
 # Globals at the top apply to all cameras.
 
@@ -34,10 +45,26 @@ cameras:
   - id: living
     label: Living room
     rtsp: rtsp://camera:CHANGEME@192.168.0.214:554/stream1
-    detector_type: yolo
+    detector_type: yolo_cat
     rotate_deg: 0
+    feeder:
+      id: feeder1
+      api_base_url: http://192.168.0.100
+      serial_number: ABC123456
+      allowed_cats: [alisa, ellie]
+      cooldown_hours:
+        alisa: 4.0
+        ellie: 2.0
 
   - id: kitchen
+    label: Kitchen
     rtsp: rtsp://camera:CHANGEME@192.168.0.215:554/stream1
-    detector_type: yolo
+    detector_type: yolo_cat
     rotate_deg: 90
+    feeder:
+      id: feeder2
+      api_base_url: http://192.168.0.101
+      serial_number: DEF789012
+      allowed_cats: [chuzh]
+      cooldown_hours:
+        chuzh: 3.0
