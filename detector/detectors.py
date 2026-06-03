@@ -1,16 +1,18 @@
 """Detector implementations.
 
 Each `Detector.detect(img_bgr)` returns a list of detection dicts:
-    {"x": int, "y": int, "w": int, "h": int, "score": float, "cat": str | None}
+    {"x": int, "y": int, "w": int, "h": int, "score": float,
+     "cat": str | None, "cat_score": float | None}
 
 To add a new detector:
   1. Subclass `Detector`, set `model_name`, implement `detect`.
   2. Register it in `build_detector()`.
   3. Set `DETECTOR_TYPE=<key>` env var to select it.
 
-`cat` is the per-detection identity label. For models that can't tell cats
-apart (out-of-the-box YOLO), it'll be the class name ('cat') or None. The
-sticky-session pseudo-classifier in `BrightBlobDetector` is a dev placeholder.
+`cat` is the per-detection identity label:
+  - blob/yolo: class name ('cat') or None — no per-cat identity.
+  - yolo_cat:  EfficientNet-B0 classifier name, or "unknown" when confidence
+               is below CLASSIFIER_MIN_CONF.
 """
 from __future__ import annotations
 
@@ -115,6 +117,68 @@ class YoloDetector(Detector):
         return out
 
 
+class YoloCatDetector(Detector):
+    """YOLO + per-box EfficientNet-B0 identity classifier.
+
+    Crops each detected cat from the same frame YOLO saw (img_bgr, inference
+    coords) and classifies it. Sets b["cat"] to the classifier name, or
+    "unknown" when confidence < CLASSIFIER_MIN_CONF.
+    """
+
+    KEEP_CLS_IDS = (15,)
+
+    def __init__(
+        self,
+        weights: str = "/opt/models/yolov8n_int8_openvino_model/",
+        conf: float = 0.25,
+        classifier_dir: str = "/opt/models/cat_classifier_openvino/",
+        min_conf: float = 0.5,
+    ) -> None:
+        import cv2
+        from classifier import CatClassifier
+        from ultralytics import YOLO
+
+        self._cv2 = cv2
+        self.model = YOLO(weights, task="detect")
+        self.conf = conf
+        stem = os.path.splitext(os.path.basename(os.path.normpath(weights)))[0]
+        self.model_name = f"{stem}+cat"
+        self._classifier = CatClassifier(classifier_dir)
+        self._min_conf = min_conf
+
+    def detect(self, img_bgr: np.ndarray) -> list[dict]:
+        cv2 = self._cv2
+        results = self.model(
+            img_bgr,
+            classes=list(self.KEEP_CLS_IDS),
+            conf=self.conf,
+            verbose=False,
+        )
+        h, w = img_bgr.shape[:2]
+        out: list[dict] = []
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                x1, y1 = max(0, int(x1)), max(0, int(y1))
+                x2, y2 = min(w, int(x2)), min(h, int(y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                # Crop from the same inference-coord frame YOLO saw (img_bgr).
+                crop_bgr = img_bgr[y1:y2, x1:x2]
+                crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                cat_name, cat_score = self._classifier.classify(crop_rgb)
+                if cat_score < self._min_conf:
+                    cat_name = "unknown"
+                out.append({
+                    "x": x1, "y": y1,
+                    "w": x2 - x1, "h": y2 - y1,
+                    "score": float(box.conf[0]),
+                    "cat": cat_name,
+                    "cat_score": float(cat_score),
+                })
+        return out
+
+
 def build_detector(detector_type: str) -> Detector:
     if detector_type == "blob":
         return BrightBlobDetector(
@@ -126,5 +190,16 @@ def build_detector(detector_type: str) -> Detector:
             weights=os.environ.get("YOLO_WEIGHTS", "yolov8n.pt"),
             conf=float(os.environ.get("YOLO_CONF", "0.25")),
         )
-    raise ValueError(f"unknown DETECTOR_TYPE: {detector_type!r} "
-                     f"(expected one of: blob, yolo)")
+    if detector_type == "yolo_cat":
+        return YoloCatDetector(
+            weights=os.environ.get("YOLO_WEIGHTS", "/opt/models/yolov8n_int8_openvino_model/"),
+            conf=float(os.environ.get("YOLO_CONF", "0.25")),
+            classifier_dir=os.environ.get(
+                "CLASSIFIER_WEIGHTS", "/opt/models/cat_classifier_openvino/"
+            ),
+            min_conf=float(os.environ.get("CLASSIFIER_MIN_CONF", "0.5")),
+        )
+    raise ValueError(
+        f"unknown DETECTOR_TYPE: {detector_type!r} "
+        f"(expected one of: blob, yolo, yolo_cat)"
+    )
