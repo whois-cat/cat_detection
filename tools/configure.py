@@ -46,16 +46,34 @@ def load_config() -> dict:
         sys.exit("cameras.yaml must define a top-level `cameras:` list")
     if not cfg["cameras"]:
         sys.exit("cameras.yaml: at least one camera is required")
-    seen = set()
+    seen_cam = set()
+    seen_feeder = set()
     for cam in cfg["cameras"]:
         cid = cam.get("id")
         if not cid or not ID_RE.match(cid):
             sys.exit(f"invalid or missing camera id {cid!r} (must match {ID_RE.pattern})")
-        if cid in seen:
+        if cid in seen_cam:
             sys.exit(f"duplicate camera id: {cid}")
-        seen.add(cid)
+        seen_cam.add(cid)
         if not cam.get("rtsp"):
             sys.exit(f"camera {cid}: missing rtsp")
+        feeder = cam.get("feeder")
+        if feeder is not None:
+            fid = feeder.get("id")
+            if not fid or not ID_RE.match(fid):
+                sys.exit(
+                    f"camera {cid}: feeder.id {fid!r} invalid (must match {ID_RE.pattern})"
+                )
+            if fid in seen_feeder:
+                sys.exit(f"camera {cid}: duplicate feeder id: {fid}")
+            seen_feeder.add(fid)
+            if not feeder.get("api_base_url"):
+                sys.exit(f"camera {cid}: feeder.api_base_url is required")
+            if not feeder.get("serial_number"):
+                sys.exit(f"camera {cid}: feeder.serial_number is required")
+            allowed = feeder.get("allowed_cats", [])
+            if not isinstance(allowed, list) or not allowed:
+                sys.exit(f"camera {cid}: feeder.allowed_cats must be a non-empty list")
     return cfg
 
 
@@ -113,22 +131,25 @@ def render_mediamtx(cfg: dict) -> str:
 
 def render_compose(cfg: dict) -> str:
     services = []
+
     for cam in cfg["cameras"]:
         cid = cam["id"]
         env = {
-            "CAMERA_ID":         cid,
-            "RTSP_SOURCE":       f"rtsp://host.docker.internal:8554/{cid}",
-            "DETECTOR_TYPE":     cam.get("detector_type", "blob"),
+            "CAMERA_ID":           cid,
+            "RTSP_SOURCE":         f"rtsp://host.docker.internal:8554/{cid}",
+            "DETECTOR_TYPE":       cam.get("detector_type", "blob"),
             "BLOB_BRIGHT_THRESHOLD": cam.get("blob_bright_threshold", 240),
-            "BLOB_MIN_AREA":     cam.get("blob_min_area", 500),
-            "YOLO_WEIGHTS":      cam.get("yolo_weights", "/opt/models/yolov8n_int8_openvino_model/"),
-            "YOLO_CONF":         cam.get("yolo_conf", 0.25),
-            "DETECT_ROI":        cam.get("detect_roi", "0,0,1,1"),
-            "ACTION_POLYGON":    cam.get("action_polygon", "0,0,1,1"),
-            "FRAME_ROTATE_DEG":  cam.get("rotate_deg", 0),
-            "EVENTS_DB":         "/data/events/events.db",
-            "WS_PORT":           "8091",
-            "CONTROL_PORT":      "8092",
+            "BLOB_MIN_AREA":       cam.get("blob_min_area", 500),
+            "YOLO_WEIGHTS":        cam.get("yolo_weights", "/opt/models/yolov8n_int8_openvino_model/"),
+            "YOLO_CONF":           cam.get("yolo_conf", 0.25),
+            "CLASSIFIER_WEIGHTS":  cam.get("classifier_weights", "/opt/models/cat_classifier_openvino/"),
+            "CLASSIFIER_MIN_CONF": cam.get("classifier_min_conf", 0.5),
+            "DETECT_ROI":          cam.get("detect_roi", "0,0,1,1"),
+            "ACTION_POLYGON":      cam.get("action_polygon", "0,0,1,1"),
+            "FRAME_ROTATE_DEG":    cam.get("rotate_deg", 0),
+            "EVENTS_DB":           "/data/events/events.db",
+            "WS_PORT":             "8091",
+            "CONTROL_PORT":        "8092",
             "ARTIFICIAL_DELAY_MS": cam.get("artificial_delay_ms", 0),
         }
         env_lines = "\n".join(f"      {k}: {json.dumps(v)}" for k, v in env.items())
@@ -145,6 +166,36 @@ def render_compose(cfg: dict) -> str:
     volumes:
       - ./data/events:/data/events
 """)
+
+        # Optional feeder service — generated only if feeder block present.
+        feeder = cam.get("feeder")
+        if feeder:
+            fid = feeder["id"]
+            allowed_cats = ",".join(feeder.get("allowed_cats", []))
+            cooldown_json = json.dumps(feeder.get("cooldown_hours", {}))
+            feeder_env = {
+                "CAMERA_ID":            cid,
+                "FEEDER_ID":            fid,
+                "FEEDER_API_BASE_URL":  feeder["api_base_url"],
+                "FEEDER_SERIAL_NUMBER": feeder["serial_number"],
+                "ALLOWED_CATS":         allowed_cats,
+                "COOLDOWN":             cooldown_json,
+            }
+            feeder_env_lines = "\n".join(
+                f"      {k}: {json.dumps(v)}" for k, v in feeder_env.items()
+            )
+            services.append(f"""\
+  feeder-{fid}:
+    build: ./feeder
+    container_name: feeder-{fid}
+    restart: unless-stopped
+    depends_on: [detector-{cid}]
+    environment:
+{feeder_env_lines}
+    volumes:
+      - ./data/cooldowns:/data/cooldowns
+""")
+
     return (
         "# GENERATED by tools/configure.py from cameras.yaml — do not edit.\n"
         "services:\n" + "\n".join(services)
