@@ -33,9 +33,13 @@
 #     allowed_cats   — list of cat names allowed to open this feeder. Names must
 #                      match class_names in the classifier model. Nothing hardcoded
 #                      here — add/remove names freely.
-#     cooldown_hours — optional map of cat → cooldown in hours. Cats not listed
-#                      have no cooldown (can open repeatedly). Example:
-#                        alisa: 4.0    # 4-hour cooldown after Alisa opens the feeder
+#     cooldown_hours        — optional map of cat → cooldown in hours. Cats not listed
+#                             have no cooldown (can open repeatedly). Example:
+#                               alisa: 4.0    # 4-hour cooldown after Alisa's meal ends
+#     door_close_timeout_sec — seconds without detection before door closes (default 30).
+#                             Tolerates missed frames and pose changes.
+#     min_meal_sec           — min meal duration (sec) to start a cooldown (default 10).
+#                             A brief blip does not lock the cat out.
 #
 # Globals at the top apply to all cameras.
 

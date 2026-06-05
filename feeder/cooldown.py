@@ -2,6 +2,10 @@
 
 Port of donor feeder_state.py — replaces JSON file with SQLite for
 atomic writes and concurrent-reader safety.
+
+Cooldown is recorded at the END of a meal (door close), not at open.
+The DB column last_opened_at is kept as-is to preserve existing rows;
+semantically it now holds the timestamp of the last meal end.
 """
 from __future__ import annotations
 
@@ -29,8 +33,8 @@ class CooldownState:
         )
         self._conn.commit()
 
-    def record_open(self, cat: str, opened_at: dt.datetime | None = None) -> None:
-        ts = (opened_at or _utc_now()).isoformat()
+    def record_meal_end(self, cat: str, ended_at: dt.datetime | None = None) -> None:
+        ts = (ended_at or _utc_now()).isoformat()
         self._conn.execute(
             "INSERT OR REPLACE INTO cooldowns (cat, last_opened_at) VALUES (?, ?)",
             (cat, ts),

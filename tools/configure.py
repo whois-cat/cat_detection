@@ -174,12 +174,14 @@ def render_compose(cfg: dict) -> str:
             allowed_cats = ",".join(feeder.get("allowed_cats", []))
             cooldown_json = json.dumps(feeder.get("cooldown_hours", {}))
             feeder_env = {
-                "CAMERA_ID":            cid,
-                "FEEDER_ID":            fid,
-                "FEEDER_API_BASE_URL":  feeder["api_base_url"],
-                "FEEDER_SERIAL_NUMBER": feeder["serial_number"],
-                "ALLOWED_CATS":         allowed_cats,
-                "COOLDOWN":             cooldown_json,
+                "CAMERA_ID":               cid,
+                "FEEDER_ID":               fid,
+                "FEEDER_API_BASE_URL":     feeder["api_base_url"],
+                "FEEDER_SERIAL_NUMBER":    feeder["serial_number"],
+                "ALLOWED_CATS":            allowed_cats,
+                "COOLDOWN":                cooldown_json,
+                "DOOR_CLOSE_TIMEOUT_SEC":  str(feeder.get("door_close_timeout_sec", 30)),
+                "MIN_MEAL_SEC":            str(feeder.get("min_meal_sec", 10)),
             }
             feeder_env_lines = "\n".join(
                 f"      {k}: {json.dumps(v)}" for k, v in feeder_env.items()
