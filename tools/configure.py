@@ -182,6 +182,8 @@ def render_compose(cfg: dict) -> str:
                 "COOLDOWN":                cooldown_json,
                 "DOOR_CLOSE_TIMEOUT_SEC":  str(feeder.get("door_close_timeout_sec", 30)),
                 "MIN_MEAL_SEC":            str(feeder.get("min_meal_sec", 10)),
+                "PRESENCE_WINDOW_SEC":     str(feeder.get("presence_window_sec", 10)),
+                "PRESENCE_CONFIRM_SEC":    str(feeder.get("presence_confirm_sec", 3)),
             }
             feeder_env_lines = "\n".join(
                 f"      {k}: {json.dumps(v)}" for k, v in feeder_env.items()
