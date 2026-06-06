@@ -40,10 +40,14 @@
 #                             Tolerates missed frames and pose changes.
 #     min_meal_sec           — min meal duration (sec) to start a cooldown (default 10).
 #                             A brief blip does not lock the cat out.
-#     presence_window_sec    — sliding window (sec) used to accumulate identity evidence
-#                             (default 10). Must be <= door_close_timeout_sec.
-#     presence_confirm_sec   — span of evidence (sec) required to confirm a cat's identity
-#                             (default 3). A single misclassified frame is never confirmed.
+#     presence_window_sec    — sliding window (sec) for n_cats counting and identity
+#                             weighted-vote (default 5). Multi-cat requires 2+ frames
+#                             with 2+ boxes within this window — single-frame glitches
+#                             are ignored. Must be <= door_close_timeout_sec.
+#     classifier_min_conf    — feeder-side minimum cat_score to participate in the
+#                             identity vote (default 0.5). Frames below this threshold
+#                             are silently excluded from voting; "unknown" is always
+#                             excluded. Raise this to make identity selection stricter.
 #
 # Globals at the top apply to all cameras.
 
