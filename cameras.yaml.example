@@ -48,6 +48,15 @@
 #                             identity vote (default 0.5). Frames below this threshold
 #                             are silently excluded from voting; "unknown" is always
 #                             excluded. Raise this to make identity selection stricter.
+#     open_debounce_sec      — an allowed+ready cat must stay the dominant open-verdict
+#                             continuously for this long before the door opens (default
+#                             3). Prevents opening on a momentary glimpse.
+#     multi_debounce_sec     — while the door is open, a multi_cat or identity-change
+#                             condition must hold this long before the door closes
+#                             (default 2). Absorbs single glitch frames (a spurious
+#                             second YOLO box, a one-frame misclassification) so the
+#                             door does not chatter. present==False still closes after
+#                             door_close_timeout_sec with no extra delay.
 #
 # Globals at the top apply to all cameras.
 

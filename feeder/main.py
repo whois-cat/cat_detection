@@ -16,6 +16,10 @@ Stats ticks are forwarded to ZoneState so the presence TTL keeps advancing
 even when no cats are detected — this guarantees the door closes after
 DOOR_CLOSE_TIMEOUT_SEC even if the camera produces no new detection events.
 
+The physical door is driven by an explicit state machine (door_fsm.DoorFSM,
+CLOSED→ARMING→OPEN→CLOSING) that debounces the pure decide() verdict so single
+glitch frames never chatter the door. decide() stays a pure function.
+
 Cooldown is recorded at the END of a meal (door close), and only when the
 cat was present for at least MIN_MEAL_SEC.
 
@@ -31,6 +35,10 @@ Env vars (all from configure.py — nothing hardcoded):
   MIN_MEAL_SEC            min meal duration (sec) to record a cooldown (default 10)
   PRESENCE_WINDOW_SEC     sliding window (sec) for n_cats / identity smoothing (default 5)
   CLASSIFIER_MIN_CONF     min cat_score to participate in identity vote (default 0.5)
+  OPEN_DEBOUNCE_SEC       allowed cat must hold the open-verdict this long before
+                          the door opens (default 3)
+  MULTI_DEBOUNCE_SEC      a multi_cat / identity-change condition must hold this
+                          long before an open door closes (default 2)
 """
 from __future__ import annotations
 
@@ -44,6 +52,7 @@ import websockets
 
 from cooldown import CooldownState
 from decision import decide
+from door_fsm import DoorFSM
 from feeder_client import FeederClient
 from zone_state import ZoneState
 
@@ -64,46 +73,15 @@ DOOR_CLOSE_TIMEOUT_SEC = float(os.environ.get("DOOR_CLOSE_TIMEOUT_SEC", "30"))
 MIN_MEAL_SEC           = float(os.environ.get("MIN_MEAL_SEC", "10"))
 PRESENCE_WINDOW_SEC    = float(os.environ.get("PRESENCE_WINDOW_SEC", "5"))
 CLASSIFIER_MIN_CONF    = float(os.environ.get("CLASSIFIER_MIN_CONF", "0.5"))
+OPEN_DEBOUNCE_SEC      = float(os.environ.get("OPEN_DEBOUNCE_SEC", "3"))
+MULTI_DEBOUNCE_SEC     = float(os.environ.get("MULTI_DEBOUNCE_SEC", "2"))
 
 WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 
 # ---- module state (initialised in main()) ----
 
 _zone: ZoneState
-_door_state = "closed"
-_door_cat: str | None = None          # identity for whom the door was opened
-_door_opened_at: float | None = None  # wall_t when door last opened
-_cat_last_seen: float | None = None   # wall_t of most recent _door_cat in-zone detection
-
-
-def _close_door(
-    reason: str,
-    wall_t: float,
-    client: FeederClient,
-    cooldown: CooldownState,
-) -> None:
-    """Close the door, emit a human-readable log line, record cooldown if warranted."""
-    global _door_state, _door_cat, _door_opened_at, _cat_last_seen
-
-    ok = client.set_door("close", reason)
-    if not ok:
-        return
-
-    _door_state = "closed"
-    if _door_opened_at is not None:
-        door_sec = wall_t - _door_opened_at
-        meal_sec = (_cat_last_seen - _door_opened_at) if _cat_last_seen is not None else 0.0
-        print(
-            f"[feeder={FEEDER_ID}] door closed:"
-            f" cat={_door_cat} open={door_sec:.0f}s meal≈{meal_sec:.0f}s reason={reason}",
-            flush=True,
-        )
-        if _door_cat and meal_sec >= MIN_MEAL_SEC:
-            cooldown.record_meal_end(_door_cat)
-
-    _door_cat = None
-    _door_opened_at = None
-    _cat_last_seen = None
+_fsm: DoorFSM
 
 
 def _handle_event(
@@ -111,8 +89,6 @@ def _handle_event(
     client: FeederClient,
     cooldown: CooldownState,
 ) -> None:
-    global _door_state, _door_cat, _door_opened_at, _cat_last_seen
-
     wall_t: float = (ev.get("wall_ms") or time.time() * 1000) / 1000.0
 
     if ev.get("kind") == "stats":
@@ -120,49 +96,37 @@ def _handle_event(
         # detection bursts — without this, the door would never close if no
         # detection events arrive for DOOR_CLOSE_TIMEOUT_SEC.
         _zone.update(wall_t, None, None, False)
-
     elif not ev.get("boxes"):
         # Clear event: detector has no detections; advance clock.
         _zone.update(wall_t, None, None, False)
-
     else:
         # Regular event: exactly one box per message (detector protocol).
         box = ev["boxes"][0]
-        this_cat = ev.get("cat")
-        in_action = bool(box.get("in_action"))
-        # Track last time the currently-open cat was seen (for meal_sec log).
-        if _door_cat and this_cat == _door_cat and in_action:
-            _cat_last_seen = wall_t
-        _zone.update(wall_t, this_cat, ev.get("cat_score"), in_action)
+        _zone.update(wall_t, ev.get("cat"), ev.get("cat_score"), bool(box.get("in_action")))
 
     snap = _zone.snapshot(wall_t)
-
-    # Identity change while door is open: the dominant cat has switched.
-    # Close and attribute the meal to the cat the door was opened for, then
-    # fall through to re-evaluate whether to open for the new identity.
-    if (
-        _door_state == "open"
-        and _door_cat is not None
-        and snap.identity is not None
-        and snap.identity != _door_cat
-        and snap.present
-    ):
-        _close_door("identity_change", wall_t, client, cooldown)
-
     action, reason = decide(snap, ALLOWED_CATS, cooldown, COOLDOWN_HOURS)
+    cmd = _fsm.step(wall_t, snap, action, reason)
 
-    if action == "open" and _door_state != "open":
-        ok = client.set_door("open", reason)
-        if ok:
-            _door_state = "open"
-            _door_cat = reason     # reason IS the identity when action == "open"
-            _door_opened_at = wall_t
-            _cat_last_seen = wall_t
+    if cmd.kind == "open":
+        if client.set_door("open", cmd.reason):
+            _fsm.confirm_open(cmd.cat, wall_t)
+            print(f"[feeder={FEEDER_ID}] door opened: cat={cmd.cat}", flush=True)
 
-    elif action == "close" and _door_state != "closed":
-        _close_door(reason, wall_t, client, cooldown)
+    elif cmd.kind == "close":
+        if client.set_door("close", cmd.reason):
+            door_sec = (wall_t - _fsm.opened_at) if _fsm.opened_at is not None else 0.0
+            print(
+                f"[feeder={FEEDER_ID}] door closed:"
+                f" cat={cmd.cat} open={door_sec:.0f}s meal≈{snap.meal_sec:.0f}s"
+                f" reason={cmd.reason}",
+                flush=True,
+            )
+            if cmd.cat and snap.meal_sec >= MIN_MEAL_SEC:
+                cooldown.record_meal_end(cmd.cat)
+            _fsm.confirm_close()
 
-    # action == None: cooldown hold — keep current state unchanged
+    # cmd.kind is None: arming / latch hold / closing debounce — no door change.
 
 
 async def _run(client: FeederClient, cooldown: CooldownState) -> None:
@@ -173,7 +137,8 @@ async def _run(client: FeederClient, cooldown: CooldownState) -> None:
                     f"[feeder={FEEDER_ID}] connected to {WS_URL} "
                     f"allowed={ALLOWED_CATS} cooldown={COOLDOWN_HOURS} "
                     f"close_timeout={DOOR_CLOSE_TIMEOUT_SEC}s min_meal={MIN_MEAL_SEC}s "
-                    f"presence_win={PRESENCE_WINDOW_SEC}s min_conf={CLASSIFIER_MIN_CONF}",
+                    f"presence_win={PRESENCE_WINDOW_SEC}s min_conf={CLASSIFIER_MIN_CONF} "
+                    f"open_debounce={OPEN_DEBOUNCE_SEC}s multi_debounce={MULTI_DEBOUNCE_SEC}s",
                     flush=True,
                 )
                 async for raw in ws:
@@ -191,7 +156,7 @@ async def _run(client: FeederClient, cooldown: CooldownState) -> None:
 
 
 def main() -> None:
-    global _zone
+    global _zone, _fsm
     print(
         f"[feeder={FEEDER_ID}] starting — camera={CAMERA_ID} "
         f"api={FEEDER_API_BASE_URL} serial={FEEDER_SERIAL_NUMBER}",
@@ -201,6 +166,10 @@ def main() -> None:
         window_sec=PRESENCE_WINDOW_SEC,
         door_close_timeout_sec=DOOR_CLOSE_TIMEOUT_SEC,
         classifier_min_conf=CLASSIFIER_MIN_CONF,
+    )
+    _fsm = DoorFSM(
+        open_debounce_sec=OPEN_DEBOUNCE_SEC,
+        multi_debounce_sec=MULTI_DEBOUNCE_SEC,
     )
     cooldown = CooldownState(COOLDOWN_DB)
     client = FeederClient(

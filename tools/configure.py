@@ -184,6 +184,8 @@ def render_compose(cfg: dict) -> str:
                 "MIN_MEAL_SEC":            str(feeder.get("min_meal_sec", 10)),
                 "PRESENCE_WINDOW_SEC":     str(feeder.get("presence_window_sec", 5)),
                 "CLASSIFIER_MIN_CONF":     str(feeder.get("classifier_min_conf", 0.5)),
+                "OPEN_DEBOUNCE_SEC":       str(feeder.get("open_debounce_sec", 3)),
+                "MULTI_DEBOUNCE_SEC":      str(feeder.get("multi_debounce_sec", 2)),
             }
             feeder_env_lines = "\n".join(
                 f"      {k}: {json.dumps(v)}" for k, v in feeder_env.items()
