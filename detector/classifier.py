@@ -47,8 +47,15 @@ class CatClassifier:
 
         model_dir = Path(model_dir)
         core = ov.Core()
+        # Force FP32 inference. The CPU plugin otherwise runs FP32 IRs in bf16 by
+        # default on AVX512_BF16/AMX hardware, whose ~8-bit mantissa shifts logits
+        # by up to ~1e1 vs the trained torch model. argmax usually survives, but
+        # the cat_score confidences would no longer match training (and the export
+        # parity gate enforces FP32). The speed cost is negligible for one B0 crop.
         self._compiled = core.compile_model(
-            core.read_model(str(model_dir / "cat_classifier.xml")), "CPU"
+            core.read_model(str(model_dir / "cat_classifier.xml")),
+            "CPU",
+            {"INFERENCE_PRECISION_HINT": "f32"},
         )
         self.class_names: list[str] = json.loads(
             (model_dir / "classes.json").read_text(encoding="utf-8")

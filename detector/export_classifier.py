@@ -31,18 +31,19 @@ Both gates require max|Δ| < PARITY_TOL. The model gate additionally requires th
 argmax (the actual identity decision) to match on every sample.
 
 Correctness-by-construction notes (each kills a known cause of false/real drift):
-  - The torch model is put in eval() once and re-asserted to be in eval()
-    immediately before the reference forward. BatchNorm in training mode would
-    recompute batch statistics from the (noisy) parity input and blow the drift
-    up to double digits while OpenVINO stays correct — this is the #1 trap.
-  - All torch forwards (including the convert_model trace) run under
-    torch.inference_mode().
-  - The IR is saved with compress_to_fp16=False so the runtime is FP32, matching
-    torch (FP16 would add ~1e-2 and is ruled out as a factor).
-  - Both backends receive the byte-for-byte same float32 array: from
-    classifier._preprocess on real crops, or a fixed-seed synthetic batch drawn
-    in the *normalized* input range (N(0,1)) — never zeros, which would mask a
-    train/eval BatchNorm mismatch.
+  - FP32 inference is forced via INFERENCE_PRECISION_HINT=f32 on the CPU plugin.
+    This is THE one that mattered: the plugin runs FP32 IRs in bf16 by default on
+    AVX512_BF16/AMX CPUs, whose ~8-bit mantissa shifts logits by up to ~1e1
+    (argmax usually survives, magnitudes don't). classifier.py sets the same hint
+    at runtime, so the gate matches production.
+  - The IR is saved with compress_to_fp16=False (the on-disk weights stay FP32).
+  - The torch model is in eval() under torch.inference_mode() for the reference
+    forward (BatchNorm in train mode would recompute batch stats and diverge);
+    convert_model traces under no_grad (inference_mode breaks torch.jit.trace).
+  - Both backends receive the byte-for-byte same float32 array, produced by the
+    *runtime* classifier._preprocess on real crops (--crops) or on synthetic
+    images — so inputs stay in the true ImageNet-normalized range, never raw
+    N(0,1) (out-of-distribution, inflates logit diffs) and never zeros.
 """
 from __future__ import annotations
 
@@ -55,7 +56,6 @@ from pathlib import Path
 PARITY_TOL = 1e-3
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-_N_SYNTHETIC = 8
 
 
 # ---- crop / input loading ----------------------------------------------------
@@ -85,26 +85,22 @@ def _synthetic_uint8_crops() -> list:
 def _model_parity_inputs(crops_dir: Path | None) -> list:
     """Return preprocessed model inputs: list of (1,3,224,224) float32 arrays.
 
-    Real crops go through the *runtime* classifier._preprocess (so the gate
-    exercises the exact production input). Without --crops we synthesize a
-    fixed-seed batch in the normalized input range — NOT zeros, so a BatchNorm
-    train/eval mismatch can't hide behind a degenerate input.
+    Both branches run the *runtime* classifier._preprocess, so the gate
+    exercises exactly the production input format and value range
+    (ImageNet-normalized, ~[-2.1, 2.6]). Raw N(0,1) tensors were a mistake:
+    they're out-of-distribution and unbounded, which drives activations into
+    extreme regimes and inflates absolute logit diffs for reasons unrelated to
+    export fidelity.
     """
     import numpy as np
 
-    if crops_dir is not None:
-        from classifier import _preprocess
+    crops = _load_real_crops(crops_dir) if crops_dir is not None else _synthetic_uint8_crops()
+    from classifier import _preprocess
 
-        crops = _load_real_crops(crops_dir)
-        inputs = [np.ascontiguousarray(_preprocess(c), dtype=np.float32) for c in crops]
-        print(f"[parity] model inputs: {len(inputs)} real crops via _preprocess",
-              flush=True)
-        return inputs
-
-    rng = np.random.default_rng(0)
-    inputs = [rng.standard_normal((1, 3, 224, 224)).astype(np.float32)
-              for _ in range(_N_SYNTHETIC)]
-    print(f"[parity] model inputs: {len(inputs)} synthetic N(0,1) tensors", flush=True)
+    inputs = [np.ascontiguousarray(_preprocess(c), dtype=np.float32) for c in crops]
+    kind = "real" if crops_dir is not None else "synthetic"
+    print(f"[parity] model inputs: {len(inputs)} {kind} crops via _preprocess",
+          flush=True)
     return inputs
 
 
@@ -228,9 +224,14 @@ def export(pt_path: Path, out_dir: Path, crops_dir: Path | None = None) -> None:
     _check_preprocess_parity(crops_dir)
 
     # Test the SHIPPED artifact: re-read the saved .xml rather than the in-memory
-    # model, so what we validate is exactly what runtime loads.
+    # model, so what we validate is exactly what runtime loads. Force FP32 — the
+    # CPU plugin defaults to bf16 on AVX512_BF16/AMX, which alone shifts logits by
+    # up to ~1e1 (argmax survives, magnitudes don't). classifier.py uses the same
+    # hint at runtime, so this matches production.
     core = ov.Core()
-    compiled = core.compile_model(core.read_model(str(xml_path)), "CPU")
+    compiled = core.compile_model(
+        core.read_model(str(xml_path)), "CPU", {"INFERENCE_PRECISION_HINT": "f32"}
+    )
     inputs = _model_parity_inputs(crops_dir)
     _check_model_parity(model, compiled, inputs)
 
