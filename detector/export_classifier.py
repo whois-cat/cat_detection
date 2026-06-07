@@ -24,11 +24,12 @@ on any mismatch. Two independent gates:
      resize/antialias/rounding drift.
   2. Model parity — the exported OpenVINO model (re-read from the saved .xml, so
      we test the *shipped artifact*, not an in-memory object) and the torch
-     model are fed the *same* normalized NCHW float32 tensor; their logits and
-     argmax must agree.
+     model are fed the *same* normalized NCHW float32 tensor; their softmax
+     probabilities (== the runtime cat_score) and argmax must agree.
 
-Both gates require max|Δ| < PARITY_TOL. The model gate additionally requires the
-argmax (the actual identity decision) to match on every sample.
+The preprocessing gate requires max|Δ| < PARITY_TOL. The model gate requires
+max|Δprob| < PARITY_TOL AND a matching argmax on every sample — i.e. the
+quantities production actually consumes, not raw logits (see PARITY_TOL).
 
 Correctness-by-construction notes (each kills a known cause of false/real drift):
   - FP32 inference is forced via INFERENCE_PRECISION_HINT=f32 on the CPU plugin.
@@ -51,8 +52,13 @@ import json
 import sys
 from pathlib import Path
 
-# Logits are FP32→FP32 (no quantization on the classifier) and preprocessing is
-# bit-identical, so the tolerance is tight on purpose. Do not raise it to "pass".
+# The gate compares softmax PROBABILITIES (== the runtime cat_score), not raw
+# logits: classifier.py returns softmax(logits).max(), the feeder votes by that
+# cat_score and thresholds on CLASSIFIER_MIN_CONF, and raw logits have an
+# arbitrary scale (the trained net emits |logit|~1e3 on off-distribution inputs,
+# where even faithful FP32 torch-vs-OpenVINO differ by ~1% absolute). Probability
+# space is bounded [0,1] and is exactly what production consumes, so 1e-3 here is
+# both tight and meaningful. Do not raise it to "pass".
 PARITY_TOL = 1e-3
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -139,52 +145,62 @@ def _check_preprocess_parity(crops_dir: Path | None) -> None:
         )
 
 
+def _softmax(z):
+    import numpy as np
+
+    z = z - z.max()
+    e = np.exp(z)
+    return e / e.sum()
+
+
 def _check_model_parity(model, compiled, inputs: list) -> None:
     """Read-back OpenVINO model vs torch model on identical normalized inputs.
 
-    Requires max|Δlogits| < PARITY_TOL AND matching argmax on every sample.
+    Compares the quantity production actually uses — the softmax probability
+    vector (the cat_score the feeder votes on) — plus the argmax decision.
+    Requires max|Δprob| < PARITY_TOL AND matching argmax on every sample. Raw
+    |Δlogit| is printed for diagnosis only (logits carry an arbitrary scale and
+    blow up on off-distribution inputs, so they're not a sane pass/fail signal).
     """
     import numpy as np
     import torch
 
-    # Re-assert eval() right before the reference forward: convert_model / tracing
-    # can leave the module's training flag flipped, and BatchNorm in train mode
-    # would recompute batch stats from these inputs → large structural drift.
+    # Defensive: BatchNorm in train mode would recompute batch stats and diverge.
     model.eval()
     assert not model.training, "torch reference must be in eval() for parity"
 
     out_port = compiled.output(0)
-    worst = 0.0
+    worst_p = 0.0
     failures = 0
     with torch.inference_mode():
         for i, x in enumerate(inputs):
             x = np.ascontiguousarray(x, dtype=np.float32)   # (1,3,224,224)
             torch_logits = model(torch.from_numpy(x)).cpu().numpy()[0]
             ov_logits = np.asarray(compiled(x)[out_port])[0]
-            d = float(np.max(np.abs(torch_logits - ov_logits)))
-            rel = d / (float(np.max(np.abs(torch_logits))) + 1e-9)
-            t_arg = int(torch_logits.argmax())
-            o_arg = int(ov_logits.argmax())
-            ok = d < PARITY_TOL and t_arg == o_arg
-            worst = max(worst, d)
+            torch_p = _softmax(torch_logits)
+            ov_p = _softmax(ov_logits)
+            dp = float(np.max(np.abs(torch_p - ov_p)))        # bounds cat_score error
+            dl = float(np.max(np.abs(torch_logits - ov_logits)))  # diagnostic only
+            t_arg = int(torch_p.argmax())
+            o_arg = int(ov_p.argmax())
+            ok = dp < PARITY_TOL and t_arg == o_arg
+            worst_p = max(worst_p, dp)
             failures += 0 if ok else 1
-            print(f"[parity] sample {i}: max|Δ|={d:.3e} rel={rel:.3e} "
-                  f"argmax torch={t_arg} ov={o_arg} {'OK' if ok else 'FAIL'}",
+            print(f"[parity] sample {i}: max|Δprob|={dp:.3e} (cat_score) "
+                  f"max|Δlogit|={dl:.3e} argmax torch={t_arg} ov={o_arg} "
+                  f"{'OK' if ok else 'FAIL'}", flush=True)
+            print(f"           torch_p={np.array2string(torch_p, precision=5, suppress_small=True)}",
                   flush=True)
-            # Full vectors localize the divergence: a ~constant rel across classes
-            # = precision (bf16); a single bad class or a clean scale = structural.
-            print(f"           torch={np.array2string(torch_logits, precision=4, suppress_small=True)}",
-                  flush=True)
-            print(f"           ov   ={np.array2string(ov_logits, precision=4, suppress_small=True)}",
+            print(f"           ov_p   ={np.array2string(ov_p, precision=5, suppress_small=True)}",
                   flush=True)
 
-    print(f"[parity] torch↔OpenVINO worst max|Δlogits| = {worst:.3e} "
+    print(f"[parity] torch↔OpenVINO worst max|Δprob| = {worst_p:.3e} "
           f"over {len(inputs)} samples", flush=True)
     if failures:
         sys.exit(
             f"[parity] FAIL: {failures}/{len(inputs)} sample(s) diverged "
-            f"(need max|Δ| < {PARITY_TOL:.0e} AND matching argmax). The exported "
-            "IR is not faithful to torch — do not ship it."
+            f"(need max|Δprob| < {PARITY_TOL:.0e} AND matching argmax). The "
+            "exported IR is not faithful to torch — do not ship it."
         )
 
 
