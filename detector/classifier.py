@@ -15,15 +15,24 @@ _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def _preprocess(crop_rgb: np.ndarray) -> np.ndarray:
+    # Must be bit-identical to the training transform
+    # (torchvision Resize(256) + CenterCrop(224), PIL backend). Two rounding
+    # rules have to match torchvision exactly or the runtime crop drifts a
+    # row/column from training (verified by export_classifier.py's parity gate):
+    #   - Resize: long edge = int(256 * long / short)  — truncation, not round.
+    #   - CenterCrop: offset = round((dim - 224) / 2)   — round, not floor.
     from PIL import Image
 
     img = Image.fromarray(crop_rgb).convert("RGB")
     w, h = img.size
-    scale = 256 / min(w, h)
-    img = img.resize((round(w * scale), round(h * scale)), Image.BILINEAR)
+    if w <= h:
+        nw, nh = 256, int(256 * h / w)
+    else:
+        nw, nh = int(256 * w / h), 256
+    img = img.resize((nw, nh), Image.BILINEAR)
     w, h = img.size
-    left = (w - 224) // 2
-    top = (h - 224) // 2
+    left = int(round((w - 224) / 2.0))
+    top = int(round((h - 224) / 2.0))
     img = img.crop((left, top, left + 224, top + 224))
     arr = np.array(img, dtype=np.float32) / 255.0
     arr = (arr - _IMAGENET_MEAN) / _IMAGENET_STD

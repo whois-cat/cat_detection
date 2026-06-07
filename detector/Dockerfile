@@ -26,11 +26,14 @@ RUN mkdir -p /opt/models \
 
 # ── Classifier: PT → OpenVINO IR + classes.json ────────────────────────────
 COPY models/cat_classifier.pt /app/models/cat_classifier.pt
-COPY export_classifier.py ./
+# classifier.py is copied here (not with the rest below) because the export
+# step's parity gate imports its runtime _preprocess to prove the exported IR
+# matches torch on the real preprocessing.
+COPY export_classifier.py classifier.py ./
 RUN python export_classifier.py \
     --pt /app/models/cat_classifier.pt \
     --out /opt/models/cat_classifier_openvino/
 
-COPY storage.py detectors.py classifier.py main.py ./
+COPY storage.py detectors.py main.py ./
 
 CMD ["python", "-u", "main.py"]

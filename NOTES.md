@@ -483,6 +483,16 @@ resolved by later architecture decisions (noted).
     Added `FRAME_ROTATE_DEG` that rotates only the inference crop and
     un-rotates detected boxes back to camera coords. UI unchanged
     (camera-orientation is the source of truth).
+19. **Classifier preprocessing drifted from training by a row/column**:
+    `detector/classifier.py::_preprocess` reimplements the torchvision
+    Resize(256)+CenterCrop(224) pipeline by hand. It used floor (`//2`) for the
+    center-crop offset, but torchvision uses `round((dim-224)/2)` — so for an
+    odd size difference the crop was shifted one pixel off from training. (Resize
+    must also use `int(256*long/short)` truncation, matching torchvision, not
+    `round`.) Caught by the parity gate added to `export_classifier.py`: it
+    compares `_preprocess` against the torchvision transform and the exported
+    OpenVINO logits against torch on real/synthetic crops, failing the build if
+    `max|Δ| >= 1e-3`. Pass `--crops <dir>` to validate on real cat crops.
 
 ---
 
