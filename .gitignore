@@ -4,6 +4,8 @@
 .env.local
 # Per-camera config carries RTSP credentials — commit cameras.yaml.example instead.
 cameras.yaml
+# Generated camera RTSP sources with credentials (MTX_PATHS_<ID>_SOURCE).
+secrets/
 data/
 
 # Python

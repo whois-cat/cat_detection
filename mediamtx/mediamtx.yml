@@ -28,7 +28,7 @@ playbackAddress: :9996
 
 paths:
   camera:
-    source: rtsp://camera:f9AP0c1APMG4E0rBt0bHrYmp1KiScMg4@192.168.0.214:554/stream1
+    # source: set via MTX_PATHS_CAMERA_SOURCE (secrets/cameras.env)
     sourceProtocol: tcp
     sourceOnDemand: no
     record: yes

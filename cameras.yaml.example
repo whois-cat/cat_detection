@@ -9,8 +9,16 @@
 #   just devserver         # docker compose up
 #
 # Field reference per camera:
-#   id              — short slug. Must match [a-z0-9-]+.
-#   rtsp            — full RTSP URL (with credentials). Don't quote.
+#   id              — short slug. Must match [a-z0-9]+ (NO hyphens: the id
+#                     becomes a mediamtx path overridden via
+#                     MTX_PATHS_<ID>_SOURCE, whose env key can't carry hyphens).
+#   rtsp            — full RTSP URL, credentials embedded inline. Don't quote.
+#                     If the camera needs auth, embed it like
+#                       rtsp://USERNAME : PASSWORD @ 192.168.0.214:554/stream1
+#                     (written WITHOUT the spaces — they're here only to keep
+#                     credentials out of the committed example). This value is
+#                     never written to any committed file: configure.py emits it
+#                     to the gitignored secrets/cameras.env as MTX_PATHS_<ID>_SOURCE.
 #   label           — optional pretty name for the UI picker.
 #   detector_type   — "blob" | "yolo" | "yolo_cat"
 #                     yolo_cat: YOLO detects cats, EfficientNet-B0 identifies them.
@@ -65,7 +73,8 @@ webrtc_host: 192.168.0.10        # public IP/host the browser dials for WebRTC I
 cameras:
   - id: living
     label: Living room
-    rtsp: rtsp://camera:CHANGEME@192.168.0.214:554/stream1
+    # Embed credentials inline (see rtsp note above); kept bare here.
+    rtsp: rtsp://192.168.0.214:554/stream1
     detector_type: yolo_cat
     rotate_deg: 0
     feeder:
@@ -79,7 +88,7 @@ cameras:
 
   - id: kitchen
     label: Kitchen
-    rtsp: rtsp://camera:CHANGEME@192.168.0.215:554/stream1
+    rtsp: rtsp://192.168.0.215:554/stream1
     detector_type: yolo_cat
     rotate_deg: 90
     feeder:
