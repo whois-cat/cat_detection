@@ -295,6 +295,7 @@ Wire (WebSocket / `/events`):
   "media_t": 0.057,
   "w": 2304, "h": 1296,
   "cat": "alisa",
+  "cat_score": 0.91,
   "camera_id": "default",
   "model": "yolov8n",
   "boxes": [{"x": 412, "y": 220, "w": 80, "h": 60,
@@ -304,6 +305,11 @@ Wire (WebSocket / `/events`):
 
 - **One event per detected box.** Multiple boxes in one frame produce
   multiple events with identical `wall_ms`/`pts`.
+- **`cat_score`**: identity-classifier confidence for `cat`, top-level
+  (mirrors `cat`). Present only for `yolo_cat`; `null` for blob/yolo (no
+  per-cat identity). The feeder weights identity votes by this value and
+  drops frames below its `CLASSIFIER_MIN_CONF`, so it MUST travel with the
+  event — it is also persisted to the `cat_score` column for training.
 - **Camera coordinates everywhere.** See the coordinate-basis discussion
   in §2.
 - **`in_action`**: box-center inside `ACTION_POLYGON`. Action-trigger

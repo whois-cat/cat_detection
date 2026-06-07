@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS events (
     media_t   REAL,
     frame_w   INTEGER, frame_h INTEGER,
     cat       TEXT,
+    cat_score REAL,
     box_x     INTEGER, box_y INTEGER, box_w INTEGER, box_h INTEGER,
     score     REAL,
     track_id  INTEGER,
@@ -38,7 +39,20 @@ def init_db(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent, additive schema migrations for pre-existing databases.
+
+    `cat_score` was added after the first events.db files were created in the
+    field; ADD COLUMN is the only safe in-place change SQLite supports without
+    a table rebuild, and a duplicate-column error just means we're already
+    migrated."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "cat_score" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN cat_score REAL")
 
 
 def insert_event(conn: sqlite3.Connection, *,
@@ -46,17 +60,17 @@ def insert_event(conn: sqlite3.Connection, *,
                  pts: int | None, tb_num: int | None, tb_den: int | None,
                  media_t: float | None,
                  frame_w: int, frame_h: int,
-                 cat: str | None,
+                 cat: str | None, cat_score: float | None,
                  box_x: int, box_y: int, box_w: int, box_h: int, score: float,
                  track_id: int | None = None, source: str = "detector") -> None:
     conn.execute(
         """INSERT INTO events
            (camera_id, model, wall_ms, pts, tb_num, tb_den, media_t,
-            frame_w, frame_h, cat,
+            frame_w, frame_h, cat, cat_score,
             box_x, box_y, box_w, box_h, score, track_id, source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (camera_id, model, wall_ms, pts, tb_num, tb_den, media_t,
-         frame_w, frame_h, cat,
+         frame_w, frame_h, cat, cat_score,
          box_x, box_y, box_w, box_h, score, track_id, source),
     )
 
@@ -67,7 +81,7 @@ def query_events(conn: sqlite3.Connection, *,
     """Return events as one dict per row, in browser-compatible shape."""
     sql = (
         "SELECT wall_ms, pts, tb_num, tb_den, media_t,"
-        "       frame_w, frame_h, cat,"
+        "       frame_w, frame_h, cat, cat_score,"
         "       box_x, box_y, box_w, box_h, score, track_id, model "
         "FROM events WHERE camera_id=? AND wall_ms BETWEEN ? AND ?"
     )
@@ -81,9 +95,9 @@ def query_events(conn: sqlite3.Connection, *,
         out.append({
             "wall_ms": r[0], "pts": r[1],
             "tb_num": r[2], "tb_den": r[3], "media_t": r[4],
-            "w": r[5], "h": r[6], "cat": r[7],
-            "boxes": [{"x": r[8], "y": r[9], "w": r[10], "h": r[11], "score": r[12]}],
-            "track_id": r[13], "model": r[14],
+            "w": r[5], "h": r[6], "cat": r[7], "cat_score": r[8],
+            "boxes": [{"x": r[9], "y": r[10], "w": r[11], "h": r[12], "score": r[13]}],
+            "track_id": r[14], "model": r[15],
         })
     return out
 

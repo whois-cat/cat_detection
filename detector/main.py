@@ -9,10 +9,11 @@ Events sent over WebSocket have the shape:
     "tb_num":   int, "tb_den": int,
     "media_t":  float,
     "w": int, "h": int,
-    "cat":      str | null,
+    "cat":       str | null,
+    "cat_score": float | null,   # classifier identity confidence; null for blob/yolo
     "camera_id": str,
     "model":    str,
-    "boxes":    [{"x":int, "y":int, "w":int, "h":int, "score":float}, ...]
+    "boxes":    [{"x":int, "y":int, "w":int, "h":int, "score":float, "in_action":bool}, ...]
   }
 
 Also broadcast on the same WS, identified by `kind` field:
@@ -273,6 +274,7 @@ def detector_loop():
             ev = {
                 **base,
                 "cat": b.get("cat"),
+                "cat_score": b.get("cat_score"),  # classifier identity confidence (None for blob/yolo)
                 "boxes": [{"x": b["x"], "y": b["y"], "w": b["w"], "h": b["h"],
                            "score": b["score"], "in_action": in_action}],
             }
@@ -385,7 +387,7 @@ async def fanout_task():
                     pts=ev.get("pts"), tb_num=ev.get("tb_num"), tb_den=ev.get("tb_den"),
                     media_t=ev.get("media_t"),
                     frame_w=ev["w"], frame_h=ev["h"],
-                    cat=ev.get("cat"),
+                    cat=ev.get("cat"), cat_score=ev.get("cat_score"),
                     box_x=b["x"], box_y=b["y"], box_w=b["w"], box_h=b["h"],
                     score=b.get("score", 0.0),
                     track_id=ev.get("track_id"),
