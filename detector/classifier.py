@@ -44,18 +44,20 @@ class CatClassifier:
 
     def __init__(self, model_dir: str | Path) -> None:
         import openvino as ov
+        import openvino.properties.hint as hints
 
         model_dir = Path(model_dir)
         core = ov.Core()
         # Force FP32 inference. The CPU plugin otherwise runs FP32 IRs in bf16 by
         # default on AVX512_BF16/AMX hardware, whose ~8-bit mantissa shifts logits
-        # by up to ~1e1 vs the trained torch model. argmax usually survives, but
-        # the cat_score confidences would no longer match training (and the export
-        # parity gate enforces FP32). The speed cost is negligible for one B0 crop.
+        # vs the trained torch model. argmax usually survives, but the cat_score
+        # confidences would drift from training (and the export parity gate
+        # enforces FP32). Typed property — string keys can be silently ignored.
+        # The speed cost is negligible for one B0 crop.
         self._compiled = core.compile_model(
             core.read_model(str(model_dir / "cat_classifier.xml")),
             "CPU",
-            {"INFERENCE_PRECISION_HINT": "f32"},
+            {hints.inference_precision: ov.Type.f32},
         )
         self.class_names: list[str] = json.loads(
             (model_dir / "classes.json").read_text(encoding="utf-8")

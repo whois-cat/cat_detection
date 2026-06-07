@@ -162,13 +162,20 @@ def _check_model_parity(model, compiled, inputs: list) -> None:
             torch_logits = model(torch.from_numpy(x)).cpu().numpy()[0]
             ov_logits = np.asarray(compiled(x)[out_port])[0]
             d = float(np.max(np.abs(torch_logits - ov_logits)))
+            rel = d / (float(np.max(np.abs(torch_logits))) + 1e-9)
             t_arg = int(torch_logits.argmax())
             o_arg = int(ov_logits.argmax())
             ok = d < PARITY_TOL and t_arg == o_arg
             worst = max(worst, d)
             failures += 0 if ok else 1
-            print(f"[parity] sample {i}: max|Δ|={d:.3e} "
+            print(f"[parity] sample {i}: max|Δ|={d:.3e} rel={rel:.3e} "
                   f"argmax torch={t_arg} ov={o_arg} {'OK' if ok else 'FAIL'}",
+                  flush=True)
+            # Full vectors localize the divergence: a ~constant rel across classes
+            # = precision (bf16); a single bad class or a clean scale = structural.
+            print(f"           torch={np.array2string(torch_logits, precision=4, suppress_small=True)}",
+                  flush=True)
+            print(f"           ov   ={np.array2string(ov_logits, precision=4, suppress_small=True)}",
                   flush=True)
 
     print(f"[parity] torch↔OpenVINO worst max|Δlogits| = {worst:.3e} "
@@ -225,13 +232,26 @@ def export(pt_path: Path, out_dir: Path, crops_dir: Path | None = None) -> None:
 
     # Test the SHIPPED artifact: re-read the saved .xml rather than the in-memory
     # model, so what we validate is exactly what runtime loads. Force FP32 — the
-    # CPU plugin defaults to bf16 on AVX512_BF16/AMX, which alone shifts logits by
-    # up to ~1e1 (argmax survives, magnitudes don't). classifier.py uses the same
-    # hint at runtime, so this matches production.
+    # CPU plugin defaults to bf16 on AVX512_BF16/AMX, which shifts logits by a
+    # ~constant relative error (argmax survives, magnitudes don't). Use the typed
+    # property (string keys can be silently ignored) and PRINT the effective
+    # precision so the build log proves whether f32 actually took.
+    import openvino.properties.hint as hints
+
+    print(f"[export] openvino {ov.get_version()} devices={ov.Core().available_devices}",
+          flush=True)
     core = ov.Core()
+    core.set_property("CPU", {hints.inference_precision: ov.Type.f32})
     compiled = core.compile_model(
-        core.read_model(str(xml_path)), "CPU", {"INFERENCE_PRECISION_HINT": "f32"}
+        core.read_model(str(xml_path)), "CPU",
+        {hints.inference_precision: ov.Type.f32},
     )
+    try:
+        eff = compiled.get_property(hints.inference_precision)
+    except Exception:
+        eff = compiled.get_property("INFERENCE_PRECISION_HINT")
+    print(f"[export] CPU effective inference_precision = {eff}", flush=True)
+
     inputs = _model_parity_inputs(crops_dir)
     _check_model_parity(model, compiled, inputs)
 
