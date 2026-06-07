@@ -55,6 +55,18 @@ Generated files (`mediamtx/mediamtx.yml`, `docker-compose.cameras*.yml`,
 `webui/nginx.conf`, `webui/public/cameras.json`) ARE committed for
 inspectability; rerun `just configure` after editing `cameras.yaml`.
 
+### Camera credentials
+
+Camera RTSP URLs carry passwords, so they never land in a committed file.
+`just configure` writes the credentialed URLs to **`secrets/cameras.env`**
+(gitignored, chmod 600) as `MTX_PATHS_<ID>_SOURCE=…` env vars, which
+docker-compose loads into the mediamtx container (mediamtx does no `${VAR}`
+substitution in YAML, only this env override). The committed
+`mediamtx/mediamtx.yml` has no `source:` line. Camera ids must be
+**hyphen-free** because they become mediamtx path keys addressed via
+underscore-separated env vars. Rotate a camera password by editing
+`cameras.yaml` and rerunning `just configure`.
+
 ## Services
 
 | Service | Role | Ports |

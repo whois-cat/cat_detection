@@ -450,7 +450,14 @@ resolved by later architecture decisions (noted).
 11. **mediamtx YAML doesn't do `${VAR}` substitution**: only the
     `MTX_<UPPERCASE>` env-var override mechanism. Got
     `invalid source: '${RTSP_URL}'` until we set
-    `MTX_PATHS_CAMERA_SOURCE` directly on the container.
+    `MTX_PATHS_CAMERA_SOURCE` directly on the container. This is now how camera
+    credentials stay out of git: `configure.py` writes the credentialed RTSP
+    URLs to the gitignored `secrets/cameras.env` as `MTX_PATHS_<ID>_SOURCE`,
+    docker-compose loads it via `env_file`, and the committed `mediamtx.yml`
+    paths have no `source:` line. mediamtx derives the path key from the env
+    var name by splitting on underscores (`MTX_PATHS_<KEY>_SOURCE`), so a
+    hyphen in a path name can't be addressed — camera ids must be hyphen-free
+    (enforced in `configure.py`).
 12. **mediamtx `/get` returns chunked fMP4, not an HLS playlist**.
     hls.js logged `manifestParsingError`. Dropped hls.js, switched to
     native `<video src>` playback.
