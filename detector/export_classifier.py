@@ -205,10 +205,12 @@ def export(pt_path: Path, out_dir: Path, crops_dir: Path | None = None) -> None:
     model.eval()                                      # once, before anything
     print(f"[export] model.training after eval() = {model.training}", flush=True)
 
-    # Convert under inference_mode; example_input is shape-only (its values are
-    # irrelevant — eval BatchNorm uses running stats, not this tensor).
+    # Convert under no_grad (NOT inference_mode): convert_model traces via
+    # torch.jit.trace, and tracing under inference_mode raises "inference tensors
+    # cannot be saved for backward". no_grad is enough — we never backprop.
+    # example_input is shape-only (eval BatchNorm uses running stats, not it).
     example = torch.zeros(1, 3, 224, 224)
-    with torch.inference_mode():
+    with torch.no_grad():
         ov_model = ov.convert_model(model, example_input=example)
     # If convert flipped the flag, this print localizes it; the parity step
     # re-evals defensively regardless.
