@@ -4,6 +4,8 @@ Run once during Docker image build:
   python export_classifier.py \
     --pt /app/models/cat_classifier.pt \
     --out /opt/models/cat_classifier_openvino/
+  # optional, preferred: validate on real crops
+  #   --crops /app/models/parity_crops/
 
 Requires torch + torchvision + openvino (build-time only).
 
@@ -12,22 +14,35 @@ Parity gate
 Exporting to OpenVINO is a classic drift point: the runtime path
 (detector/classifier.py::_preprocess + OpenVINO inference) must produce the
 same logits the trained torch model would, or identity decisions silently
-diverge from training. After export this script PROVES that, and fails the
-build on any mismatch:
+diverge from training. After export this script PROVES that and FAILS the build
+on any mismatch. Two independent gates:
 
-  1. Preprocessing parity — runtime `_preprocess` (PIL: resize-256 short side
-     → center-crop 224 → ImageNet norm) is compared element-wise against the
+  1. Preprocessing parity — runtime `_preprocess` (PIL: resize-256 short side →
+     center-crop 224 → ImageNet norm) compared element-wise against the
      canonical torchvision inference transform the classifier was trained with
-     (documented in training/torch_dataset.py; the donor loader.py reimplemented
-     the same steps). max|Δ| must be < PARITY_TOL. This catches PIL-vs-tensor
+     (documented in training/torch_dataset.py). Catches PIL-vs-tensor
      resize/antialias/rounding drift.
-  2. Model parity — for several crops, the torch model and the exported
-     OpenVINO model are both fed the *same* `_preprocess` output and their
-     logits compared. max|Δlogits| must be < PARITY_TOL.
+  2. Model parity — the exported OpenVINO model (re-read from the saved .xml, so
+     we test the *shipped artifact*, not an in-memory object) and the torch
+     model are fed the *same* normalized NCHW float32 tensor; their logits and
+     argmax must agree.
 
-Crops: pass `--crops <dir>` to use real cat crops (preferred — exercises the
-true input distribution); otherwise a deterministic set of synthetic crops of
-varied sizes is generated so the gate always runs in CI/build.
+Both gates require max|Δ| < PARITY_TOL. The model gate additionally requires the
+argmax (the actual identity decision) to match on every sample.
+
+Correctness-by-construction notes (each kills a known cause of false/real drift):
+  - The torch model is put in eval() once and re-asserted to be in eval()
+    immediately before the reference forward. BatchNorm in training mode would
+    recompute batch statistics from the (noisy) parity input and blow the drift
+    up to double digits while OpenVINO stays correct — this is the #1 trap.
+  - All torch forwards (including the convert_model trace) run under
+    torch.inference_mode().
+  - The IR is saved with compress_to_fp16=False so the runtime is FP32, matching
+    torch (FP16 would add ~1e-2 and is ruled out as a factor).
+  - Both backends receive the byte-for-byte same float32 array: from
+    classifier._preprocess on real crops, or a fixed-seed synthetic batch drawn
+    in the *normalized* input range (N(0,1)) — never zeros, which would mask a
+    train/eval BatchNorm mismatch.
 """
 from __future__ import annotations
 
@@ -35,46 +50,74 @@ import json
 import sys
 from pathlib import Path
 
-# Logits are FP32→FP32 (no quantization on the classifier), and preprocessing
-# is bit-identical in practice, so the tolerance is tight on purpose.
+# Logits are FP32→FP32 (no quantization on the classifier) and preprocessing is
+# bit-identical, so the tolerance is tight on purpose. Do not raise it to "pass".
 PARITY_TOL = 1e-3
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+_N_SYNTHETIC = 8
 
 
-def _load_crops(crops_dir: Path | None, n_synthetic: int = 6) -> list:
-    """Return a list of HWC uint8 RGB ndarrays to validate on."""
+# ---- crop / input loading ----------------------------------------------------
+
+def _load_real_crops(crops_dir: Path) -> list:
+    """Return real crops as HWC uint8 RGB ndarrays (sys.exit if none found)."""
     import numpy as np
+    from PIL import Image
 
-    if crops_dir is not None:
-        from PIL import Image
-
-        paths = sorted(p for p in crops_dir.iterdir() if p.suffix.lower() in _IMG_EXTS)
-        if not paths:
-            sys.exit(f"[parity] --crops {crops_dir} has no images ({sorted(_IMG_EXTS)})")
-        crops = [np.array(Image.open(p).convert("RGB")) for p in paths]
-        print(f"[parity] loaded {len(crops)} real crops from {crops_dir}", flush=True)
-        return crops
-
-    # Deterministic synthetic crops of varied shapes — still exercise the resize
-    # / center-crop / normalize path and the full torch↔OpenVINO numeric path.
-    rng = np.random.default_rng(0)
-    shapes = [(300, 300), (480, 640), (640, 480), (257, 257), (224, 400), (512, 288)]
-    crops = [
-        rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
-        for (h, w) in shapes[:n_synthetic]
-    ]
-    print(f"[parity] no --crops given; using {len(crops)} synthetic crops", flush=True)
+    paths = sorted(p for p in crops_dir.iterdir() if p.suffix.lower() in _IMG_EXTS)
+    if not paths:
+        sys.exit(f"[parity] --crops {crops_dir} has no images ({sorted(_IMG_EXTS)})")
+    crops = [np.array(Image.open(p).convert("RGB")) for p in paths]
+    print(f"[parity] loaded {len(crops)} real crops from {crops_dir}", flush=True)
     return crops
 
 
-def _check_preprocess_parity(crops: list) -> None:
+def _synthetic_uint8_crops() -> list:
+    """Deterministic raw crops of varied shapes, for the preprocessing gate."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    shapes = [(300, 300), (480, 640), (640, 480), (257, 257), (224, 400), (512, 288)]
+    return [rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8) for (h, w) in shapes]
+
+
+def _model_parity_inputs(crops_dir: Path | None) -> list:
+    """Return preprocessed model inputs: list of (1,3,224,224) float32 arrays.
+
+    Real crops go through the *runtime* classifier._preprocess (so the gate
+    exercises the exact production input). Without --crops we synthesize a
+    fixed-seed batch in the normalized input range — NOT zeros, so a BatchNorm
+    train/eval mismatch can't hide behind a degenerate input.
+    """
+    import numpy as np
+
+    if crops_dir is not None:
+        from classifier import _preprocess
+
+        crops = _load_real_crops(crops_dir)
+        inputs = [np.ascontiguousarray(_preprocess(c), dtype=np.float32) for c in crops]
+        print(f"[parity] model inputs: {len(inputs)} real crops via _preprocess",
+              flush=True)
+        return inputs
+
+    rng = np.random.default_rng(0)
+    inputs = [rng.standard_normal((1, 3, 224, 224)).astype(np.float32)
+              for _ in range(_N_SYNTHETIC)]
+    print(f"[parity] model inputs: {len(inputs)} synthetic N(0,1) tensors", flush=True)
+    return inputs
+
+
+# ---- gates -------------------------------------------------------------------
+
+def _check_preprocess_parity(crops_dir: Path | None) -> None:
     """Runtime _preprocess vs the donor torchvision inference transform."""
     import numpy as np
-    import torch
     from torchvision import transforms
 
     from classifier import _preprocess  # the runtime preprocessing under test
+
+    crops = _load_real_crops(crops_dir) if crops_dir is not None else _synthetic_uint8_crops()
 
     donor = transforms.Compose([
         transforms.ToPILImage(),
@@ -90,38 +133,59 @@ def _check_preprocess_parity(crops: list) -> None:
         ours = _preprocess(crop)[0]              # (3, 224, 224) float32
         ref = donor(crop).numpy()                # (3, 224, 224) float32
         worst = max(worst, float(np.max(np.abs(ours - ref))))
-    print(f"[parity] preprocessing max|Δ| vs torchvision donor = {worst:.2e}", flush=True)
+    print(f"[parity] preprocessing max|Δ| vs torchvision donor = {worst:.3e}", flush=True)
     if worst >= PARITY_TOL:
         sys.exit(
             f"[parity] FAIL: runtime _preprocess drifted from the training "
-            f"transform (max|Δ|={worst:.2e} >= {PARITY_TOL:.0e}). "
+            f"transform (max|Δ|={worst:.3e} >= {PARITY_TOL:.0e}). "
             "Reconcile detector/classifier.py::_preprocess with the torchvision "
             "Resize(256)+CenterCrop(224)+Normalize pipeline before shipping."
         )
 
 
-def _check_model_parity(model, compiled, crops: list) -> None:
-    """torch model vs exported OpenVINO model on identical _preprocess inputs."""
+def _check_model_parity(model, compiled, inputs: list) -> None:
+    """Read-back OpenVINO model vs torch model on identical normalized inputs.
+
+    Requires max|Δlogits| < PARITY_TOL AND matching argmax on every sample.
+    """
     import numpy as np
     import torch
 
-    from classifier import _preprocess
+    # Re-assert eval() right before the reference forward: convert_model / tracing
+    # can leave the module's training flag flipped, and BatchNorm in train mode
+    # would recompute batch stats from these inputs → large structural drift.
+    model.eval()
+    assert not model.training, "torch reference must be in eval() for parity"
 
+    out_port = compiled.output(0)
     worst = 0.0
-    for crop in crops:
-        inp = _preprocess(crop)                       # (1, 3, 224, 224) float32
-        with torch.no_grad():
-            torch_logits = model(torch.from_numpy(inp)).numpy()[0]
-        ov_logits = compiled(inp)[0][0]               # first output, drop batch dim
-        worst = max(worst, float(np.max(np.abs(torch_logits - ov_logits))))
-    print(f"[parity] torch↔OpenVINO max|Δlogits| = {worst:.2e}", flush=True)
-    if worst >= PARITY_TOL:
+    failures = 0
+    with torch.inference_mode():
+        for i, x in enumerate(inputs):
+            x = np.ascontiguousarray(x, dtype=np.float32)   # (1,3,224,224)
+            torch_logits = model(torch.from_numpy(x)).cpu().numpy()[0]
+            ov_logits = np.asarray(compiled(x)[out_port])[0]
+            d = float(np.max(np.abs(torch_logits - ov_logits)))
+            t_arg = int(torch_logits.argmax())
+            o_arg = int(ov_logits.argmax())
+            ok = d < PARITY_TOL and t_arg == o_arg
+            worst = max(worst, d)
+            failures += 0 if ok else 1
+            print(f"[parity] sample {i}: max|Δ|={d:.3e} "
+                  f"argmax torch={t_arg} ov={o_arg} {'OK' if ok else 'FAIL'}",
+                  flush=True)
+
+    print(f"[parity] torch↔OpenVINO worst max|Δlogits| = {worst:.3e} "
+          f"over {len(inputs)} samples", flush=True)
+    if failures:
         sys.exit(
-            f"[parity] FAIL: OpenVINO logits drifted from torch "
-            f"(max|Δ|={worst:.2e} >= {PARITY_TOL:.0e}). The export is not "
-            "faithful — do not ship this IR."
+            f"[parity] FAIL: {failures}/{len(inputs)} sample(s) diverged "
+            f"(need max|Δ| < {PARITY_TOL:.0e} AND matching argmax). The exported "
+            "IR is not faithful to torch — do not ship it."
         )
 
+
+# ---- export ------------------------------------------------------------------
 
 def export(pt_path: Path, out_dir: Path, crops_dir: Path | None = None) -> None:
     import openvino as ov
@@ -138,24 +202,36 @@ def export(pt_path: Path, out_dir: Path, crops_dir: Path | None = None) -> None:
     model = models.efficientnet_b0(weights=None)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
     model.load_state_dict(checkpoint["state_dict"])
-    model.eval()
+    model.eval()                                      # once, before anything
+    print(f"[export] model.training after eval() = {model.training}", flush=True)
 
-    dummy = torch.zeros(1, 3, 224, 224)
-    ov_model = ov.convert_model(model, example_input=dummy)
+    # Convert under inference_mode; example_input is shape-only (its values are
+    # irrelevant — eval BatchNorm uses running stats, not this tensor).
+    example = torch.zeros(1, 3, 224, 224)
+    with torch.inference_mode():
+        ov_model = ov.convert_model(model, example_input=example)
+    # If convert flipped the flag, this print localizes it; the parity step
+    # re-evals defensively regardless.
+    print(f"[export] model.training after convert_model = {model.training}", flush=True)
 
     xml_path = out_dir / "cat_classifier.xml"
-    ov.save_model(ov_model, str(xml_path))
-    print(f"[export] OpenVINO IR → {xml_path}", flush=True)
+    ov.save_model(ov_model, str(xml_path), compress_to_fp16=False)  # FP32, match torch
+    print(f"[export] OpenVINO IR (FP32) → {xml_path}", flush=True)
 
     classes_path = out_dir / "classes.json"
     classes_path.write_text(json.dumps(class_names), encoding="utf-8")
     print(f"[export] classes → {classes_path} : {class_names}", flush=True)
 
-    # ---- parity gate (fails the build on any drift) ----
-    crops = _load_crops(crops_dir)
-    _check_preprocess_parity(crops)
-    compiled = ov.Core().compile_model(ov_model, "CPU")
-    _check_model_parity(model, compiled, crops)
+    # ---- parity gates (fail the build on any drift) ----
+    _check_preprocess_parity(crops_dir)
+
+    # Test the SHIPPED artifact: re-read the saved .xml rather than the in-memory
+    # model, so what we validate is exactly what runtime loads.
+    core = ov.Core()
+    compiled = core.compile_model(core.read_model(str(xml_path)), "CPU")
+    inputs = _model_parity_inputs(crops_dir)
+    _check_model_parity(model, compiled, inputs)
+
     print("[parity] OK — preprocessing and logits match within tolerance", flush=True)
 
 
