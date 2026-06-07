@@ -63,12 +63,25 @@ class CatClassifier:
             (model_dir / "classes.json").read_text(encoding="utf-8")
         )
 
-    def classify(self, crop_rgb: np.ndarray) -> tuple[str, float]:
-        """Return (cat_name, confidence). crop_rgb is HWC uint8 RGB."""
+    def _probs(self, crop_rgb: np.ndarray) -> np.ndarray:
+        """Softmax probability vector for one crop. The single preprocess +
+        inference path — classify() and classify_all() both go through here so
+        runtime and review/diagnostics use byte-identical pixels and math."""
         inp = _preprocess(crop_rgb)
         logits = self._compiled(inp)[0]  # (1, num_classes)
-        probs = logits[0].astype(np.float64)
-        e = np.exp(probs - probs.max())
-        probs = e / e.sum()
+        z = logits[0].astype(np.float64)
+        e = np.exp(z - z.max())
+        return e / e.sum()
+
+    def classify(self, crop_rgb: np.ndarray) -> tuple[str, float]:
+        """Return (cat_name, confidence). crop_rgb is HWC uint8 RGB."""
+        probs = self._probs(crop_rgb)
         idx = int(np.argmax(probs))
         return self.class_names[idx], float(probs[idx])
+
+    def classify_all(self, crop_rgb: np.ndarray) -> list[tuple[str, float]]:
+        """Return [(cat_name, prob), ...] over ALL classes in class_names order.
+        Same _preprocess + compiled model as classify() — for the label-review
+        manifest where the full probability vector is needed."""
+        probs = self._probs(crop_rgb)
+        return [(name, float(p)) for name, p in zip(self.class_names, probs)]

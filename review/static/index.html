@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cat crop review</title>
+<style>
+  :root { --bg:#11131a; --fg:#e6e8ee; --muted:#8b90a0; --accent:#4f8cff;
+          --a:#ff7a45; --b:#36c5a0; --ok:#36c5a0; --bad:#ff5470; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--fg);
+         height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px;
+           border-bottom:1px solid #262a36; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .grow { flex:1; }
+  #progress { color:var(--muted); font-variant-numeric:tabular-nums; }
+  #bar { height:4px; background:#262a36; border-radius:2px; width:240px; overflow:hidden; }
+  #bar > i { display:block; height:100%; background:var(--accent); width:0; transition:width .2s; }
+  main { flex:1; display:grid; grid-template-columns: 1fr 360px; min-height:0; }
+  #stage { display:flex; align-items:center; justify-content:center; padding:18px; min-height:0; }
+  #stage img { max-width:100%; max-height:100%; image-rendering:auto;
+               border-radius:8px; background:#0008; box-shadow:0 4px 24px #0006; }
+  #stage .gone { color:var(--bad); font-size:16px; }
+  aside { border-left:1px solid #262a36; padding:16px; overflow:auto; display:flex;
+          flex-direction:column; gap:14px; }
+  .pred { font-size:13px; color:var(--muted); }
+  .pred b { color:var(--fg); font-size:18px; }
+  .probs { display:flex; flex-direction:column; gap:6px; }
+  .prow { display:grid; grid-template-columns:72px 1fr 52px; align-items:center; gap:8px; }
+  .prow .name { text-align:right; color:var(--muted); }
+  .prow.confuse .name { color:var(--fg); font-weight:600; }
+  .prow .track { background:#262a36; border-radius:4px; height:14px; overflow:hidden; }
+  .prow .track > i { display:block; height:100%; background:var(--accent); }
+  .prow.confuse .track > i { background:var(--a); }
+  .prow .pct { text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .buttons { display:flex; flex-direction:column; gap:8px; margin-top:auto; }
+  button.lab { display:flex; align-items:center; gap:10px; padding:10px 12px; cursor:pointer;
+               background:#1a1d27; color:var(--fg); border:1px solid #2c3140; border-radius:8px;
+               font-size:15px; text-align:left; }
+  button.lab:hover { border-color:var(--accent); }
+  button.lab .k { display:inline-flex; width:22px; height:22px; align-items:center;
+                  justify-content:center; background:#2c3140; border-radius:5px; font-size:12px; }
+  button.lab.confuse { border-color:var(--a); }
+  button.lab.discard { color:var(--muted); }
+  .nav { display:flex; gap:8px; }
+  .nav button { flex:1; padding:8px; background:#1a1d27; color:var(--fg);
+                border:1px solid #2c3140; border-radius:8px; cursor:pointer; }
+  .chosen { font-size:13px; }
+  .chosen b { color:var(--ok); }
+  .hint { color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cat crop review</h1>
+  <span id="pos" class="hint"></span>
+  <div class="grow"></div>
+  <div id="bar"><i></i></div>
+  <span id="progress">0 / 0</span>
+</header>
+<main>
+  <section id="stage"><div class="hint">loading…</div></section>
+  <aside>
+    <div class="pred" id="pred"></div>
+    <div class="probs" id="probs"></div>
+    <div class="chosen" id="chosen"></div>
+    <div class="buttons" id="buttons"></div>
+    <div class="nav">
+      <button onclick="go(-1)">← prev</button>
+      <button onclick="go(1)">next →</button>
+      <button onclick="jumpUnreviewed()">skip to unreviewed</button>
+    </div>
+    <div class="hint">keys: 1..N label · ←/→ navigate</div>
+  </aside>
+</main>
+
+<script>
+let M = null;        // {classes, extra_labels, confuse, queue, reviews}
+let LABELS = [];     // classes + extra (button/hotkey order)
+let idx = 0;
+
+async function load() {
+  M = await (await fetch('/api/manifest')).json();
+  LABELS = [...M.classes, ...M.extra_labels];
+  renderButtons();
+  // resume: start at the first unreviewed crop
+  idx = Math.max(0, M.queue.findIndex(q => !(q.crop_id in M.reviews)));
+  if (idx < 0) idx = 0;
+  render();
+}
+
+function renderButtons() {
+  const wrap = document.getElementById('buttons');
+  wrap.innerHTML = '';
+  LABELS.forEach((lab, i) => {
+    const b = document.createElement('button');
+    b.className = 'lab' + (M.confuse.includes(lab) ? ' confuse' : '')
+               + (lab === 'discard' ? ' discard' : '');
+    b.innerHTML = `<span class="k">${i + 1}</span><span>${lab}</span>`;
+    b.onclick = () => choose(lab);
+    wrap.appendChild(b);
+  });
+}
+
+function curr() { return M.queue[idx]; }
+
+function render() {
+  const q = curr();
+  document.getElementById('progress').textContent =
+      `${Object.keys(M.reviews).length} / ${M.queue.length}`;
+  document.getElementById('bar').firstElementChild.style.width =
+      (100 * Object.keys(M.reviews).length / M.queue.length) + '%';
+  document.getElementById('pos').textContent =
+      `#${idx + 1} of ${M.queue.length} · ${q.camera}`;
+
+  // image (decoded on demand by the server)
+  const stage = document.getElementById('stage');
+  stage.innerHTML = '';
+  const img = new Image();
+  img.onerror = () => { stage.innerHTML =
+      '<div class="gone">recording unavailable (pruned/gap) — use discard</div>'; };
+  img.src = `/api/crop/${encodeURIComponent(q.crop_id)}?t=${Date.now()}`;
+  stage.appendChild(img);
+
+  // prediction + sorted probability bars (confuse pair emphasised)
+  document.getElementById('pred').innerHTML =
+      `model says <b>${q.predicted}</b> · conf ${(q.conf * 100).toFixed(1)}%`;
+  const ranked = Object.entries(q.probs).sort((a, b) => b[1] - a[1]);
+  document.getElementById('probs').innerHTML = ranked.map(([n, p]) => `
+      <div class="prow ${M.confuse.includes(n) ? 'confuse' : ''}">
+        <span class="name">${n}</span>
+        <span class="track"><i style="width:${(p * 100).toFixed(1)}%"></i></span>
+        <span class="pct">${(p * 100).toFixed(1)}%</span>
+      </div>`).join('');
+
+  const chosen = M.reviews[q.crop_id];
+  document.getElementById('chosen').innerHTML =
+      chosen ? `your label: <b>${chosen}</b> (re-label to change)` : '';
+
+  prefetch();
+}
+
+function prefetch() {
+  for (let k = 1; k <= 3; k++) {
+    const q = M.queue[idx + k];
+    if (q) { const im = new Image(); im.src = `/api/crop/${encodeURIComponent(q.crop_id)}`; }
+  }
+}
+
+async function choose(label) {
+  const q = curr();
+  const r = await fetch('/api/review', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ crop_id: q.crop_id, label }),
+  });
+  if (!r.ok) { alert('save failed'); return; }
+  M.reviews[q.crop_id] = label;
+  // advance to the next still-unreviewed crop (resumable / non-linear)
+  jumpUnreviewed(true);
+}
+
+function go(d) {
+  idx = Math.min(M.queue.length - 1, Math.max(0, idx + d));
+  render();
+}
+
+function jumpUnreviewed(fromHere) {
+  const start = fromHere ? idx + 1 : 0;
+  for (let i = start; i < M.queue.length; i++) {
+    if (!(M.queue[i].crop_id in M.reviews)) { idx = i; render(); return; }
+  }
+  // none left after here — stay put and just refresh
+  render();
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight') return go(1);
+  if (e.key === 'ArrowLeft') return go(-1);
+  const n = parseInt(e.key, 10);
+  if (!Number.isNaN(n) && n >= 1 && n <= LABELS.length) choose(LABELS[n - 1]);
+});
+
+load();
+</script>
+</body>
+</html>

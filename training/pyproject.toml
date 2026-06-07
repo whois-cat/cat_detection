@@ -14,3 +14,6 @@ dependencies = [
 [project.optional-dependencies]
 yolo       = ["ultralytics"]
 classifier = ["torch", "torchvision", "scikit-learn"]
+# Stage B label-review web app (see ../review/requirements.txt). Decode-only —
+# deliberately no openvino/torch; av+numpy come from the base deps above.
+review     = ["fastapi", "uvicorn", "Pillow"]

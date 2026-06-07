@@ -55,6 +55,9 @@ class Sample:
     wall_ms: int
     camera_id: str
     model: str
+    # CropSource only: the ORIGINAL box in camera coords (carries rowid). boxes[0]
+    # above is crop-LOCAL; src_box is what decode_one_crop / the manifest need.
+    src_box: Box | None = None
 
 
 # ---------------------------------------------------------------- internals --
@@ -200,23 +203,90 @@ class CropSource(SampleSource):
         self.pad_frac = pad_frac
 
     def _emit(self, frame: FrameRecord, img: np.ndarray) -> Iterator[Sample]:
-        H, W = img.shape[:2]
         for box in frame.boxes:
-            pad = int(self.pad_frac * max(box.w, box.h))
-            x0 = max(0, box.x - pad)
-            y0 = max(0, box.y - pad)
-            x1 = min(W, box.x + box.w + pad)
-            y1 = min(H, box.y + box.h + pad)
-            if x1 <= x0 or y1 <= y0:
+            crop, local = _pad_crop(img, box, self.pad_frac)
+            if crop is None:
                 continue
-            crop = img[y0:y1, x0:x1]
-            # Box coords relative to the crop, clipped to its bounds.
-            local = Box(
-                x=box.x - x0, y=box.y - y0, w=box.w, h=box.h,
-                cat=box.cat, score=box.score, track_id=box.track_id,
-            )
             yield Sample(
                 image=crop, boxes=[local],
                 wall_ms=frame.wall_ms,
                 camera_id=frame.camera_id, model=frame.model,
+                src_box=box,            # original camera-coords box (has rowid)
             )
+
+
+# ------------------------------------------------------- random-access crop --
+
+def _pad_crop(img: np.ndarray, box: Box, pad_frac: float):
+    """Crop `img` (BGR) to `box` (CAMERA coords) with pad_frac context, clamped
+    to frame edges. Returns (crop_bgr, box_local) or (None, None) if degenerate.
+
+    Single source of the crop geometry — both CropSource._emit (batch) and
+    decode_one_crop (random access) call it, so a crop cut for review is pixel-
+    identical to the one the classifier scored when building the manifest.
+    """
+    H, W = img.shape[:2]
+    pad = int(pad_frac * max(box.w, box.h))
+    x0 = max(0, box.x - pad)
+    y0 = max(0, box.y - pad)
+    x1 = min(W, box.x + box.w + pad)
+    y1 = min(H, box.y + box.h + pad)
+    if x1 <= x0 or y1 <= y0:
+        return None, None
+    crop = img[y0:y1, x0:x1]
+    local = Box(
+        x=box.x - x0, y=box.y - y0, w=box.w, h=box.h,
+        cat=box.cat, score=box.score, track_id=box.track_id, rowid=box.rowid,
+    )
+    return crop, local
+
+
+class CropUnavailable(RuntimeError):
+    """The crop for an event can't be decoded — its recording segment was
+    pruned, falls in a gap, or the seek produced no frame."""
+
+
+@dataclass(slots=True)
+class CropRef:
+    """Everything decode_one_crop needs to re-cut ONE crop from recordings.
+
+    `box` is in CAMERA coordinates (the original detector box, matching the
+    events row), NOT crop-local. The review UI builds this straight from a
+    manifest line.
+    """
+    camera_id: str
+    wall_ms: int
+    box: Box
+
+
+def decode_one_crop(ref: CropRef, recordings_root, *, pad_frac: float = 0.15,
+                    index: SegmentIndex | None = None) -> np.ndarray:
+    """Random-access single-crop decode (for the label-review UI).
+
+    Reuses the exact segment lookup (SegmentIndex.locate) and keyframe-aligned
+    seek (_decode_frames_at) the batch sources use — no seek/segment logic is
+    duplicated. Decodes the one frame into memory, cuts the crop, and returns a
+    BGR uint8 ndarray; the caller is expected to encode it (e.g. to JPEG in
+    memory) and discard the pixels. Nothing is written to disk.
+
+    Pass a cached `index` to skip rescanning the camera's recording dir on every
+    call (the web app keeps one SegmentIndex per camera). Raises CropUnavailable
+    when the recording for that wall_ms is gone.
+    """
+    idx = (index if index is not None
+           else SegmentIndex.from_dir(Path(recordings_root) / ref.camera_id))
+    hit = idx.locate(ref.wall_ms)
+    if hit is None:
+        raise CropUnavailable(
+            f"no recording segment covers wall_ms={ref.wall_ms} "
+            f"for camera {ref.camera_id} (pruned or recording gap)"
+        )
+    seg, media_t = hit
+    for _off, img in _decode_frames_at(seg.path, [media_t]):
+        crop, _local = _pad_crop(img, ref.box, pad_frac)
+        if crop is None:
+            raise CropUnavailable(f"degenerate crop for wall_ms={ref.wall_ms}")
+        return crop
+    raise CropUnavailable(
+        f"seek produced no frame in {seg.path} at media_t={media_t:.3f}s"
+    )

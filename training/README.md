@@ -175,6 +175,66 @@ in the parent repo). The 4-cat label set should be identical.
 
 ---
 
+## Recipe: label review (correct confusable labels) — no JPEGs on disk
+
+The detector's labels are guesses from the very model we're trying to improve
+(it confuses alisa↔felisis), so before re-training we hand-verify them. The
+recordings are already the image store and `events.db` already has the box
+coordinates — so this workflow writes **no crop files at all**. Crops are cut
+from the recordings into memory, shown/scored, and the pixels are dropped; only
+metadata (the labels) is persisted.
+
+**Stage A — build the manifest (detector env: needs OpenVINO + the classifier IR).**
+Walks `CropSource`, runs the classifier per crop (reusing
+`detector/classifier.py::CatClassifier.classify_all` — same `_preprocess` and IR
+as production), and writes one JSONL line of metadata per crop, sorted
+most-contentious-first:
+
+```bash
+python3 -m training.build_review_manifest \
+    --db data/events/events.db \
+    --recordings data/recordings \
+    --classifier detector/models/cat_classifier_openvino \
+    --out data/review/manifest.jsonl \
+    --model yolov8n+cat \
+    --confuse alisa,felisis \         # names are data — never hardcoded
+    --min-score 0.3
+```
+
+Each line: `{crop_id, src_event_key, wall_ms, camera, model, box, pad_frac,
+predicted, conf, probs{name:p}}`. Ordering: (0) the two top probabilities ARE the
+`--confuse` pair → by smallest margin first; (1) predicted is one of the pair →
+by lowest confidence; (2) everything else by lowest confidence. **The only thing
+on disk is `manifest.jsonl`.**
+
+**Stage B — review web app (host: needs `av` + this package, NOT openvino/torch).**
+
+```bash
+pip install -r review/requirements.txt        # fastapi, uvicorn, av, numpy, Pillow
+REVIEW_CONFUSE=alisa,felisis just review 8095  # → http://localhost:8095
+```
+
+Each crop is decoded on demand straight from the recordings
+(`training.decode_one_crop`, which reuses the same segment lookup + keyframe seek
+as the batch sources), encoded to an in-memory JPEG, and streamed — never written
+to a file. The page shows the crop big, the model's guess + confidence, the two
+top probabilities (the confuse pair highlighted), and one button per class plus
+`unknown` / `discard`; hotkeys `1..N`, `←/→` to navigate, a live `X / N`
+progress bar.
+
+Corrections are **non-destructive**: they go to a *separate* writable
+`data/review/reviews.db` keyed by `src_event_key`, so the detector's rows in
+`events.db` are never touched and the database can stay read-only. Progress
+survives restart (already-reviewed crops are skipped; any crop can be reopened
+and re-labelled).
+
+Feeding corrections back into training: `CropSource` now carries each box's
+`events` rowid (`box.rowid` / `Sample.src_box.rowid`), so a training step can
+left-join `reviews.db` on `src_event_key` and override `box.cat` with the human
+label (falling back to the detector label where unreviewed).
+
+---
+
 ## Recipe: YOLO fine-tune (per-cat detector)
 
 ```bash
@@ -222,12 +282,11 @@ These are deliberate not-yet-done bits. None of them block the v1 dataset:
   by media-time stride, decode the frame, and emit a Sample with
   `boxes=[]` if no event from any model is within ±100 ms.
 
-- **Label review / correction UI.** Events as-recorded are the detector's
-  opinion, not ground truth. The expected workflow is to extract a
-  dataset, review and re-label visually (existing tooling: CVAT in the
-  parent repo), and feed corrections back. The path back into the live2
-  events DB isn't wired — events from a human reviewer would use
-  `source != 'detector'`. Schema already supports it.
+- **Label review / correction UI.** ✅ Done — see "Recipe: label review"
+  below. Two stages: a metadata-only manifest (Stage A) and a tiny web app
+  that decodes crops on the fly and records non-destructive corrections
+  (Stage B). No JPEGs are ever written; recordings + events.db stay the
+  only image/label store on disk.
 
 - **Track-aware temporal sampling.** Right now the extractor takes every
   detection. For classifier training you usually want at most a few
@@ -251,9 +310,16 @@ training/
 ├── README.md         (this file)
 ├── pyproject.toml    (just deps for extraction — no torch in here)
 ├── __init__.py
-├── db.py             (events.db queries; per-row → per-frame regrouping)
+├── db.py             (events.db queries; per-row → per-frame regrouping; box.rowid)
 ├── segments.py       (wall_ms → segment file + offset; see docstring)
-├── sources.py        (SampleSource ABC + FullFrameSource + CropSource)
-├── extract_classifier.py   (one-shot script wrapping CropSource)
-└── extract_detector.py     (one-shot script wrapping FullFrameSource)
+├── sources.py        (SampleSource ABC + FullFrameSource + CropSource;
+│                      decode_one_crop / CropRef for random-access review)
+├── extract_classifier.py     (one-shot script wrapping CropSource)
+├── extract_detector.py       (one-shot script wrapping FullFrameSource)
+└── build_review_manifest.py  (Stage A: metadata-only review manifest)
+
+../review/            (Stage B: FastAPI label-review web app; `just review`)
+├── app.py            (on-demand in-memory crop decode; corrections → reviews.db)
+├── static/index.html (one-page vanilla-JS reviewer)
+└── requirements.txt  (fastapi/uvicorn/av/numpy/Pillow — no openvino/torch)
 ```
