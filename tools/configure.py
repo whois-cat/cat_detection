@@ -164,6 +164,7 @@ def render_compose(cfg: dict) -> str:
             "YOLO_CONF":           cam.get("yolo_conf", 0.25),
             "CLASSIFIER_WEIGHTS":  cam.get("classifier_weights", "/opt/models/cat_classifier_openvino/"),
             "CLASSIFIER_MIN_CONF": cam.get("classifier_min_conf", 0.5),
+            "CLASSIFIER_PAD_FRAC": cam.get("classifier_pad_frac", 0.15),
             "DETECT_ROI":          cam.get("detect_roi", "0,0,1,1"),
             "ACTION_POLYGON":      cam.get("action_polygon", "0,0,1,1"),
             "FRAME_ROTATE_DEG":    cam.get("rotate_deg", 0),

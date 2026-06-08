@@ -28,6 +28,14 @@
 #                         (default: /opt/models/cat_classifier_openvino/).
 #   classifier_min_conf — minimum confidence to assign an identity; below this
 #                         the cat is recorded as "unknown" (default: 0.5).
+#   classifier_pad_frac — context padding added around each YOLO box BEFORE the
+#                         identity classifier runs (default: 0.15). MUST match the
+#                         training crop padding in all three places or the
+#                         classifier sees different framing at serve vs train time:
+#                           detector  CLASSIFIER_PAD_FRAC  (this value)
+#                           manifest  build_review_manifest --pad-frac
+#                           training  train_classifier     --pad-frac
+#                         Change all three together or not at all.
 #   rotate_deg      — internal-to-model rotation, 0/90/180/270.
 #   detect_roi      — camera-coord rectangle, "x0,y0,x1,y1" in [0..1].
 #   action_polygon  — camera-coord polygon (rect or N-vertex; see .env.example).

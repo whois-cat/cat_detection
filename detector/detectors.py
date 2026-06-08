@@ -133,6 +133,7 @@ class YoloCatDetector(Detector):
         conf: float = 0.25,
         classifier_dir: str = "/opt/models/cat_classifier_openvino/",
         min_conf: float = 0.5,
+        pad_frac: float = 0.15,
     ) -> None:
         import cv2
         from classifier import CatClassifier
@@ -145,6 +146,11 @@ class YoloCatDetector(Detector):
         self.model_name = f"{stem}+cat"
         self._classifier = CatClassifier(classifier_dir)
         self._min_conf = min_conf
+        # Context padding around the box BEFORE classification. MUST match the
+        # training crop padding (training._pad_crop / build_review_manifest
+        # --pad-frac / train_classifier --pad-frac) or the classifier sees a
+        # different framing at serve time than it was trained/reviewed on.
+        self._pad_frac = pad_frac
 
     def detect(self, img_bgr: np.ndarray) -> list[dict]:
         cv2 = self._cv2
@@ -163,8 +169,15 @@ class YoloCatDetector(Detector):
                 x2, y2 = min(w, int(x2)), min(h, int(y2))
                 if x2 <= x1 or y2 <= y1:
                     continue
-                # Crop from the same inference-coord frame YOLO saw (img_bgr).
-                crop_bgr = img_bgr[y1:y2, x1:x2]
+                # Expand the box by pad_frac (same clamp as training._pad_crop)
+                # so the classifier sees the SAME framing it was trained on, then
+                # crop from the inference-coord frame YOLO saw (img_bgr). The
+                # emitted box stays the tight detection box — only the classifier
+                # input is padded.
+                pad = int(self._pad_frac * max(x2 - x1, y2 - y1))
+                cx0, cy0 = max(0, x1 - pad), max(0, y1 - pad)
+                cx1, cy1 = min(w, x2 + pad), min(h, y2 + pad)
+                crop_bgr = img_bgr[cy0:cy1, cx0:cx1]
                 crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
                 cat_name, cat_score = self._classifier.classify(crop_rgb)
                 if cat_score < self._min_conf:
@@ -198,6 +211,7 @@ def build_detector(detector_type: str) -> Detector:
                 "CLASSIFIER_WEIGHTS", "/opt/models/cat_classifier_openvino/"
             ),
             min_conf=float(os.environ.get("CLASSIFIER_MIN_CONF", "0.5")),
+            pad_frac=float(os.environ.get("CLASSIFIER_PAD_FRAC", "0.15")),
         )
     raise ValueError(
         f"unknown DETECTOR_TYPE: {detector_type!r} "

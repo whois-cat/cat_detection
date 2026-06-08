@@ -13,6 +13,10 @@ dependencies = [
 # Kept out of the base set so the extraction step alone is fast to install.
 [project.optional-dependencies]
 yolo       = ["ultralytics"]
+# train_classifier.py needs only torch + torchvision (CPU wheels are enough —
+# install from the CPU index, e.g. `pip install torch torchvision
+# --index-url https://download.pytorch.org/whl/cpu`). scikit-learn is unused by
+# the trainer (metrics are computed with numpy) but kept for ad-hoc analysis.
 classifier = ["torch", "torchvision", "scikit-learn"]
 # Stage B label-review web app (see ../review/requirements.txt). Decode-only —
 # deliberately no openvino/torch; av+numpy come from the base deps above.

@@ -20,7 +20,8 @@ class Box:
     cat: str | None
     score: float
     track_id: int | None
-    rowid: int | None = None   # events table PK (== src_event_key), if queried
+    rowid: int | None = None       # events table PK (== src_event_key), if queried
+    cat_score: float | None = None  # classifier identity confidence, if present
 
 
 @dataclass(slots=True)
@@ -56,7 +57,7 @@ def iter_frames(conn: sqlite3.Connection, *,
     """
     sql = [
         "SELECT rowid, camera_id, model, wall_ms, pts, media_t, frame_w, frame_h,",
-        "       cat, box_x, box_y, box_w, box_h, score, track_id",
+        "       cat, cat_score, box_x, box_y, box_w, box_h, score, track_id",
         "FROM events WHERE 1=1",
     ]
     params: list = []
@@ -72,7 +73,7 @@ def iter_frames(conn: sqlite3.Connection, *,
     current: FrameRecord | None = None
     for row in cur:
         (rowid, cam, model_, wall_ms, pts, media_t, fw, fh,
-         cat_, bx, by, bw, bh, score, track_id) = row
+         cat_, cat_score, bx, by, bw, bh, score, track_id) = row
         key = (cam, model_, wall_ms, pts)
         if current is None or (current.camera_id, current.model,
                                current.wall_ms, current.pts) != key:
@@ -84,7 +85,7 @@ def iter_frames(conn: sqlite3.Connection, *,
             )
         current.boxes.append(Box(
             x=bx, y=by, w=bw, h=bh, cat=cat_, score=score, track_id=track_id,
-            rowid=rowid,
+            rowid=rowid, cat_score=cat_score,
         ))
     if current is not None:
         yield current

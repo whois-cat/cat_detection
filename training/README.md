@@ -249,6 +249,73 @@ src = CropSource(db, recordings, reviews=load_reviews("data/review/reviews.db"))
 
 ---
 
+## Recipe: train OUR classifier (to replace the donor)
+
+`train_classifier.py` trains a fresh EfficientNet-B0 from the recordings +
+corrections and writes the **best-by-val** model to a NEW path. It does **not**
+touch the donor (`detector/models/cat_classifier.pt`) or the runtime — swapping
+is a later, separate step.
+
+```bash
+cd live2
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+python -m training.train_classifier \
+    --db data/events/events.db \
+    --recordings data/recordings \
+    --reviews-db data/review/reviews.db \
+    --confuse alisa,felisis \
+    --trust-conf 0.9 \
+    --pad-frac 0.15 \
+    --min-recall 0.9
+# heavier pass when you have more data:  add --full-finetune
+```
+
+What it does, and why each part:
+
+- **Labels (safe by default).** For the `--confuse` pair, ONLY human labels are
+  used (the donor is exactly what's wrong there). For other classes it takes the
+  human label, else the donor's label when its `cat_score >= --trust-conf` (the
+  donor is usually right on chuzh/ellie, so this adds volume cheaply). Class names
+  are the sorted unique surviving labels — saved with the model.
+- **Honest split.** `track_id` is empty, so a random split leaks near-duplicate
+  neighbours. Crops are grouped into **episodes** (same camera, `wall_ms` gaps
+  `> --episode-gap-sec` start a new one) and whole episodes go to train OR val.
+  The split is stratified so val always contains **both** confuse cats.
+- **No JPEGs.** Crops are decoded from the recordings into RAM
+  (`CropSource` → `TorchCachedDataset.materialise()`), trained on, discarded.
+- **Crop framing.** `--pad-frac` MUST equal the detector `CLASSIFIER_PAD_FRAC`
+  and `build_review_manifest --pad-frac` (default 0.15 everywhere). The eval/val
+  transform is byte-identical to `detector/classifier.py::_preprocess`; only train
+  augments (h-flip, small rotation, mild brightness/contrast, light
+  random-resized-crop — no hard color jitter, since night IR is ~grayscale).
+
+**Reading the output.** The script prints a confusion matrix (rows=true,
+cols=pred), per-class precision/recall, overall + macro accuracy, and explicitly
+the `alisa↔felisis` cross-error cell — that cell is the whole point; it should be
+near zero. It ends with a **PASS/FAIL** line: PASS iff every class (incl. alisa
+and felisis) has val recall `>= --min-recall`. On FAIL it warns loudly and does
+NOT crash — collect/relabel more crops (especially the confuse pair) and re-run.
+
+**Output.** `models/trained/<timestamp>/cat_classifier.pt` (same
+`{state_dict, class_names, num_classes}` format `export_classifier.py` expects)
+plus `metadata.json` (class_names, pad_frac, preprocessing spec, val metrics).
+
+**Export + swap the donor (later, deliberate step).**
+
+```bash
+# 1) export the new .pt to OpenVINO IR (parity-gated, see ../detector/):
+python detector/export_classifier.py \
+    --pt models/trained/<timestamp>/cat_classifier.pt \
+    --out detector/models/cat_classifier_openvino_NEW \
+    --crops <dir of real crops>          # for a meaningful parity check
+# 2) point the detector at it (per camera) and rebuild:
+#    cameras.yaml: classifier_weights: /opt/models/cat_classifier_openvino_NEW
+#    just configure && just rebuild-detectors
+# Keep classifier_pad_frac identical to what you trained with.
+```
+
+---
+
 ## Recipe: YOLO fine-tune (per-cat detector)
 
 ```bash
@@ -328,9 +395,11 @@ training/
 ├── segments.py       (wall_ms → segment file + offset; see docstring)
 ├── sources.py        (SampleSource ABC + FullFrameSource + CropSource;
 │                      decode_one_crop / CropRef for random-access review)
+├── reviews.py        (load human corrections reviews.db → {rowid: label})
 ├── extract_classifier.py     (one-shot script wrapping CropSource)
 ├── extract_detector.py       (one-shot script wrapping FullFrameSource)
-└── build_review_manifest.py  (Stage A: metadata-only review manifest)
+├── build_review_manifest.py  (Stage A: metadata-only review manifest)
+└── train_classifier.py       (train OUR classifier; best-by-val → models/trained/)
 
 ../review/            (Stage B: FastAPI label-review web app; `just review`)
 ├── app.py            (on-demand in-memory crop decode; corrections → reviews.db)

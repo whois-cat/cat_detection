@@ -253,7 +253,8 @@ def _pad_crop(img: np.ndarray, box: Box, pad_frac: float):
     crop = img[y0:y1, x0:x1]
     local = Box(
         x=box.x - x0, y=box.y - y0, w=box.w, h=box.h,
-        cat=box.cat, score=box.score, track_id=box.track_id, rowid=box.rowid,
+        cat=box.cat, score=box.score, track_id=box.track_id,
+        rowid=box.rowid, cat_score=box.cat_score,
     )
     return crop, local
 
