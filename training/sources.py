@@ -24,9 +24,9 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator, Mapping
 
 import av
 import numpy as np
@@ -198,20 +198,37 @@ class CropSource(SampleSource):
     box jitter. Clamped to frame edges.
     """
 
-    def __init__(self, *args, pad_frac: float = 0.15, **kwargs):
+    def __init__(self, *args, pad_frac: float = 0.15,
+                 reviews: Mapping[int, str] | None = None,
+                 drop_labels: Iterable[str] = ("discard", "unknown"),
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.pad_frac = pad_frac
+        # Human label corrections (training.reviews.load_reviews): src_event_key
+        # (== box.rowid) → label. When a box has a correction it overrides the
+        # detector's cat; labels in drop_labels are skipped entirely.
+        self.reviews = reviews or {}
+        self.drop_labels = set(drop_labels)
 
     def _emit(self, frame: FrameRecord, img: np.ndarray) -> Iterator[Sample]:
         for box in frame.boxes:
+            label = box.cat
+            if self.reviews and box.rowid is not None:
+                corrected = self.reviews.get(box.rowid)
+                if corrected is not None:
+                    if corrected in self.drop_labels:
+                        continue            # reviewer marked discard/unknown
+                    label = corrected
             crop, local = _pad_crop(img, box, self.pad_frac)
             if crop is None:
                 continue
+            local.cat = label
             yield Sample(
                 image=crop, boxes=[local],
                 wall_ms=frame.wall_ms,
                 camera_id=frame.camera_id, model=frame.model,
-                src_box=box,            # original camera-coords box (has rowid)
+                # original camera-coords box (has rowid), with corrected label
+                src_box=replace(box, cat=label),
             )
 
 

@@ -35,6 +35,7 @@ from pathlib import Path
 
 import cv2
 
+from .reviews import load_reviews
 from .sources import CropSource
 
 
@@ -52,6 +53,9 @@ def main():
     ap.add_argument("--t-from", type=int, default=None, help="wall_ms lower bound")
     ap.add_argument("--t-to",   type=int, default=None, help="wall_ms upper bound")
     ap.add_argument("--min-score", type=float, default=None, help="drop low-score detections")
+    ap.add_argument("--reviews-db", type=Path, default=None,
+                    help="reviews.db from the label-review tool — overrides the "
+                         "detector label per crop; 'discard'/'unknown' crops are skipped")
     ap.add_argument("--pad-frac", type=float, default=0.15, help="extra context around the box")
     ap.add_argument("--val-frac", type=float, default=0.1, help="held-out fraction for val")
     ap.add_argument("--split-by-track", action="store_true",
@@ -67,11 +71,14 @@ def main():
     )
 
     rng = random.Random(args.seed)
+    reviews = load_reviews(args.reviews_db) if args.reviews_db else None
+    if reviews:
+        log.info("loaded %d human label corrections from %s", len(reviews), args.reviews_db)
     src = CropSource(
         db_path=args.db, recordings_root=args.recordings,
         camera_id=args.camera, model=args.model, cat=args.cat,
         t_from=args.t_from, t_to=args.t_to, min_score=args.min_score,
-        pad_frac=args.pad_frac,
+        pad_frac=args.pad_frac, reviews=reviews,
     )
 
     args.out.mkdir(parents=True, exist_ok=True)

@@ -227,10 +227,25 @@ Corrections are **non-destructive**: they go to a *separate* writable
 survives restart (already-reviewed crops are skipped; any crop can be reopened
 and re-labelled).
 
-Feeding corrections back into training: `CropSource` now carries each box's
-`events` rowid (`box.rowid` / `Sample.src_box.rowid`), so a training step can
-left-join `reviews.db` on `src_event_key` and override `box.cat` with the human
-label (falling back to the detector label where unreviewed).
+**Feeding corrections back into training.** `CropSource` carries each box's
+`events` rowid (`box.rowid` / `Sample.src_box.rowid`) and accepts a `reviews`
+map (`training.load_reviews("data/review/reviews.db")`): where a crop has a human
+label it overrides the detector's `box.cat`, and `discard` / `unknown` crops are
+dropped — unreviewed crops keep the detector label. Both training paths use it:
+
+```bash
+# disk dataset (ImageFolder) with corrected labels:
+uv run python -m training.extract_classifier \
+    --recordings data/recordings --db data/events/events.db \
+    --out data/datasets/classifier --reviews-db data/review/reviews.db \
+    --min-score 0.3 --split-by-track
+```
+
+```python
+# in-memory (no JPEGs), same correction overlay:
+from training import CropSource, load_reviews
+src = CropSource(db, recordings, reviews=load_reviews("data/review/reviews.db"))
+```
 
 ---
 
