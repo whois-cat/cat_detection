@@ -57,17 +57,39 @@ rebuild-webui:
 rebuild-detectors:
     {{PROD}} up -d --build
 
-# Crop label-review web app (Stage B). Decodes crops on the fly from recordings
-# (no image files) and writes corrections to a SEPARATE reviews.db — events.db is
-# never modified. Build the manifest first with Stage A:
-#   python3 -m training.build_review_manifest --db data/events/events.db \
-#       --recordings data/recordings --classifier detector/models/cat_classifier_openvino \
-#       --out data/review/manifest.jsonl --model yolov8n+cat --confuse alisa,felisis
-# Highlight the confusable pair in the UI by exporting REVIEW_CONFUSE (not hardcoded):
-#   REVIEW_CONFUSE=alisa,felisis just review 8095
+# ── Crop label-review tooling ───────────────────────────────────────────────
+# Stage A — build the metadata-only review manifest. Runs INSIDE the detector
+# image (it carries openvino + the baked classifier IR) with the repo mounted at
+# /work. Pass the detector service name + any build_review_manifest flags:
+#   just review-manifest detector-grey --confuse alisa,felisis --min-score 0.3
+# --model is auto-detected when the DB has a single model. Output is metadata
+# only (data/review/manifest.jsonl) — no images. Overridable env:
+#   EVENTS_DB, RECORDINGS_ROOT, CLASSIFIER_IR, REVIEW_MANIFEST.
+review-manifest SERVICE *ARGS:
+    {{PROD}} run --rm --no-deps -v "$PWD":/work -w /work {{SERVICE}} \
+        python -m training.build_review_manifest \
+            --db "${EVENTS_DB:-data/events/events.db}" \
+            --recordings "${RECORDINGS_ROOT:-data/recordings}" \
+            --classifier "${CLASSIFIER_IR:-/opt/models/cat_classifier_openvino}" \
+            --out "${REVIEW_MANIFEST:-data/review/manifest.jsonl}" \
+            {{ARGS}}
+
+# One-time: create the Stage B venv on the host (no openvino/torch).
+review-setup:
+    python3 -m venv .venv-review
+    .venv-review/bin/pip install -r review/requirements.txt
+
+# Stage B — the review web app. Decodes crops on the fly (no image files) and
+# writes corrections to a SEPARATE reviews.db; events.db is never modified.
+# Run `just review-setup` once first. Highlight the confusable pair (not
+# hardcoded) via env:  REVIEW_CONFUSE=alisa,felisis just review 8095
 review PORT="8095":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PY=.venv-review/bin/python
+    [ -x "$PY" ] || PY=python3
     REVIEW_MANIFEST="${REVIEW_MANIFEST:-data/review/manifest.jsonl}" \
     RECORDINGS_ROOT="${RECORDINGS_ROOT:-data/recordings}" \
     REVIEW_DB="${REVIEW_DB:-data/review/reviews.db}" \
     REVIEW_CONFUSE="${REVIEW_CONFUSE:-}" \
-    python3 -m uvicorn review.app:app --host 0.0.0.0 --port {{PORT}}
+    "$PY" -m uvicorn review.app:app --host 0.0.0.0 --port {{PORT}}

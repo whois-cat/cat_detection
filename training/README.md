@@ -184,33 +184,32 @@ coordinates — so this workflow writes **no crop files at all**. Crops are cut
 from the recordings into memory, shown/scored, and the pixels are dropped; only
 metadata (the labels) is persisted.
 
-**Stage A — build the manifest (detector env: needs OpenVINO + the classifier IR).**
-Walks `CropSource`, runs the classifier per crop (reusing
-`detector/classifier.py::CatClassifier.classify_all` — same `_preprocess` and IR
-as production), and writes one JSONL line of metadata per crop, sorted
-most-contentious-first:
+**Stage A — build the manifest** (runs in the detector image: it has OpenVINO +
+the baked classifier IR). Walks `CropSource`, runs the classifier per crop
+(reusing `detector/classifier.py::CatClassifier.classify_all` — same `_preprocess`
+and IR as production), and writes one JSONL line of metadata per crop, sorted
+most-contentious-first. Driven by `just` (pass the detector service name + flags):
 
 ```bash
-python3 -m training.build_review_manifest \
-    --db data/events/events.db \
-    --recordings data/recordings \
-    --classifier detector/models/cat_classifier_openvino \
-    --out data/review/manifest.jsonl \
-    --model yolov8n+cat \
-    --confuse alisa,felisis \         # names are data — never hardcoded
-    --min-score 0.3
+just review-manifest detector-grey --confuse alisa,felisis --min-score 0.3
 ```
 
-Each line: `{crop_id, src_event_key, wall_ms, camera, model, box, pad_frac,
-predicted, conf, probs{name:p}}`. Ordering: (0) the two top probabilities ARE the
-`--confuse` pair → by smallest margin first; (1) predicted is one of the pair →
-by lowest confidence; (2) everything else by lowest confidence. **The only thing
-on disk is `manifest.jsonl`.**
+`just review-manifest` mounts the repo into the detector container and runs
+`python -m training.build_review_manifest`. `--model` is auto-detected when the DB
+has a single model. Overridable env: `EVENTS_DB`, `RECORDINGS_ROOT`,
+`CLASSIFIER_IR`, `REVIEW_MANIFEST`. Each line: `{crop_id, src_event_key, wall_ms,
+camera, model, box, pad_frac, predicted, conf, probs{name:p}}`. Ordering: (0) the
+two top probabilities ARE the `--confuse` pair → by smallest margin first; (1)
+predicted is one of the pair → by lowest confidence; (2) everything else by lowest
+confidence. **The only thing on disk is `manifest.jsonl`.**
 
-**Stage B — review web app (host: needs `av` + this package, NOT openvino/torch).**
+> Bare invocation (outside `just`, in any env with openvino+av+cv2):
+> `python -m training.build_review_manifest --db … --recordings … --classifier … --out … --confuse alisa,felisis`
+
+**Stage B — review web app** (host: needs `av` + this package, NOT openvino/torch).
 
 ```bash
-pip install -r review/requirements.txt        # fastapi, uvicorn, av, numpy, Pillow
+just review-setup                              # once: venv + fastapi/uvicorn/av/Pillow
 REVIEW_CONFUSE=alisa,felisis just review 8095  # → http://localhost:8095
 ```
 

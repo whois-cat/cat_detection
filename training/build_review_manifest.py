@@ -91,6 +91,25 @@ def main() -> None:
     import cv2  # BGR -> RGB only
 
     from training import CropSource
+    from training.db import open_db_ro
+
+    # Auto-detect --model when the DB holds exactly one (the common case); refuse
+    # to guess when several are present so crops aren't silently mixed.
+    if args.model is None:
+        ro = open_db_ro(args.db)
+        q = "SELECT DISTINCT model FROM events"
+        p: list = []
+        if args.camera is not None:
+            q += " WHERE camera_id = ?"
+            p.append(args.camera)
+        models = [r[0] for r in ro.execute(q, p)]
+        ro.close()
+        if not models:
+            sys.exit("no events found (check --db / --camera)")
+        if len(models) > 1:
+            sys.exit(f"multiple models in DB — pass --model one of: {models}")
+        args.model = models[0]
+        print(f"[manifest] auto-selected --model {args.model!r}")
 
     confuse = {c.strip() for c in args.confuse.split(",") if c.strip()} if args.confuse else set()
     clf = _load_classifier(args.classifier)
