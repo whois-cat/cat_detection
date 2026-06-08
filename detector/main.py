@@ -9,6 +9,7 @@ Events sent over WebSocket have the shape:
     "tb_num":   int, "tb_den": int,
     "media_t":  float,
     "w": int, "h": int,
+    "rotate_deg": int,           # FRAME_ROTATE_DEG applied to the inference input
     "cat":       str | null,
     "cat_score": float | null,   # classifier identity confidence; null for blob/yolo
     "camera_id": str,
@@ -251,6 +252,11 @@ def detector_loop():
             "tb_num": tb_num, "tb_den": tb_den,
             "media_t": float(media_t),
             "w": cam_W, "h": cam_H,    # camera-frame dims (source of truth)
+            # Rotation applied to the inference input for THIS event. Persisted so
+            # training/review can re-rotate each crop by its own recorded value —
+            # data captured under different (or later-changed) rotate_deg mixes
+            # correctly. Boxes/dims above stay camera-orientation.
+            "rotate_deg": FRAME_ROTATE_DEG,
             "camera_id": CAMERA_ID,
             "model": detector.model_name,
         }
@@ -386,7 +392,7 @@ async def fanout_task():
                     camera_id=ev["camera_id"], model=ev["model"], wall_ms=ev["wall_ms"],
                     pts=ev.get("pts"), tb_num=ev.get("tb_num"), tb_den=ev.get("tb_den"),
                     media_t=ev.get("media_t"),
-                    frame_w=ev["w"], frame_h=ev["h"],
+                    frame_w=ev["w"], frame_h=ev["h"], rotate_deg=ev.get("rotate_deg"),
                     cat=ev.get("cat"), cat_score=ev.get("cat_score"),
                     box_x=b["x"], box_y=b["y"], box_w=b["w"], box_h=b["h"],
                     score=b.get("score", 0.0),

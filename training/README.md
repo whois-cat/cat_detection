@@ -187,24 +187,27 @@ metadata (the labels) is persisted.
 **Stage A — build the manifest** (runs in the detector image: it has OpenVINO +
 the baked classifier IR). Walks `CropSource`, runs the classifier per crop
 (reusing `detector/classifier.py::CatClassifier.classify_all` — same `_preprocess`
-and IR as production), and writes one JSONL line of metadata per crop, sorted
-most-contentious-first. Driven by `just` (pass the detector service name + flags):
+and IR as production), and writes one JSONL line of metadata per crop, sorted by
+**overall uncertainty** (least-confident first). Driven by `just`:
 
 ```bash
-just review-manifest detector-grey --confuse alisa,felisis --min-score 0.3
+just review-manifest detector-grey --min-score 0.3
 ```
 
 `just review-manifest` mounts the repo into the detector container and runs
 `python -m training.build_review_manifest`. `--model` is auto-detected when the DB
 has a single model. Overridable env: `EVENTS_DB`, `RECORDINGS_ROOT`,
 `CLASSIFIER_IR`, `REVIEW_MANIFEST`. Each line: `{crop_id, src_event_key, wall_ms,
-camera, model, box, pad_frac, predicted, conf, probs{name:p}}`. Ordering: (0) the
-two top probabilities ARE the `--confuse` pair → by smallest margin first; (1)
-predicted is one of the pair → by lowest confidence; (2) everything else by lowest
-confidence. **The only thing on disk is `manifest.jsonl`.**
+camera, model, box, rotate_deg, pad_frac, predicted, conf, probs{name:p}}`.
+**Ordering** = top-1 probability ascending, tie-broken by the top-1−top-2 margin —
+the genuinely ambiguous crops (any cats, any confused pair) float to the top.
+`--confuse` is optional and only affects the UI highlight (not ordering/trust).
+For data captured before per-event rotation was recorded, pass
+`--default-rotate-deg <deg>` (the camera's rotation then). **The only thing on
+disk is `manifest.jsonl`.**
 
 > Bare invocation (outside `just`, in any env with openvino+av+cv2):
-> `python -m training.build_review_manifest --db … --recordings … --classifier … --out … --confuse alisa,felisis`
+> `python -m training.build_review_manifest --db … --recordings … --classifier … --out … --min-score 0.3`
 
 **Stage B — review web app** (host: needs `av` + this package, NOT openvino/torch).
 
@@ -217,9 +220,11 @@ Each crop is decoded on demand straight from the recordings
 (`training.decode_one_crop`, which reuses the same segment lookup + keyframe seek
 as the batch sources), encoded to an in-memory JPEG, and streamed — never written
 to a file. The page shows the crop big, the model's guess + confidence, the two
-top probabilities (the confuse pair highlighted), and one button per class plus
-`unknown` / `discard`; hotkeys `1..N`, `←/→` to navigate, a live `X / N`
-progress bar.
+top probabilities (the `REVIEW_CONFUSE` pair highlighted, if set), and one button
+per class plus `unknown` / `discard`; hotkeys `1..N`, `←/→` to navigate, a live
+`X / N` progress bar. Crops are shown in the detector's inference orientation
+(each rotated by its own recorded `rotate_deg`), so you judge exactly what the
+model sees.
 
 Corrections are **non-destructive**: they go to a *separate* writable
 `data/review/reviews.db` keyed by `src_event_key`, so the detector's rows in
@@ -264,25 +269,31 @@ python -m training.train_classifier \
     --recordings data/recordings \
     --reviews-db data/review/reviews.db \
     --confuse alisa,felisis \
-    --trust-conf 0.9 \
     --pad-frac 0.15 \
     --min-recall 0.9
 # heavier pass when you have more data:  add --full-finetune
+# cheap volume (trust the donor on unreviewed crops):  --trust-detector --trust-conf 0.9
 ```
 
 What it does, and why each part:
 
-- **Labels (safe by default).** For the `--confuse` pair, ONLY human labels are
-  used (the donor is exactly what's wrong there). For other classes it takes the
-  human label, else the donor's label when its `cat_score >= --trust-conf` (the
-  donor is usually right on chuzh/ellie, so this adds volume cheaply). Class names
-  are the sorted unique surviving labels — saved with the model.
+- **Labels (human-only by default).** The donor confuses several pairs, so by
+  default NO detector label is trusted — training uses ONLY human-reviewed labels.
+  `--trust-detector` opts back in to the donor's label for unreviewed crops when
+  its `cat_score >= --trust-conf` (cheap volume, your call). `discard`/`unknown`
+  are dropped; class names are the sorted unique surviving labels, saved with the
+  model. `--confuse` here only highlights a cell in the confusion matrix.
 - **Honest split.** `track_id` is empty, so a random split leaks near-duplicate
   neighbours. Crops are grouped into **episodes** (same camera, `wall_ms` gaps
   `> --episode-gap-sec` start a new one) and whole episodes go to train OR val.
-  The split is stratified so val always contains **both** confuse cats.
+  The split is stratified so val contains **every** class (per-class recall needs it).
 - **No JPEGs.** Crops are decoded from the recordings into RAM
   (`CropSource` → `TorchCachedDataset.materialise()`), trained on, discarded.
+- **Rotation, per-event.** Each crop is rotated by its own recorded `rotate_deg`
+  (the shared `training.sources.rotate_crop`, same convention as the detector), so
+  data captured under different — or later-changed — camera rotations trains
+  together correctly. For events recorded before `rotate_deg` was persisted, pass
+  `--default-rotate-deg <deg>` (one warning is logged). `rotate_deg=0` is a no-op.
 - **Crop framing.** `--pad-frac` MUST equal the detector `CLASSIFIER_PAD_FRAC`
   and `build_review_manifest --pad-frac` (default 0.15 everywhere). The eval/val
   transform is byte-identical to `detector/classifier.py::_preprocess`; only train

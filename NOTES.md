@@ -294,6 +294,7 @@ Wire (WebSocket / `/events`):
   "tb_num":  1, "tb_den": 90000,
   "media_t": 0.057,
   "w": 2304, "h": 1296,
+  "rotate_deg": 90,
   "cat": "alisa",
   "cat_score": 0.91,
   "camera_id": "default",
@@ -310,6 +311,12 @@ Wire (WebSocket / `/events`):
   per-cat identity). The feeder weights identity votes by this value and
   drops frames below its `CLASSIFIER_MIN_CONF`, so it MUST travel with the
   event — it is also persisted to the `cat_score` column for training.
+- **`rotate_deg`**: the `FRAME_ROTATE_DEG` applied to the inference input for
+  this event, persisted (nullable column) so training/review can re-rotate
+  each crop by its OWN recorded value — data captured under different (or
+  later-changed) camera rotations then mixes correctly. Boxes and `w`/`h`
+  stay camera-orientation. Old rows are `NULL`; consumers fall back to a
+  configured default (`--default-rotate-deg`) and log one warning.
 - **Camera coordinates everywhere.** See the coordinate-basis discussion
   in §2.
 - **`in_action`**: box-center inside `ACTION_POLYGON`. Action-trigger

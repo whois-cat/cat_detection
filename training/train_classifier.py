@@ -54,15 +54,20 @@ Meta = namedtuple("Meta", ["label", "camera", "wall_ms"])
 
 # --------------------------------------------------------------- label policy --
 
-def decide_label(det_label, det_conf, human, confuse, trust_conf):
-    """Final training label for one crop, or None to drop it (see module doc)."""
+def decide_label(det_label, det_conf, human, trust_detector, trust_conf):
+    """Final training label for one crop, or None to drop it.
+
+    Default (trust_detector=False): ONLY human labels are used — the donor
+    confuses several pairs, so we don't trust ANY of its labels. With
+    --trust-detector, an unreviewed crop may also use the donor's label when its
+    cat_score >= trust_conf. discard/unknown are always dropped.
+    """
     if human is not None:
         return None if human in DROP_LABELS else human
-    # No human label below here — fall back to the detector, carefully.
+    if not trust_detector:
+        return None                      # human-only by default
     if not det_label or det_label in DROP_LABELS:
         return None
-    if det_label in confuse:
-        return None                      # never trust the detector on the confuse pair
     if det_conf is not None and det_conf >= trust_conf:
         return det_label
     return None
@@ -93,9 +98,10 @@ def build_episodes(metas: list[Meta], gap_ms: int) -> list[list[int]]:
 
 
 def split_episodes(episodes: list[list[int]], metas: list[Meta], *,
-                   val_frac: float, confuse: set[str], seed: int):
-    """Assign whole episodes to train/val. Stratify so val holds both confuse
-    cats. Returns (train_idx, val_idx) as crop-index lists."""
+                   val_frac: float, required: set[str], seed: int):
+    """Assign whole episodes to train/val. Stratify so val holds EVERY class in
+    `required` (per-class recall needs each present). Returns (train_idx, val_idx)
+    as crop-index lists."""
     rng = random.Random(seed)
     order = list(range(len(episodes)))
     rng.shuffle(order)
@@ -113,9 +119,9 @@ def split_episodes(episodes: list[list[int]], metas: list[Meta], *,
     def ep_labels(e: int) -> set[str]:
         return {metas[i].label for i in episodes[e]}
 
-    # Guarantee each confuse cat appears in val (move a train episode if needed).
+    # Guarantee each required class appears in val (move a train episode if need).
     val_label_union = set().union(*(ep_labels(e) for e in val_eps)) if val_eps else set()
-    for cat in confuse:
+    for cat in required:
         if cat in val_label_union:
             continue
         for e in order:
@@ -124,8 +130,8 @@ def split_episodes(episodes: list[list[int]], metas: list[Meta], *,
                 val_label_union |= ep_labels(e)
                 break
         else:
-            log.warning("confuse cat %r not present in ANY episode — confusion "
-                        "metric for it will be empty", cat)
+            log.warning("class %r not present in ANY episode — its val recall "
+                        "will be 0/empty", cat)
 
     train_idx, val_idx = [], []
     for e in range(len(episodes)):
@@ -204,12 +210,22 @@ def main() -> None:
                     help="reviews.db with human corrections (strongly recommended)")
     ap.add_argument("--camera", default=None)
     ap.add_argument("--model", default=None, help="detector model filter (default: all)")
-    ap.add_argument("--confuse", default="", help="confusable pair, e.g. alisa,felisis")
+    ap.add_argument("--confuse", default="",
+                    help="OPTIONAL pair to highlight in the confusion matrix "
+                         "(e.g. alisa,felisis); does NOT affect trust or split")
+    ap.add_argument("--trust-detector", action="store_true",
+                    help="also use the donor's labels for unreviewed crops (OFF by "
+                         "default — human labels only, since the donor confuses "
+                         "several pairs)")
     ap.add_argument("--trust-conf", type=float, default=0.9,
-                    help="min detector cat_score to trust its label (non-confuse classes)")
+                    help="min detector cat_score to trust its label; only used "
+                         "with --trust-detector")
     ap.add_argument("--pad-frac", type=float, default=0.15,
                     help="crop context padding — MUST match the detector "
                          "CLASSIFIER_PAD_FRAC and build_review_manifest --pad-frac")
+    ap.add_argument("--default-rotate-deg", type=int, default=0,
+                    help="rotation to assume for events recorded BEFORE rotate_deg "
+                         "was persisted (set to the camera's rotate_deg then)")
     ap.add_argument("--min-score", type=float, default=None, help="drop low YOLO-score boxes")
     ap.add_argument("--episode-gap-sec", type=float, default=60.0)
     ap.add_argument("--val-frac", type=float, default=0.2)
@@ -256,13 +272,15 @@ def main() -> None:
         human = reviews.get(sb.rowid) if sb and sb.rowid is not None else None
         label = decide_label(sb.cat if sb else None,
                              sb.cat_score if sb else None,
-                             human, confuse, args.trust_conf)
+                             human, args.trust_detector, args.trust_conf)
         return Meta(label=label, camera=sample.camera_id, wall_ms=sample.wall_ms)
 
     # CropSource WITHOUT reviews= (we need the raw detector label/conf for policy).
+    # default_rotate_deg only affects pre-migration events with NULL rotate_deg.
     src = CropSource(db_path=args.db, recordings_root=args.recordings,
                      camera_id=args.camera, model=args.model,
-                     min_score=args.min_score, pad_frac=args.pad_frac)
+                     min_score=args.min_score, pad_frac=args.pad_frac,
+                     default_rotate_deg=args.default_rotate_deg)
     cache = TorchCachedDataset(src, transform=lambda x: x, target_fn=meta_fn)
     cache.materialise()   # decode pass in the MAIN process (CropSource isn't fork-safe)
 
@@ -285,7 +303,7 @@ def main() -> None:
     # --- honest, episode-grouped, confuse-stratified split ---
     episodes = build_episodes(metas, int(args.episode_gap_sec * 1000))
     train_idx, val_idx = split_episodes(episodes, metas, val_frac=args.val_frac,
-                                        confuse=confuse, seed=args.seed)
+                                        required=set(classes), seed=args.seed)
     log.info("%d episodes -> train %d crops / val %d crops",
              len(episodes), len(train_idx), len(val_idx))
 

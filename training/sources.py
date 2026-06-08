@@ -58,6 +58,10 @@ class Sample:
     # CropSource only: the ORIGINAL box in camera coords (carries rowid). boxes[0]
     # above is crop-LOCAL; src_box is what decode_one_crop / the manifest need.
     src_box: Box | None = None
+    # Rotation (degrees) applied to `image` to match the detector's inference
+    # orientation for THIS event — resolved per-event (recorded value, else the
+    # configured default).
+    rotate_deg: int = 0
 
 
 # ---------------------------------------------------------------- internals --
@@ -201,6 +205,7 @@ class CropSource(SampleSource):
     def __init__(self, *args, pad_frac: float = 0.15,
                  reviews: Mapping[int, str] | None = None,
                  drop_labels: Iterable[str] = ("discard", "unknown"),
+                 default_rotate_deg: int = 0,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.pad_frac = pad_frac
@@ -209,8 +214,23 @@ class CropSource(SampleSource):
         # detector's cat; labels in drop_labels are skipped entirely.
         self.reviews = reviews or {}
         self.drop_labels = set(drop_labels)
+        # Fallback rotation for events recorded BEFORE rotate_deg was persisted
+        # (FrameRecord.rotate_deg is NULL). Set to the camera's rotate_deg at
+        # capture time. Newer events carry their own value and ignore this.
+        self.default_rotate_deg = default_rotate_deg
+        self._warned_missing_rotate = False
 
     def _emit(self, frame: FrameRecord, img: np.ndarray) -> Iterator[Sample]:
+        rot = frame.rotate_deg
+        if rot is None:
+            rot = self.default_rotate_deg
+            if not self._warned_missing_rotate:
+                log.warning(
+                    "event(s) without recorded rotate_deg — assuming %d°. Set "
+                    "CropSource(default_rotate_deg=...) to the camera's rotation "
+                    "at capture time for pre-migration data.", rot,
+                )
+                self._warned_missing_rotate = True
         for box in frame.boxes:
             label = box.cat
             if self.reviews and box.rowid is not None:
@@ -222,6 +242,10 @@ class CropSource(SampleSource):
             crop, local = _pad_crop(img, box, self.pad_frac)
             if crop is None:
                 continue
+            # Rotate the camera-orientation crop into the detector's inference
+            # orientation for THIS event, so crops captured under different
+            # rotations train together correctly.
+            crop = rotate_crop(crop, rot)
             local.cat = label
             yield Sample(
                 image=crop, boxes=[local],
@@ -229,10 +253,26 @@ class CropSource(SampleSource):
                 camera_id=frame.camera_id, model=frame.model,
                 # original camera-coords box (has rowid), with corrected label
                 src_box=replace(box, cat=label),
+                rotate_deg=rot,
             )
 
 
 # ------------------------------------------------------- random-access crop --
+
+def rotate_crop(crop: np.ndarray, rotate_deg: int | None) -> np.ndarray:
+    """Rotate a camera-orientation crop into the detector's INFERENCE orientation.
+
+    SINGLE shared helper — same convention as detector/main.py's `_ROT90_K`: the
+    camera is mounted rotated and we rotate the inference input CW by rotate_deg;
+    np.rot90 turns CCW, so the matching factor is k = (-rotate_deg // 90) % 4.
+    rotate_deg is per-event (0/90/180/270); 0/None is a no-op so users with no
+    tilt are unaffected.
+    """
+    k = (-int(rotate_deg or 0) // 90) % 4
+    if k == 0:
+        return crop
+    return np.ascontiguousarray(np.rot90(crop, k=k))
+
 
 def _pad_crop(img: np.ndarray, box: Box, pad_frac: float):
     """Crop `img` (BGR) to `box` (CAMERA coords) with pad_frac context, clamped
@@ -270,11 +310,13 @@ class CropRef:
 
     `box` is in CAMERA coordinates (the original detector box, matching the
     events row), NOT crop-local. The review UI builds this straight from a
-    manifest line.
+    manifest line. `rotate_deg` is that event's recorded rotation (applied after
+    cutting, to match the detector's inference orientation).
     """
     camera_id: str
     wall_ms: int
     box: Box
+    rotate_deg: int = 0
 
 
 def decode_one_crop(ref: CropRef, recordings_root, *, pad_frac: float = 0.15,
@@ -304,7 +346,8 @@ def decode_one_crop(ref: CropRef, recordings_root, *, pad_frac: float = 0.15,
         crop, _local = _pad_crop(img, ref.box, pad_frac)
         if crop is None:
             raise CropUnavailable(f"degenerate crop for wall_ms={ref.wall_ms}")
-        return crop
+        # Match the detector's per-event inference orientation.
+        return rotate_crop(crop, ref.rotate_deg)
     raise CropUnavailable(
         f"seek produced no frame in {seg.path} at media_t={media_t:.3f}s"
     )

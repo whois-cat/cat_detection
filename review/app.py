@@ -127,6 +127,7 @@ def _crop_jpeg(crop_id: str) -> bytes:
         wall_ms=item["wall_ms"],
         box=Box(x=b["x"], y=b["y"], w=b["w"], h=b["h"],
                 cat=None, score=0.0, track_id=None, rowid=item.get("src_event_key")),
+        rotate_deg=int(item.get("rotate_deg", 0)),   # match detector inference orientation
     )
     crop_bgr = decode_one_crop(
         ref, RECORDINGS,

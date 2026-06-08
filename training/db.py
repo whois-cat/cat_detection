@@ -33,6 +33,7 @@ class FrameRecord:
     media_t: float | None
     frame_w: int
     frame_h: int
+    rotate_deg: int | None    # rotation applied to inference input (NULL = pre-migration)
     boxes: list[Box]
 
 
@@ -57,7 +58,7 @@ def iter_frames(conn: sqlite3.Connection, *,
     """
     sql = [
         "SELECT rowid, camera_id, model, wall_ms, pts, media_t, frame_w, frame_h,",
-        "       cat, cat_score, box_x, box_y, box_w, box_h, score, track_id",
+        "       rotate_deg, cat, cat_score, box_x, box_y, box_w, box_h, score, track_id",
         "FROM events WHERE 1=1",
     ]
     params: list = []
@@ -73,7 +74,7 @@ def iter_frames(conn: sqlite3.Connection, *,
     current: FrameRecord | None = None
     for row in cur:
         (rowid, cam, model_, wall_ms, pts, media_t, fw, fh,
-         cat_, cat_score, bx, by, bw, bh, score, track_id) = row
+         rotate_deg, cat_, cat_score, bx, by, bw, bh, score, track_id) = row
         key = (cam, model_, wall_ms, pts)
         if current is None or (current.camera_id, current.model,
                                current.wall_ms, current.pts) != key:
@@ -81,7 +82,8 @@ def iter_frames(conn: sqlite3.Connection, *,
                 yield current
             current = FrameRecord(
                 camera_id=cam, model=model_, wall_ms=wall_ms, pts=pts,
-                media_t=media_t, frame_w=fw, frame_h=fh, boxes=[],
+                media_t=media_t, frame_w=fw, frame_h=fh,
+                rotate_deg=rotate_deg, boxes=[],
             )
         current.boxes.append(Box(
             x=bx, y=by, w=bw, h=bh, cat=cat_, score=score, track_id=track_id,

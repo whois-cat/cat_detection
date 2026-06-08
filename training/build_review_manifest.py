@@ -10,21 +10,19 @@ CropSource over the recordings, and for each detected box:
 
 The single output is a JSONL manifest — no JPEGs, no crops on disk. Each line:
 
-    {crop_id, src_event_key, wall_ms, camera, model, box{x,y,w,h}, pad_frac,
-     predicted, conf, probs{name: p}}
+    {crop_id, src_event_key, wall_ms, camera, model, box{x,y,w,h}, rotate_deg,
+     pad_frac, predicted, conf, probs{name: p}}
 
 `src_event_key` is the events-table rowid, the non-destructive link the review
-UI writes corrections against. `box` is in camera coords so the UI can re-cut
-the identical crop on the fly via training.decode_one_crop.
+UI writes corrections against. `box` is in camera coords and `rotate_deg` is the
+event's recorded rotation, so the UI re-cuts the identical crop on the fly via
+training.decode_one_crop (the classifier here is scored on that same rotated crop).
 
-Records are sorted most-contentious-first so the confusable pair surfaces at the
-top of the review queue (pass --confuse alisa,felisis — names are data, never
-hardcoded):
-
-  tier 0 — the two highest-probability classes ARE the confuse pair: sort by the
-           margin |p1 - p2| ascending (a near-tie is maximally contentious);
-  tier 1 — predicted is one of the pair (but top-2 aren't both): by conf ascending;
-  tier 2 — everything else: by conf ascending.
+Records are sorted by OVERALL uncertainty — least-confident crops first — so the
+genuinely ambiguous ones (any cats, any confused pair) surface at the top:
+top-1 probability ascending, tie-broken by the top-1 minus top-2 margin
+ascending. `--confuse` is OPTIONAL and does NOT affect ordering or trust; it's
+only carried for the UI to highlight (the app reads REVIEW_CONFUSE).
 
 Usage (from the repo root, detector env):
 
@@ -32,8 +30,7 @@ Usage (from the repo root, detector env):
         --db data/events/events.db \
         --recordings data/recordings \
         --classifier detector/models/cat_classifier_openvino \
-        --out data/review/manifest.jsonl \
-        --model yolov8n+cat --confuse alisa,felisis --min-score 0.3
+        --out data/review/manifest.jsonl --min-score 0.3
 """
 from __future__ import annotations
 
@@ -56,17 +53,14 @@ def _load_classifier(classifier_dir: str):
     return CatClassifier(classifier_dir)
 
 
-def contentiousness_key(rec: dict, confuse: set[str]):
-    """Sort key: lower == more contentious (see module docstring)."""
-    ranked = sorted(rec["probs"].items(), key=lambda kv: kv[1], reverse=True)
-    conf = rec["conf"]
-    if confuse and len(ranked) >= 2:
-        top2 = {ranked[0][0], ranked[1][0]}
-        if top2 == confuse:
-            return (0, abs(ranked[0][1] - ranked[1][1]))
-    if confuse and rec["predicted"] in confuse:
-        return (1, conf)
-    return (2, conf)
+def uncertainty_key(rec: dict):
+    """Sort key: lower == more uncertain. Top-1 probability ascending, tie-broken
+    by the top-1 − top-2 margin ascending. Any cats, any confused pair — the
+    least-confident crops sort first."""
+    ps = sorted(rec["probs"].values(), reverse=True)
+    top1 = ps[0] if ps else 0.0
+    margin = top1 - (ps[1] if len(ps) > 1 else 0.0)
+    return (top1, margin)
 
 
 def main() -> None:
@@ -79,10 +73,16 @@ def main() -> None:
     ap.add_argument("--camera", default=None, help="filter by camera_id (default: all)")
     ap.add_argument("--model", default=None, help="filter by detector model (default: all)")
     ap.add_argument("--confuse", default=None,
-                    help="comma-separated confusable pair to float to the top, "
-                         "e.g. alisa,felisis (names from data — not hardcoded)")
+                    help="OPTIONAL confusable pair for UI highlight only (e.g. "
+                         "alisa,felisis); does NOT affect ordering. The app reads "
+                         "REVIEW_CONFUSE — pass it there to actually highlight.")
     ap.add_argument("--min-score", type=float, default=None, help="drop low-score boxes")
-    ap.add_argument("--pad-frac", type=float, default=0.15, help="crop context padding")
+    ap.add_argument("--pad-frac", type=float, default=0.15,
+                    help="crop context padding — MUST match detector "
+                         "CLASSIFIER_PAD_FRAC and train_classifier --pad-frac")
+    ap.add_argument("--default-rotate-deg", type=int, default=0,
+                    help="rotation to assume for events recorded BEFORE rotate_deg "
+                         "was persisted (set to the camera's rotate_deg then)")
     ap.add_argument("--t-from", type=int, default=None, help="wall_ms lower bound")
     ap.add_argument("--t-to", type=int, default=None, help="wall_ms upper bound")
     ap.add_argument("--limit", type=int, default=None, help="cap number of crops")
@@ -111,14 +111,13 @@ def main() -> None:
         args.model = models[0]
         print(f"[manifest] auto-selected --model {args.model!r}")
 
-    confuse = {c.strip() for c in args.confuse.split(",") if c.strip()} if args.confuse else set()
     clf = _load_classifier(args.classifier)
 
     src = CropSource(
         db_path=args.db, recordings_root=args.recordings,
         camera_id=args.camera, model=args.model,
         t_from=args.t_from, t_to=args.t_to, min_score=args.min_score,
-        pad_frac=args.pad_frac,
+        pad_frac=args.pad_frac, default_rotate_deg=args.default_rotate_deg,
     )
 
     records: list[dict] = []
@@ -139,22 +138,22 @@ def main() -> None:
             "camera": sample.camera_id,
             "model": sample.model,
             "box": {"x": int(sb.x), "y": int(sb.y), "w": int(sb.w), "h": int(sb.h)},
+            "rotate_deg": int(sample.rotate_deg),
             "pad_frac": float(args.pad_frac),
             "predicted": predicted,
             "conf": float(probs[predicted]),
             "probs": probs,
         })
 
-    records.sort(key=lambda r: contentiousness_key(r, confuse))
+    records.sort(key=uncertainty_key)   # least-confident first
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r) + "\n")
 
-    n_pair = sum(1 for r in records if contentiousness_key(r, confuse)[0] == 0)
     print(f"wrote {len(records)} records to {args.out} "
-          f"({n_pair} in the contentious {sorted(confuse) or '—'} pair, sorted first)")
+          f"(sorted by uncertainty; lowest top-1 confidence first)")
 
 
 if __name__ == "__main__":
