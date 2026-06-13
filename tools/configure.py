@@ -8,9 +8,8 @@ Generates (all marked with `# GENERATED ...` headers):
   - webui/public/cameras.json         camera list the UI fetches at startup
 
 Run via `just configure` (or `python tools/configure.py`) from the live2/
-directory after editing cameras.yaml. Generated files ARE committed so the
-codebase is self-contained and diffs are inspectable; rerun whenever
-cameras.yaml changes.
+directory after editing cameras.yaml. Generated files are gitignored because
+they are server-specific; rerun whenever cameras.yaml changes.
 
 Networking model (important if you're chasing connectivity issues):
 - mediamtx stays on the HOST network (network_mode: host) — needed so
@@ -36,6 +35,53 @@ ROOT = Path(__file__).resolve().parent.parent
 CAMERAS_YAML = ROOT / "cameras.yaml"
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def _flat_points(raw) -> list[float]:
+    if isinstance(raw, str):
+        return [float(v.strip()) for v in raw.split(",") if v.strip()]
+    if isinstance(raw, (list, tuple)):
+        if raw and all(isinstance(v, (list, tuple)) for v in raw):
+            return [float(x) for pair in raw for x in pair]
+        return [float(v) for v in raw]
+    raise ValueError(f"unsupported region coordinates: {raw!r}")
+
+
+def _polygon_from_value(raw) -> list[list[float]]:
+    vals = _flat_points(raw)
+    if len(vals) == 4:
+        x0, y0, x1, y1 = vals
+        points = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    elif len(vals) >= 6 and len(vals) % 2 == 0:
+        points = [[vals[i], vals[i + 1]] for i in range(0, len(vals), 2)]
+    else:
+        raise ValueError("region must be rect x0,y0,x1,y1 or an even polygon >= 3 points")
+    for x, y in points:
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise ValueError(f"region point out of [0,1]: {(x, y)!r}")
+    return points
+
+
+def _rect_from_value(raw) -> list[float]:
+    vals = _flat_points(raw)
+    if len(vals) != 4:
+        raise ValueError("rect must be x0,y0,x1,y1")
+    for v in vals:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"rect point out of [0,1]: {v!r}")
+    return vals
+
+
+def _ignore_regions_for_ui(cam: dict) -> list[dict]:
+    out = []
+    for i, raw in enumerate(cam.get("ignore_regions", []) or []):
+        name = f"{cam['id']}-ignore-{i}"
+        coords = raw
+        if isinstance(raw, dict):
+            name = str(raw.get("name") or name)
+            coords = raw.get("rect", raw.get("points", raw.get("polygon")))
+        out.append({"name": name, "points": _polygon_from_value(coords)})
+    return out
 
 
 def load_config() -> dict:
@@ -170,6 +216,7 @@ def render_compose(cfg: dict) -> str:
             "CLASSIFIER_PAD_FRAC": cam.get("classifier_pad_frac", 0.15),
             "DETECT_ROI":          cam.get("detect_roi", "0,0,1,1"),
             "IGNORE_REGIONS":      json.dumps(cam.get("ignore_regions", [])),
+            "IGNORE_REGION_MIN_COVERAGE": cam.get("ignore_region_min_coverage", 0.8),
             "ACTION_POLYGON":      cam.get("action_polygon", "0,0,1,1"),
             "FRAME_ROTATE_DEG":    cam.get("rotate_deg", 0),
             "EVENTS_DB":           "/data/events/events.db",
@@ -211,6 +258,7 @@ def render_compose(cfg: dict) -> str:
                 "CLASSIFIER_MIN_CONF":     str(feeder.get("classifier_min_conf", 0.9)),
                 "OPEN_DEBOUNCE_SEC":       str(feeder.get("open_debounce_sec", 3)),
                 "MULTI_DEBOUNCE_SEC":      str(feeder.get("multi_debounce_sec", 2)),
+                "DISPLAY_TEXT_INTERVAL":   str(feeder.get("display_text_interval", 2)),
             }
             feeder_env_lines = "\n".join(
                 f"      {k}: {json.dumps(v)}" for k, v in feeder_env.items()
@@ -329,6 +377,10 @@ def render_cameras_json(cfg: dict) -> str:
         {
             "id":    cam["id"],
             "label": cam.get("label", cam["id"].replace("-", " ").title()),
+            "detect_roi": _rect_from_value(cam.get("detect_roi", "0,0,1,1")),
+            "action_polygon": _polygon_from_value(cam.get("action_polygon", "0,0,1,1")),
+            "ignore_regions": _ignore_regions_for_ui(cam),
+            "ignore_region_min_coverage": cam.get("ignore_region_min_coverage", 0.8),
         }
         for cam in cfg["cameras"]
     ]

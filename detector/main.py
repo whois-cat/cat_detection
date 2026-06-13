@@ -19,7 +19,10 @@ Events sent over WebSocket have the shape:
 
 Also broadcast on the same WS, identified by `kind` field:
   {"kind": "stats", "fps_in": float, "fps_processed": float,
-   "active_tracks": int, "camera_id": str, "model": str}
+   "active_tracks": int, "camera_id": str, "model": str,
+   "detect_roi": [x0,y0,x1,y1],
+   "action_polygon": [[x,y], ...],
+   "ignore_regions": [{"name": str, "points": [[x,y], ...]}]}
 
 Storage: SQLite at /data/events/events.db (one row per detection box).
 """
@@ -99,15 +102,17 @@ DETECT_ROI_IS_FULL = DETECT_ROI == (0.0, 0.0, 1.0, 1.0)
 ACTION_ROI_IS_FULL = ACTION_POLYGON == [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 
 
-def _parse_ignore_regions() -> list[list[tuple[float, float]]]:
+def _parse_ignore_regions() -> list[dict]:
     raw = os.environ.get("IGNORE_REGIONS", "").strip()
     if not raw:
         return []
     data = json.loads(raw)
     regions = []
     for i, region in enumerate(data):
+        name = f"ignore-{i}"
         coords = region
         if isinstance(region, dict):
+            name = str(region.get("name") or name)
             coords = region.get("rect", region.get("points", region.get("polygon")))
         if isinstance(coords, str):
             vals = [float(v.strip()) for v in coords.split(",") if v.strip()]
@@ -125,11 +130,45 @@ def _parse_ignore_regions() -> list[list[tuple[float, float]]]:
         for x, y in points:
             if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
                 raise ValueError(f"IGNORE_REGIONS[{i}] point out of [0,1]: {(x, y)!r}")
-        regions.append(points)
+        regions.append({"name": name, "points": points})
     return regions
 
 
 IGNORE_REGIONS = _parse_ignore_regions()
+IGNORE_REGION_MIN_COVERAGE = max(
+    0.0,
+    min(1.0, float(os.environ.get("IGNORE_REGION_MIN_COVERAGE", "0.8"))),
+)
+
+
+def _box_region_coverage(
+    box: dict,
+    frame_w: int,
+    frame_h: int,
+    region: list[tuple[float, float]],
+    *,
+    samples: int = 7,
+) -> float:
+    if frame_w <= 0 or frame_h <= 0 or box["w"] <= 0 or box["h"] <= 0:
+        return 0.0
+    samples = max(2, samples)
+    inside = 0
+    total = samples * samples
+    for iy in range(samples):
+        py = (box["y"] + (iy + 0.5) * box["h"] / samples) / frame_h
+        for ix in range(samples):
+            px = (box["x"] + (ix + 0.5) * box["w"] / samples) / frame_w
+            if _point_in_polygon(px, py, region):
+                inside += 1
+    return inside / total
+
+
+def _box_in_ignore_region(box: dict, frame_w: int, frame_h: int) -> bool:
+    return any(
+        _box_region_coverage(box, frame_w, frame_h, region["points"])
+        >= IGNORE_REGION_MIN_COVERAGE
+        for region in IGNORE_REGIONS
+    )
 
 
 def _unrotate_box_to_camera(rx: int, ry: int, rw: int, rh: int,
@@ -276,17 +315,7 @@ def detector_loop():
             )
             boxes.append({**b, "x": ux + x0, "y": uy + y0, "w": uw, "h": uh})
         if IGNORE_REGIONS:
-            boxes = [
-                b for b in boxes
-                if not any(
-                    _point_in_polygon(
-                        (b["x"] + b["w"] * 0.5) / cam_W,
-                        (b["y"] + b["h"] * 0.5) / cam_H,
-                        region,
-                    )
-                    for region in IGNORE_REGIONS
-                )
-            ]
+            boxes = [b for b in boxes if not _box_in_ignore_region(b, cam_W, cam_H)]
 
         wall_ms = int(time.time() * 1000)
         pts = int(frame.pts)
@@ -478,6 +507,14 @@ async def stats_task():
             # its native (camera) orientation, so these draw directly.
             "detect_roi":     list(DETECT_ROI),
             "action_polygon": [[x, y] for x, y in ACTION_POLYGON],
+            "ignore_regions": [
+                {
+                    "name": region["name"],
+                    "points": [[x, y] for x, y in region["points"]],
+                }
+                for region in IGNORE_REGIONS
+            ],
+            "ignore_region_min_coverage": IGNORE_REGION_MIN_COVERAGE,
         }
         await broadcast_str(json.dumps(msg, separators=(",", ":")))
 

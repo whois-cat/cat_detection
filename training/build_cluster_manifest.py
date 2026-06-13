@@ -249,13 +249,16 @@ def main() -> None:
     ap.add_argument("--ignore-region", action="append", default=[],
                     help="extra ignored region as CAMERA:x0,y0,x1,y1 or global "
                          "x0,y0,x1,y1 in camera-normalized coords")
+    ap.add_argument("--ignore-region-min-coverage", type=float, default=0.8,
+                    help="drop a box only when at least this fraction of the "
+                         "box area is inside an ignore region")
     ap.add_argument("--labels", default="",
                     help="optional comma-separated label names for the review UI")
     args = ap.parse_args()
 
     from training import CropSource
     from training.regions import (
-        box_center_in_ignore_region,
+        box_in_ignore_region,
         load_ignore_regions_from_camera_config,
         merge_regions,
         parse_region_specs,
@@ -273,12 +276,13 @@ def main() -> None:
 
     def keep_box(frame, box) -> bool:
         nonlocal ignored_by_region
-        if box_center_in_ignore_region(
+        if box_in_ignore_region(
             frame.camera_id,
             frame.frame_w,
             frame.frame_h,
             box,
             ignore_regions,
+            min_coverage=args.ignore_region_min_coverage,
         ):
             ignored_by_region += 1
             return False
@@ -413,6 +417,7 @@ def main() -> None:
             "dedupe_threshold": args.dedupe_threshold,
             "deduped": deduped,
             "ignored_by_region": ignored_by_region,
+            "ignore_region_min_coverage": args.ignore_region_min_coverage,
             "ignore_regions": regions_to_jsonable(ignore_regions),
         },
         "labels": labels_hint,

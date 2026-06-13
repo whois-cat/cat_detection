@@ -1,8 +1,9 @@
 """Ignore-region helpers for detector false-positive cleanup.
 
 Regions are expressed in camera-normalized coordinates [0..1]. A detection is
-ignored when its box center falls inside any configured region for its camera
-or a global "*" region.
+ignored when most of its box area is covered by a configured region for its
+camera or a global "*" region. Using box coverage instead of box center keeps a
+real cat that extends outside a feeder/bowl mask from being dropped.
 """
 from __future__ import annotations
 
@@ -31,6 +32,28 @@ def _point_in_polygon(x: float, y: float, poly: Iterable[tuple[float, float]]) -
                 inside = not inside
         j = i
     return inside
+
+
+def _box_region_coverage(
+    box: Box,
+    frame_w: int,
+    frame_h: int,
+    region: IgnoreRegion,
+    *,
+    samples: int = 7,
+) -> float:
+    if frame_w <= 0 or frame_h <= 0 or box.w <= 0 or box.h <= 0:
+        return 0.0
+    samples = max(2, samples)
+    inside = 0
+    total = samples * samples
+    for iy in range(samples):
+        py = (box.y + (iy + 0.5) * box.h / samples) / frame_h
+        for ix in range(samples):
+            px = (box.x + (ix + 0.5) * box.w / samples) / frame_w
+            if _point_in_polygon(px, py, region.points):
+                inside += 1
+    return inside / total
 
 
 def _flat_points(raw) -> list[float]:
@@ -106,24 +129,26 @@ def merge_regions(*maps: dict[str, list[IgnoreRegion]]) -> dict[str, list[Ignore
     return out
 
 
-def box_center_in_ignore_region(
+def box_in_ignore_region(
     camera_id: str,
     frame_w: int,
     frame_h: int,
     box: Box,
     regions_by_camera: dict[str, list[IgnoreRegion]],
+    *,
+    min_coverage: float = 0.8,
 ) -> bool:
-    if frame_w <= 0 or frame_h <= 0:
-        return False
     regions = [
         *regions_by_camera.get("*", []),
         *regions_by_camera.get(camera_id, []),
     ]
     if not regions:
         return False
-    cx = (box.x + box.w * 0.5) / frame_w
-    cy = (box.y + box.h * 0.5) / frame_h
-    return any(_point_in_polygon(cx, cy, region.points) for region in regions)
+    threshold = max(0.0, min(1.0, min_coverage))
+    return any(
+        _box_region_coverage(box, frame_w, frame_h, region) >= threshold
+        for region in regions
+    )
 
 
 def regions_to_jsonable(regions_by_camera: dict[str, list[IgnoreRegion]]) -> dict:

@@ -26,14 +26,17 @@ class FeederClient:
     def _api_path(self, suffix: str) -> str:
         return f"/api/{self._serial}{suffix}"
 
-    def _call(self, path: str) -> bool:
+    def _call(self, path: str, *, json_body: dict | None = None) -> bool:
         """POST with one retry on transient errors; immediate fail on 4xx."""
         import httpx
 
         url = f"{self._base}{path}"
         for attempt in range(2):
             try:
-                resp = self._http.post(url)
+                if json_body is None:
+                    resp = self._http.post(url)
+                else:
+                    resp = self._http.post(url, json=json_body)
                 if resp.is_success:
                     return True
                 if 400 <= resp.status_code < 500:
@@ -80,15 +83,13 @@ class FeederClient:
         return ok
 
     def set_display_text(self, text: str, interval: int = 1) -> bool:
-        import httpx
-
-        url = f"{self._base}{self._api_path('/display/text')}"
-        try:
-            resp = self._http.post(url, json={"text": text, "interval": interval})
-            return resp.is_success
-        except Exception as exc:
-            print(f"[feeder={self._fid}] display error: {exc!r}", flush=True)
-            return False
+        ok = self._call(
+            self._api_path("/display/text"),
+            json_body={"text": text, "interval": interval},
+        )
+        if ok:
+            print(f"[feeder={self._fid}] display text: {text!r}", flush=True)
+        return ok
 
     @property
     def state(self) -> str:

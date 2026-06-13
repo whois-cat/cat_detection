@@ -42,6 +42,7 @@ Env vars (all from configure.py — nothing hardcoded):
                           the door opens (default 3)
   MULTI_DEBOUNCE_SEC      a multi_cat / identity-change condition must hold this
                           long before an open door closes (default 2)
+  DISPLAY_TEXT_INTERVAL   seconds for feeder display text update (default 2)
 """
 from __future__ import annotations
 
@@ -78,6 +79,7 @@ PRESENCE_WINDOW_SEC    = float(os.environ.get("PRESENCE_WINDOW_SEC", "5"))
 CLASSIFIER_MIN_CONF    = float(os.environ.get("CLASSIFIER_MIN_CONF", "0.9"))
 OPEN_DEBOUNCE_SEC      = float(os.environ.get("OPEN_DEBOUNCE_SEC", "3"))
 MULTI_DEBOUNCE_SEC     = float(os.environ.get("MULTI_DEBOUNCE_SEC", "2"))
+DISPLAY_TEXT_INTERVAL  = int(os.environ.get("DISPLAY_TEXT_INTERVAL", "2"))
 
 WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 
@@ -122,6 +124,7 @@ def _handle_event(
     if cmd.kind == "open":
         if client.set_door("open", cmd.reason):
             _fsm.confirm_open(cmd.cat, wall_t)
+            client.set_display_text(cmd.cat, DISPLAY_TEXT_INTERVAL)
             print(f"[feeder={FEEDER_ID}] door opened: cat={cmd.cat}", flush=True)
 
     elif cmd.kind == "close":
