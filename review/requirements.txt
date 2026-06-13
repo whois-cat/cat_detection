@@ -1,7 +1,7 @@
 # Stage B label-review web app. Decode-only — NO openvino/torch (all inference
 # happened in Stage A). `av` + numpy come via the training package.
-fastapi
-uvicorn[standard]
-av
-numpy
-Pillow
+fastapi>=0.115
+uvicorn[standard]>=0.30
+av>=12
+numpy>=1.26
+Pillow>=10

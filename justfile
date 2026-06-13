@@ -33,10 +33,9 @@ ps:
 logs SERVICE="":
     {{COMPOSE}} logs -f --tail=200 {{SERVICE}}
 
-# One-time host venv for review apps.
+# One-time dependency check/warmup for review apps. Uses uv; no python3-venv needed.
 review-setup:
-    python3 -m venv .venv-review
-    .venv-review/bin/pip install -r review/requirements.txt
+    uv run --with-requirements review/requirements.txt python -c "import av, fastapi, numpy, PIL, uvicorn; print('review deps ok')"
 
 # Cold-start clustering manifest. SERVICE is a detector service, e.g. detector-grey.
 # Override REVIEW_LABELS/RECORDING_TZ; pass --embedding efficientnet if weights are cached.
@@ -51,18 +50,15 @@ cluster-manifest SERVICE *ARGS:
             --labels "${REVIEW_LABELS:-}" \
             {{ARGS}}
 
-# Bulk-label clusters in the browser. Requires `just review-setup` once.
+# Bulk-label clusters in the browser.
 cluster-review PORT="8095":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    PY=.venv-review/bin/python
-    [ -x "$PY" ] || PY=python3
     CLUSTER_MANIFEST="${CLUSTER_MANIFEST:-data/review/clusters.json}" \
     RECORDINGS_ROOT="${RECORDINGS_ROOT:-data/recordings}" \
     REVIEW_DB="${REVIEW_DB:-data/review/reviews.db}" \
     REVIEW_LABELS="${REVIEW_LABELS:-alisa,chuzh,ellie,felisis}" \
     RECORDING_TZ="${RECORDING_TZ:-UTC}" \
-    "$PY" -m uvicorn review.cluster_app:app --host 0.0.0.0 --port {{PORT}}
+    uv run --with-requirements review/requirements.txt \
+        python -m uvicorn review.cluster_app:app --host 0.0.0.0 --port {{PORT}}
 
 # Train the identity classifier from reviewed labels. Args pass through.
 train-classifier *ARGS:
