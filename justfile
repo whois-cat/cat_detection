@@ -10,7 +10,7 @@ default:
 
 # Regenerate mediamtx, per-camera compose, nginx, and cameras.json from cameras.yaml.
 configure:
-    python tools/configure.py
+    python3 tools/configure.py
 
 # Start the production-shaped local stack.
 up: configure
