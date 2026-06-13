@@ -8,6 +8,14 @@ cameras.yaml
 secrets/
 data/
 
+# Generated from cameras.yaml by tools/configure.py. These are
+# server-specific and should be recreated with `just configure`.
+docker-compose.cameras.yml
+docker-compose.cameras.dev.yml
+mediamtx/mediamtx.yml
+webui/nginx.conf
+webui/public/cameras.json
+
 # Python
 __pycache__/
 *.py[cod]

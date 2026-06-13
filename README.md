@@ -52,8 +52,9 @@ Each camera in `cameras.yaml` becomes:
 - a per-camera recordings directory (`data/recordings/<id>/`)
 
 Generated files (`mediamtx/mediamtx.yml`, `docker-compose.cameras*.yml`,
-`webui/nginx.conf`, `webui/public/cameras.json`) ARE committed for
-inspectability; rerun `just configure` after editing `cameras.yaml`.
+`webui/nginx.conf`, `webui/public/cameras.json`) are **not committed**.
+They are server-specific outputs of `just configure`; rerun it after editing
+`cameras.yaml`.
 
 ### Camera credentials
 
@@ -100,16 +101,16 @@ live2/
 ├── cameras.yaml.example            — per-camera config; copy → cameras.yaml
 ├── tools/configure.py              — renders all multi-camera derived files
 ├── docker-compose.yml              — base stack (mediamtx, pruner, webui)
-├── docker-compose.cameras.yml      — GENERATED — one detector service per camera
+├── docker-compose.cameras.yml      — GENERATED/ignored — one detector service per camera
 ├── docker-compose.dev.yml          — webui dev overlay (vite HMR)
-├── docker-compose.cameras.dev.yml  — GENERATED — per-detector watchfiles overlay
+├── docker-compose.cameras.dev.yml  — GENERATED/ignored — per-detector watchfiles overlay
 ├── .env.example                    — pruner + WEB_PORT
-├── mediamtx/mediamtx.yml           — GENERATED — multi-path server config
+├── mediamtx/mediamtx.yml           — GENERATED/ignored — multi-path server config
 ├── detector/                       — PyAV → swappable Detector → SQLite + WS
 ├── pruner/                         — detection-aware segment GC
 ├── webui/                          — Svelte 5 SPA
-│   ├── nginx.conf                  — GENERATED — per-camera proxy rules
-│   └── public/cameras.json         — GENERATED — UI camera picker source
+│   ├── nginx.conf                  — GENERATED/ignored — per-camera proxy rules
+│   └── public/cameras.json         — GENERATED/ignored — UI camera picker source
 └── training/                       — extract datasets from recordings + events.db
 ```
 

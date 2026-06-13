@@ -351,8 +351,8 @@ def main():
         path.write_text(body)
         print(f"wrote {path.relative_to(ROOT)}")
 
-    # Secrets are written separately: gitignored, never part of `targets` (which
-    # are all committed). chmod 600 so credentials aren't world-readable.
+    # Secrets are written separately: gitignored, never part of `targets`. chmod
+    # 600 so credentials aren't world-readable.
     secrets_path = ROOT / "secrets" / "cameras.env"
     secrets_path.parent.mkdir(parents=True, exist_ok=True)
     secrets_path.write_text(render_secrets_env(cfg))
