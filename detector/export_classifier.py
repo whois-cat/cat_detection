@@ -54,7 +54,7 @@ from pathlib import Path
 
 # The gate compares softmax PROBABILITIES (== the runtime cat_score), not raw
 # logits: classifier.py returns softmax(logits).max(), the feeder votes by that
-# cat_score and thresholds on CLASSIFIER_MIN_CONF, and raw logits have an
+# cat_score and thresholds on the feeder's CLASSIFIER_MIN_CONF, and raw logits have an
 # arbitrary scale (the trained net emits |logit|~1e3 on off-distribution inputs,
 # where even faithful FP32 torch-vs-OpenVINO differ by ~1% absolute). Probability
 # space is bounded [0,1] and is exactly what production consumes, so 1e-3 here is

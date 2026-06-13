@@ -12,7 +12,7 @@ To add a new detector:
 `cat` is the per-detection identity label:
   - blob/yolo: class name ('cat') or None — no per-cat identity.
   - yolo_cat:  EfficientNet-B0 classifier name, or "unknown" when confidence
-               is below CLASSIFIER_MIN_CONF.
+               is below DETECTOR_UNKNOWN_CONF.
 """
 from __future__ import annotations
 
@@ -122,7 +122,7 @@ class YoloCatDetector(Detector):
 
     Crops each detected cat from the same frame YOLO saw (img_bgr, inference
     coords) and classifies it. Sets b["cat"] to the classifier name, or
-    "unknown" when confidence < CLASSIFIER_MIN_CONF.
+    "unknown" when confidence < DETECTOR_UNKNOWN_CONF.
     """
 
     KEEP_CLS_IDS = (15,)
@@ -147,8 +147,8 @@ class YoloCatDetector(Detector):
         self._classifier = CatClassifier(classifier_dir)
         self._min_conf = min_conf
         # Context padding around the box BEFORE classification. MUST match the
-        # training crop padding (training._pad_crop / build_review_manifest
-        # --pad-frac / train_classifier --pad-frac) or the classifier sees a
+        # training crop padding (cluster review / train_classifier --pad-frac)
+        # or the classifier sees a
         # different framing at serve time than it was trained/reviewed on.
         self._pad_frac = pad_frac
 
@@ -210,7 +210,12 @@ def build_detector(detector_type: str) -> Detector:
             classifier_dir=os.environ.get(
                 "CLASSIFIER_WEIGHTS", "/opt/models/cat_classifier_openvino/"
             ),
-            min_conf=float(os.environ.get("CLASSIFIER_MIN_CONF", "0.5")),
+            min_conf=float(
+                os.environ.get(
+                    "DETECTOR_UNKNOWN_CONF",
+                    os.environ.get("CLASSIFIER_MIN_CONF", "0.5"),
+                )
+            ),
             pad_frac=float(os.environ.get("CLASSIFIER_PAD_FRAC", "0.15")),
         )
     raise ValueError(

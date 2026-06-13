@@ -1,4 +1,11 @@
-from training.train_classifier import Meta, build_episodes, split_episodes
+import numpy as np
+
+from training.train_classifier import (
+    Meta,
+    build_episodes,
+    split_episodes,
+    supported_macro_recall,
+)
 
 
 def test_episode_split_keeps_neighbours_together():
@@ -30,3 +37,15 @@ def test_episode_split_keeps_neighbours_together():
 
     for episode in episodes:
         assert len({owners[idx] for idx in episode}) == 1
+
+
+def test_macro_recall_ignores_classes_absent_from_eval_split():
+    # Middle class has no validation samples. This happens in weekly fine-tunes
+    # when a cat is present only in replay memory, which is train-only.
+    cm = np.array([
+        [3, 0, 0],
+        [0, 0, 0],
+        [0, 0, 2],
+    ])
+
+    assert supported_macro_recall(cm) == 1.0

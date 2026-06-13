@@ -15,6 +15,9 @@ suppress low-confidence misclassifications.
 Stats ticks are forwarded to ZoneState so the presence TTL keeps advancing
 even when no cats are detected — this guarantees the door closes after
 DOOR_CLOSE_TIMEOUT_SEC even if the camera produces no new detection events.
+An independent watchdog also advances the clock if the detector stops sending
+events entirely, and WS disconnects force the physical door closed before
+reconnect.
 
 The physical door is driven by an explicit state machine (door_fsm.DoorFSM,
 CLOSED→ARMING→OPEN→CLOSING) that debounces the pure decide() verdict so single
@@ -82,16 +85,24 @@ WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 
 _zone: ZoneState
 _fsm: DoorFSM
+_last_event_monotonic: float | None = None
+_last_event_wall_t: float | None = None
 
 
 def _handle_event(
     ev: dict,
     client: FeederClient,
     cooldown: CooldownState,
+    *,
+    mark_event: bool = True,
 ) -> None:
+    global _last_event_monotonic, _last_event_wall_t
     wall_t: float = (ev.get("wall_ms") or time.time() * 1000) / 1000.0
+    if mark_event:
+        _last_event_monotonic = time.monotonic()
+        _last_event_wall_t = wall_t
 
-    if ev.get("kind") == "stats":
+    if ev.get("kind") in {"stats", "watchdog"}:
         # Advance ZoneState clock so the presence TTL keeps ticking between
         # detection bursts — without this, the door would never close if no
         # detection events arrive for DOOR_CLOSE_TIMEOUT_SEC.
@@ -129,7 +140,42 @@ def _handle_event(
     # cmd.kind is None: arming / latch hold / closing debounce — no door change.
 
 
+def _fail_safe_close(client: FeederClient, cooldown: CooldownState, reason: str) -> None:
+    """Close the physical door immediately when detector liveness is unknown."""
+    if _fsm.state not in {"open", "closing"} and client.state != "open":
+        return
+    cat = _fsm.door_cat
+    meal_sec = 0.0
+    if _fsm.opened_at is not None:
+        meal_sec = ((_last_event_wall_t or time.time()) - _fsm.opened_at)
+    if client.set_door("close", reason):
+        print(f"[feeder={FEEDER_ID}] fail-safe door close: {reason}", flush=True)
+        if cat and meal_sec >= MIN_MEAL_SEC:
+            cooldown.record_meal_end(cat)
+        _fsm.confirm_close()
+
+
+async def _watchdog(client: FeederClient, cooldown: CooldownState) -> None:
+    """Close an open door if detector events stop but the WS connection hangs."""
+    interval = max(1.0, min(5.0, DOOR_CLOSE_TIMEOUT_SEC / 3.0))
+    while True:
+        await asyncio.sleep(interval)
+        if _last_event_monotonic is None or _last_event_wall_t is None:
+            continue
+        silence_sec = time.monotonic() - _last_event_monotonic
+        if silence_sec < DOOR_CLOSE_TIMEOUT_SEC:
+            continue
+        wall_t = _last_event_wall_t + silence_sec
+        _handle_event(
+            {"kind": "watchdog", "wall_ms": int(wall_t * 1000), "boxes": []},
+            client,
+            cooldown,
+            mark_event=False,
+        )
+
+
 async def _run(client: FeederClient, cooldown: CooldownState) -> None:
+    watchdog = asyncio.create_task(_watchdog(client, cooldown))
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=20) as ws:
@@ -147,12 +193,19 @@ async def _run(client: FeederClient, cooldown: CooldownState) -> None:
                     except json.JSONDecodeError:
                         continue
                     _handle_event(ev, client, cooldown)
+                print(
+                    f"[feeder={FEEDER_ID}] WS closed; reconnecting in 5s",
+                    flush=True,
+                )
         except Exception as exc:
             print(
                 f"[feeder={FEEDER_ID}] WS error: {exc!r}; reconnecting in 5s",
                 flush=True,
             )
-            await asyncio.sleep(5)
+        _fail_safe_close(client, cooldown, "detector_ws_lost")
+        if watchdog.done():
+            watchdog.result()
+        await asyncio.sleep(5)
 
 
 def main() -> None:

@@ -135,17 +135,19 @@ When to prefer disk JPEGs anyway:
   YAML/directory layout, so disk is the only path.
 
 YOLO fine-tune always uses [`extract_detector.py`](extract_detector.py)
-(disk). Per-cat classifier training has both options.
+(disk). Per-cat classifier training should normally use
+[`train_classifier.py`](train_classifier.py) directly from reviewed labels;
+[`extract_classifier.py`](extract_classifier.py) is an optional ImageFolder/JPG
+export for external tools or visual audits.
 
-## Recipe: per-cat classifier
+## Optional: export reviewed classifier crops to ImageFolder
 
 ```bash
-cd live2
 uv run python -m training.extract_classifier \
     --recordings data/recordings \
     --db data/events/events.db \
     --out data/datasets/classifier \
-    --model yolov8n \
+    --reviews-db data/review/reviews.db \
     --min-score 0.7 \
     --val-frac 0.1 \
     --test-frac 0.1
@@ -168,9 +170,10 @@ data/datasets/classifier/
         ...
 ```
 
-Train a classifier with the parent project's existing EfficientNet-B0
-recipe (see [`../../scripts/`](../../scripts/) and [`../../models/`](../../models/)
-in the parent repo). The 4-cat label set should be identical.
+This is not the normal weekly training path. Use it when you need a portable
+JPG/ImageFolder dataset for visual audit, CVAT, or an external trainer. The
+standard in-repo classifier workflow below trains directly from recordings and
+`reviews.db` without writing crop JPEGs.
 
 > Grouped splitting matters. Consecutive frames from one visit are
 > near-duplicates. Random per-image splitting leaks frame n+1 into val/test while
@@ -271,7 +274,6 @@ corrections and writes the **best-by-val** model to a NEW path. It does **not**
 touch the runtime model — swapping is a later, separate step.
 
 ```bash
-cd live2
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 python -m training.train_classifier \
     --db data/events/events.db \
@@ -310,7 +312,7 @@ What it does, and why each part:
   together correctly. For events recorded before `rotate_deg` was persisted, pass
   `--default-rotate-deg <deg>` (one warning is logged). `rotate_deg=0` is a no-op.
 - **Crop framing.** `--pad-frac` MUST equal the detector `CLASSIFIER_PAD_FRAC`
-  and `build_review_manifest --pad-frac` (default 0.15 everywhere). The eval/val
+  and `build_cluster_manifest --pad-frac` (default 0.15 everywhere). The eval/val
   transform is byte-identical to `detector/classifier.py::_preprocess`; only train
   augments (h-flip, small rotation, mild brightness/contrast, light
   random-resized-crop — no hard color jitter, since night IR is ~grayscale).
@@ -355,7 +357,9 @@ just compare-classifiers \
 The script decodes crops from recordings in memory and trusts only
 `reviews.db`. The conservative deploy signal is: candidate macro/min recall does
 not regress and high-confidence wrong predictions at the feeder threshold do not
-increase.
+increase. If `--replay-set` is supplied, replay metrics are reported separately
+as forgetting/regression memory; they are not blended into the headline
+promotion verdict.
 
 **Weekly retraining.** Use the already-trained runtime classifier for
 active-learning queues, not as truth. Each week:
@@ -407,7 +411,6 @@ separate archive) or deliberately export an approved crop dataset.
 ## Recipe: YOLO fine-tune (per-cat detector)
 
 ```bash
-cd live2
 uv run python -m training.extract_detector \
     --recordings data/recordings \
     --db data/events/events.db \
@@ -482,18 +485,15 @@ training/
 ├── db.py             (events.db queries; per-row → per-frame regrouping; box.rowid)
 ├── segments.py       (wall_ms → segment file + offset; see docstring)
 ├── sources.py        (SampleSource ABC + FullFrameSource + CropSource;
-│                      decode_one_crop / CropRef for random-access review)
+│                      decode_one_crop / CropRef for random-access review/replay)
 ├── reviews.py        (load human corrections reviews.db → {rowid: label})
-├── extract_classifier.py     (one-shot script wrapping CropSource)
+├── extract_classifier.py     (optional ImageFolder/JPG export from CropSource)
 ├── extract_detector.py       (one-shot script wrapping FullFrameSource)
 ├── build_cluster_manifest.py (cold-start clustering manifest)
-├── build_review_manifest.py  (legacy single-crop review manifest)
 └── train_classifier.py       (train identity classifier; best-by-val → models/trained/)
 
-../review/            (FastAPI label-review apps; `just cluster-review`)
+../review/            (FastAPI bulk label-review app; `just cluster-review`)
 ├── cluster_app.py    (bulk cluster labels; corrections → reviews.db)
-├── app.py            (legacy single-crop review)
 ├── static/cluster.html
-├── static/index.html (one-page vanilla-JS reviewer)
 └── requirements.txt  (fastapi/uvicorn/av/numpy/Pillow — no openvino/torch)
 ```

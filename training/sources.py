@@ -321,7 +321,7 @@ class CropRef:
 
 def decode_one_crop(ref: CropRef, recordings_root, *, pad_frac: float = 0.15,
                     index: SegmentIndex | None = None) -> np.ndarray:
-    """Random-access single-crop decode (for the label-review UI).
+    """Random-access crop decode (for review UIs and replay builders).
 
     Reuses the exact segment lookup (SegmentIndex.locate) and keyframe-aligned
     seek (_decode_frames_at) the batch sources use — no seek/segment logic is

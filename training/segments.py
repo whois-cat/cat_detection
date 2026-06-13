@@ -106,14 +106,9 @@ class SegmentIndex:
         if idx < 0:
             return None
         seg = self.segments[idx]
-        # If the next segment starts AFTER wall_ms, we're between segments
-        # which means inside `seg` (mediamtx writes contiguous segments). If
-        # the gap to the next segment is larger than a reasonable segment
-        # duration, treat as a gap.
+        # bisect_right picks the latest segment start <= wall_ms. If the offset
+        # is too large, the timestamp is in a recording gap or a pruned segment.
         offset_ms = wall_ms - seg.start_ms
-        next_start_ms = self._starts[idx + 1] if idx + 1 < len(self._starts) else None
-        if next_start_ms is not None and wall_ms >= next_start_ms:
-            return None
         # Generous max — covers default 30 s segments plus any final short one.
         if offset_ms > 60_000:
             return None

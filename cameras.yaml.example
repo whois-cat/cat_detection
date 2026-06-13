@@ -26,14 +26,15 @@
 #   yolo_conf       — YOLO confidence threshold.
 #   classifier_weights  — OpenVINO IR dir for the cat identity classifier
 #                         (default: /opt/models/cat_classifier_openvino/).
-#   classifier_min_conf — minimum confidence to assign an identity; below this
-#                         the cat is recorded as "unknown" (default: 0.5).
+#   detector_unknown_conf — detector-side identity confidence threshold; below
+#                           this the detector records cat="unknown" (default: 0.5).
+#                           Legacy alias: classifier_min_conf.
 #   classifier_pad_frac — context padding added around each YOLO box BEFORE the
 #                         identity classifier runs (default: 0.15). MUST match the
 #                         training crop padding in all three places or the
 #                         classifier sees different framing at serve vs train time:
 #                           detector  CLASSIFIER_PAD_FRAC  (this value)
-#                           manifest  build_review_manifest --pad-frac
+#                           review    build_cluster_manifest --pad-frac
 #                           training  train_classifier     --pad-frac
 #                         Change all three together or not at all.
 #   rotate_deg      — internal-to-model rotation, 0/90/180/270.

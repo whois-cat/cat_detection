@@ -1,9 +1,9 @@
 """Build a cold-start cluster manifest for bulk cat-label review.
 
-Unlike build_review_manifest.py, this does NOT use an existing cat identity
-classifier. It only trusts the detector box score ("there is probably a cat
-here"), decodes the crops, builds visual or generic ImageNet embeddings,
-clusters them, and writes metadata for the cluster-review UI.
+It does NOT use an existing cat identity classifier. It only trusts the
+detector box score ("there is probably a cat here"), decodes the crops, builds
+visual or generic ImageNet embeddings, clusters them, and writes metadata for
+the cluster-review UI.
 """
 from __future__ import annotations
 

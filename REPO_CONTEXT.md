@@ -312,7 +312,9 @@ The intended rule is: the feeder can open only when the classifier is at least
 90% confident and the cat is allowed by feeder policy/cooldown state.
 
 Detector confidence answers "is there probably a cat in this crop?" Identity
-confidence answers "which cat is it?" Do not mix these gates.
+confidence answers "which cat is it?" Do not mix these gates. Detector-side
+identity fallback uses `DETECTOR_UNKNOWN_CONF` (legacy alias:
+`classifier_min_conf`) to decide when to record `cat="unknown"`.
 
 ## Pruner Behavior
 
@@ -328,9 +330,9 @@ Current defaults:
 - prune interval: `3600s` / one hour;
 - dry-run can be enabled with `PRUNER_DRY_RUN=1`.
 
-mediamtx also has its own hard recording retention cap. If only the last week
-of videos is available, replay memory or a longer video retention policy is
-needed for stable weekly fine-tuning.
+mediamtx also has its own hard recording retention cap:
+`recordDeleteAfter: 720h`, i.e. 30 days. Replay memory is still useful because
+approved examples can outlive both pruner cleanup and the 30-day hard cap.
 
 ## Important Files
 
@@ -353,7 +355,7 @@ needed for stable weekly fine-tuning.
 - `training/replay.py`: replay-set loader.
 - `training/compare_classifiers.py`: candidate model evaluation/comparison.
 - `training/segments.py`: recording segment lookup and timezone parsing.
-- `training/extract_classifier.py`: reviewed crop extraction.
+- `training/extract_classifier.py`: optional ImageFolder/JPG export.
 - `pruner/pruner.py`: detection-aware video cleanup.
 - `feeder/main.py`: feeder runtime and classifier confidence gate.
 - `feeder/zone_state.py`: temporal smoothing for identities/presence.

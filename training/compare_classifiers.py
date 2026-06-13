@@ -10,7 +10,9 @@ Examples:
         --candidate new=models/trained/20260612-120000/cat_classifier.pt
 
 The evaluator trusts only reviews.db labels. It decodes crops from recordings in
-memory and reports closed-set metrics plus thresholded runtime behavior.
+memory and reports closed-set metrics plus thresholded runtime behavior. Replay
+sets are reported separately as forgetting/regression memory, not blended into
+the headline promotion metrics.
 """
 from __future__ import annotations
 
@@ -223,9 +225,8 @@ def main() -> None:
         default_rotate_deg=args.default_rotate_deg,
     )
 
-    y_true: list[str] = []
-    y_pred: dict[str, list[Prediction]] = {name: [] for name, _model in candidates}
-    missing = 0
+    primary_true: list[str] = []
+    primary_pred: dict[str, list[Prediction]] = {name: [] for name, _model in candidates}
     for sample in src:
         sb = sample.src_box
         if sb is None or sb.rowid is None:
@@ -233,35 +234,48 @@ def main() -> None:
         label = review_labels.get(sb.rowid)
         if label is None or label in DROP_LABELS:
             continue
-        y_true.append(label)
+        primary_true.append(label)
         for name, model in candidates:
-            y_pred[name].append(model.predict(sample.image))
-        if args.limit is not None and len(y_true) >= args.limit:
+            primary_pred[name].append(model.predict(sample.image))
+        if args.limit is not None and len(primary_true) >= args.limit:
             break
 
+    replay_true: list[str] = []
+    replay_pred: dict[str, list[Prediction]] = {name: [] for name, _model in candidates}
     for replay_path in args.replay_set:
         for image, meta in load_replay_set(replay_path):
-            y_true.append(meta.label)
+            replay_true.append(meta.label)
             for name, model in candidates:
-                y_pred[name].append(model.predict(image))
-            if args.limit is not None and len(y_true) >= args.limit:
-                break
+                replay_pred[name].append(model.predict(image))
 
-    if missing:
-        print(f"[compare] skipped {missing} crops with unavailable recordings")
-    if not y_true:
+    if not primary_true:
         raise SystemExit("no reviewed crops available for comparison")
 
-    results = {name: metrics_for(y_true, preds, thresholds) for name, preds in y_pred.items()}
+    results = {
+        name: metrics_for(primary_true, preds, thresholds)
+        for name, preds in primary_pred.items()
+    }
+    replay_results = (
+        {
+            name: metrics_for(replay_true, preds, thresholds)
+            for name, preds in replay_pred.items()
+        }
+        if replay_true
+        else {}
+    )
     threshold_key = f"{max(thresholds):.3g}" if thresholds else "0.9"
     report = {
-        "n": len(y_true),
-        "classes": sorted(set(y_true)),
+        "n": len(primary_true),
+        "classes": sorted(set(primary_true)),
         "baseline": args.baseline,
         "results": results,
+        "replay_n": len(replay_true),
+        "replay_classes": sorted(set(replay_true)),
+        "replay_results": replay_results,
         "verdict": verdict(results, args.baseline, threshold_key),
     }
 
+    print(f"primary reviewed crops: n={len(primary_true)} classes={sorted(set(primary_true))}")
     for name, m in results.items():
         print(
             f"{name}: n={m['n']} acc={m['accuracy']:.3f} "
@@ -273,6 +287,14 @@ def main() -> None:
                 f"  @{threshold_key}: coverage={t['coverage']:.3f} "
                 f"acc_when_conf={t['accuracy_when_confident']:.3f} "
                 f"high_conf_wrong={t['high_conf_wrong']}"
+            )
+    if replay_results:
+        print(f"\nreplay regression memory: n={len(replay_true)} classes={sorted(set(replay_true))}")
+        for name, m in replay_results.items():
+            print(
+                f"{name}: replay_acc={m['accuracy']:.3f} "
+                f"replay_macro_recall={m['macro_recall']:.3f} "
+                f"replay_min_recall={m['min_recall']:.3f}"
             )
     if args.baseline:
         print("verdict:", json.dumps(report["verdict"], ensure_ascii=False))

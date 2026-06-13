@@ -187,9 +187,25 @@ def per_class_pr(cm: np.ndarray):
     return precision, recall
 
 
+def present_class_mask(cm: np.ndarray) -> np.ndarray:
+    """Classes with at least one true sample in this eval split."""
+    return cm.sum(axis=1) > 0
+
+
+def supported_macro_recall(cm: np.ndarray) -> float:
+    """Macro recall over classes that are actually present in this eval split."""
+    _prec, rec = per_class_pr(cm)
+    present = present_class_mask(cm)
+    if not bool(present.any()):
+        return 0.0
+    return float(rec[present].mean())
+
+
 def print_report(cm: np.ndarray, classes: list[str], confuse: set[str]) -> dict:
     prec, rec = per_class_pr(cm)
-    macro_recall = float(rec.mean())
+    support = cm.sum(axis=1)
+    present = present_class_mask(cm)
+    macro_recall = supported_macro_recall(cm)
     overall = float(np.diag(cm).sum() / max(1, cm.sum()))
 
     width = max(len(c) for c in classes) + 1
@@ -201,8 +217,17 @@ def print_report(cm: np.ndarray, classes: list[str], confuse: set[str]) -> dict:
     print("\nper-class precision / recall:")
     for i, c in enumerate(classes):
         flag = "  <-- confuse" if c in confuse else ""
-        print(f"  {c:<{width}} precision={prec[i]:.3f}  recall={rec[i]:.3f}{flag}")
-    print(f"\noverall accuracy = {overall:.3f}   macro recall = {macro_recall:.3f}")
+        if support[i] == 0:
+            print(f"  {c:<{width}} precision=NA     recall=NA   support=0{flag}")
+        else:
+            print(
+                f"  {c:<{width}} precision={prec[i]:.3f}  "
+                f"recall={rec[i]:.3f}  support={int(support[i])}{flag}"
+            )
+    print(
+        f"\noverall accuracy = {overall:.3f}   "
+        f"macro recall = {macro_recall:.3f} (present classes only)"
+    )
 
     # The confusion cells we care about most.
     conf_list = sorted(confuse)
@@ -214,8 +239,11 @@ def print_report(cm: np.ndarray, classes: list[str], confuse: set[str]) -> dict:
 
     return {
         "classes": classes,
+        "present_classes": [classes[i] for i, ok in enumerate(present) if ok],
+        "missing_eval_classes": [classes[i] for i, ok in enumerate(present) if not ok],
         "precision": {c: float(prec[i]) for i, c in enumerate(classes)},
         "recall": {c: float(rec[i]) for i, c in enumerate(classes)},
+        "support": {c: int(support[i]) for i, c in enumerate(classes)},
         "macro_recall": macro_recall,
         "overall_accuracy": overall,
         "confusion_matrix": cm.tolist(),
@@ -228,6 +256,54 @@ def confuse_cross_errors(cm: np.ndarray, classes: list[str], confuse: set[str]) 
         return 0
     a, b = classes.index(cs[0]), classes.index(cs[1])
     return int(cm[a, b] + cm[b, a])
+
+
+def load_checkpoint_remapped(model, checkpoint: dict, classes: list[str]) -> dict:
+    """Load a previous classifier, remapping the head by class name.
+
+    Weekly fine-tunes can add or temporarily miss classes. The backbone is still
+    valuable, and classifier rows for overlapping class names should be reused.
+    New class rows keep the freshly initialised weights.
+    """
+    state = checkpoint["state_dict"]
+    checkpoint_classes = list(checkpoint.get("class_names", []))
+    current = model.state_dict()
+
+    loaded_body = 0
+    skipped = []
+    head_keys = {"classifier.1.weight", "classifier.1.bias"}
+    for key, value in state.items():
+        if key in head_keys:
+            continue
+        if key in current and tuple(current[key].shape) == tuple(value.shape):
+            current[key] = value
+            loaded_body += 1
+        else:
+            skipped.append(key)
+
+    overlap: list[str] = []
+    if checkpoint_classes:
+        old_index = {c: i for i, c in enumerate(checkpoint_classes)}
+        weight_key = "classifier.1.weight"
+        bias_key = "classifier.1.bias"
+        if weight_key in state and bias_key in state:
+            for new_i, cat in enumerate(classes):
+                old_i = old_index.get(cat)
+                if old_i is None or old_i >= state[weight_key].shape[0]:
+                    continue
+                current[weight_key][new_i].copy_(state[weight_key][old_i])
+                current[bias_key][new_i].copy_(state[bias_key][old_i])
+                overlap.append(cat)
+
+    model.load_state_dict(current)
+    return {
+        "checkpoint_classes": checkpoint_classes,
+        "overlap_classes": overlap,
+        "new_classes": [c for c in classes if c not in overlap],
+        "dropped_checkpoint_classes": [c for c in checkpoint_classes if c not in classes],
+        "loaded_body_tensors": loaded_body,
+        "skipped_tensors": skipped,
+    }
 
 
 # ------------------------------------------------------------------- main -----
@@ -256,7 +332,7 @@ def main() -> None:
                     help="compact replay set directory/manifest; added to train only")
     ap.add_argument("--pad-frac", type=float, default=0.15,
                     help="crop context padding — MUST match the detector "
-                         "CLASSIFIER_PAD_FRAC and build_review_manifest --pad-frac")
+                         "CLASSIFIER_PAD_FRAC and build_cluster_manifest --pad-frac")
     ap.add_argument("--default-rotate-deg", type=int, default=0,
                     help="rotation to assume for events recorded BEFORE rotate_deg "
                          "was persisted (set to the camera's rotate_deg then)")
@@ -425,14 +501,19 @@ def main() -> None:
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(classes))
     if args.init_from:
         checkpoint = torch.load(str(args.init_from), map_location="cpu", weights_only=False)
-        checkpoint_classes = list(checkpoint.get("class_names", []))
-        if checkpoint_classes != classes:
+        init_report = load_checkpoint_remapped(model, checkpoint, classes)
+        if init_report["checkpoint_classes"] and not init_report["overlap_classes"]:
             raise SystemExit(
-                "--init-from class_names do not match current reviewed labels: "
-                f"{checkpoint_classes} != {classes}"
+                "--init-from has no overlapping class_names with current labels: "
+                f"{init_report['checkpoint_classes']} vs {classes}"
             )
-        model.load_state_dict(checkpoint["state_dict"])
-        log.info("initialized model from %s", args.init_from)
+        log.info(
+            "initialized model from %s (reused head rows=%s, new=%s, dropped_old=%s)",
+            args.init_from,
+            init_report["overlap_classes"],
+            init_report["new_classes"],
+            init_report["dropped_checkpoint_classes"],
+        )
 
     if args.full_finetune:
         lr = args.lr if args.lr is not None else 1e-4
@@ -476,8 +557,7 @@ def main() -> None:
                 y_true.extend(y.tolist())
                 y_pred.extend(pred.tolist())
         cm = confusion(y_true, y_pred, len(classes))
-        _, rec = per_class_pr(cm)
-        macro = float(rec.mean())
+        macro = supported_macro_recall(cm)
         cross = confuse_cross_errors(cm, classes, confuse)
         log.info("epoch %02d  train_loss=%.4f  val_macro_recall=%.3f  confuse_cross=%d",
                  epoch, running / max(1, len(train_idx)), macro, cross)
@@ -553,13 +633,23 @@ def main() -> None:
 
     # --- PASS/FAIL guard (loud warning on FAIL; do NOT crash) ---
     _, rec = per_class_pr(cm)
+    support = cm.sum(axis=1)
     failing = {classes[i]: float(rec[i]) for i in range(len(classes))
-               if rec[i] < args.min_recall}
+               if support[i] > 0 and rec[i] < args.min_recall}
+    missing_eval = [classes[i] for i in range(len(classes)) if support[i] == 0]
     # confuse cats must explicitly clear the bar too (already covered by per-class,
     # but call them out so an empty confuse class can't slip through silently).
     for c in sorted(confuse):
         if c not in classes:
             failing[c] = 0.0
+        elif support[classes.index(c)] == 0:
+            log.warning("confuse cat %r has no validation samples; not included in PASS/FAIL", c)
+    if missing_eval:
+        print(
+            "\nWARN — validation has no samples for: "
+            + ", ".join(missing_eval)
+            + ". They are excluded from val macro recall/PASS gate."
+        )
     if failing:
         print("\n" + "!" * 64)
         print(f"FAIL — NOT ready for production (need recall >= {args.min_recall} "
