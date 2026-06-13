@@ -30,7 +30,7 @@ Usage (from the repo root, detector env):
         --db data/events/events.db \
         --recordings data/recordings \
         --classifier detector/models/cat_classifier_openvino \
-        --out data/review/manifest.jsonl --min-score 0.3
+        --out data/review/manifest.jsonl --min-score 0.7
 """
 from __future__ import annotations
 
@@ -76,7 +76,8 @@ def main() -> None:
                     help="OPTIONAL confusable pair for UI highlight only (e.g. "
                          "alisa,felisis); does NOT affect ordering. The app reads "
                          "REVIEW_CONFUSE — pass it there to actually highlight.")
-    ap.add_argument("--min-score", type=float, default=None, help="drop low-score boxes")
+    ap.add_argument("--min-score", type=float, default=0.7,
+                    help="drop low detector-score boxes before review")
     ap.add_argument("--pad-frac", type=float, default=0.15,
                     help="crop context padding — MUST match detector "
                          "CLASSIFIER_PAD_FRAC and train_classifier --pad-frac")

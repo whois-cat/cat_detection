@@ -27,6 +27,7 @@ services:
       - path: ./secrets/cameras.env
         required: false
     environment:
+      TZ: ${RECORDING_TZ:-UTC}
       MTX_LOGLEVEL: info
 
   pruner:
@@ -38,6 +39,7 @@ services:
       - ./data/events:/data/events:ro
     environment:
       EVENTS_DB: /data/events/events.db
+      RECORDING_TZ: ${RECORDING_TZ:-UTC}
       SEGMENT_DURATION_SEC: "30"        # must match mediamtx recordSegmentDuration
       KEEP_PRE_ROLL_SEC: ${PRUNER_PRE_ROLL_SEC:-30}
       KEEP_POST_ROLL_SEC: ${PRUNER_POST_ROLL_SEC:-30}

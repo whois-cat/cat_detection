@@ -28,9 +28,9 @@ timestamp is the segment START in *local* time (the container TZ). With
 default config segments are 30 seconds long.
 
 Caveats:
-- mediamtx writes segments in local time. The detector and the trainer
-  must agree on TZ. If you mount the segments on a host with a different
-  TZ, set $TZ to match the recording container's TZ before running.
+- mediamtx writes segments in the recording container's wall-clock timezone.
+  Batch/review tools parse filenames using $RECORDING_TZ, falling back to $TZ
+  and then UTC. Keep RECORDING_TZ equal to the mediamtx container TZ.
 - The very last segment of a recording session can be shorter than the
   configured duration; we accept any media_t up to the next segment's start.
 """
@@ -38,8 +38,10 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 @dataclass(slots=True)
@@ -48,14 +50,29 @@ class Segment:
     start_ms: int     # local wall-clock at segment start
 
 
+def _recording_tz():
+    raw = os.environ.get("RECORDING_TZ") or os.environ.get("TZ") or "UTC"
+    if raw.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(raw)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(f"invalid RECORDING_TZ/TZ value: {raw!r}") from exc
+
+
+RECORDING_TZ = _recording_tz()
+
+
 def _parse_filename(name: str) -> int | None:
     stem = name.rsplit(".", 1)[0]
     try:
         dt = datetime.strptime(stem, "%Y-%m-%d_%H-%M-%S-%f")
     except ValueError:
         return None
-    # `.timestamp()` interprets a naive datetime as local time.
-    return int(dt.timestamp() * 1000)
+    # mediamtx record filenames are wall-clock timestamps in the recording
+    # container's timezone. Parse them in an explicit zone so Docker-side
+    # manifest generation and host-side review decode agree.
+    return int(dt.replace(tzinfo=RECORDING_TZ).timestamp() * 1000)
 
 
 class SegmentIndex:

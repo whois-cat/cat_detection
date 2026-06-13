@@ -28,7 +28,8 @@ random access. The training surfaces are the **on-disk files and the
 SQLite schema** — that's the contract the modeller depends on:
 
 - `data/recordings/<camera_id>/<YYYY-MM-DD_HH-MM-SS-ffffff>.mp4`
-  (mediamtx-written, segment start is the filename in local wall-clock).
+  (mediamtx-written, segment start is the filename in the recording
+  container timezone; tools parse this with `RECORDING_TZ`, default `UTC`).
 - `data/events/events.db` — schema in [`../detector/storage.py`](../detector/storage.py).
 
 If those layouts ever change, this package is the single place that needs
@@ -145,9 +146,9 @@ uv run python -m training.extract_classifier \
     --db data/events/events.db \
     --out data/datasets/classifier \
     --model yolov8n \
-    --min-score 0.3 \
+    --min-score 0.7 \
     --val-frac 0.1 \
-    --split-by-track   # keep all crops from one track in one split
+    --test-frac 0.1
 ```
 
 Output is a torchvision `ImageFolder`-compatible tree:
@@ -162,104 +163,112 @@ data/datasets/classifier/
     val/
         alisa/  ...
         ...
+    test/
+        alisa/  ...
+        ...
 ```
 
 Train a classifier with the parent project's existing EfficientNet-B0
 recipe (see [`../../scripts/`](../../scripts/) and [`../../models/`](../../models/)
 in the parent repo). The 4-cat label set should be identical.
 
-> `--split-by-track` matters. Within one track, consecutive frames are
-> near-duplicates. Random per-image splitting leaks frame n+1 of a track
-> into val while frame n is in train, inflating val accuracy. Splitting
-> per `track_id` keeps each cat-appearance entirely on one side.
+> Grouped splitting matters. Consecutive frames from one visit are
+> near-duplicates. Random per-image splitting leaks frame n+1 into val/test while
+> frame n is in train, inflating accuracy. Splitting is always episode-based:
+> consecutive crops are grouped by camera and wall-clock gap before assignment
+> to train/val/test.
 
 ---
 
-## Recipe: label review (correct confusable labels) — no JPEGs on disk
+## Recipe: cold-start cluster review — no old identity labels
 
-The detector's labels are guesses from the very model we're trying to improve
-(it confuses alisa↔felisis), so before re-training we hand-verify them. The
-recordings are already the image store and `events.db` already has the box
-coordinates — so this workflow writes **no crop files at all**. Crops are cut
-from the recordings into memory, shown/scored, and the pixels are dropped; only
-metadata (the labels) is persisted.
+For a new classifier, do not trust the old model's names or probabilities.
+Use the detector score only as a gate for "there is probably a cat in this box",
+then cluster visually similar crops and label whole clusters. This writes no
+crop files: crops are decoded from recordings on demand and labels go into the
+separate `data/review/reviews.db`.
 
-**Stage A — build the manifest** (runs in the detector image: it has OpenVINO +
-the baked classifier IR). Walks `CropSource`, runs the classifier per crop
-(reusing `detector/classifier.py::CatClassifier.classify_all` — same `_preprocess`
-and IR as production), and writes one JSONL line of metadata per crop, sorted by
-**overall uncertainty** (least-confident first). Driven by `just`:
-
-```bash
-just review-manifest detector-grey --min-score 0.3
-```
-
-`just review-manifest` mounts the repo into the detector container and runs
-`python -m training.build_review_manifest`. `--model` is auto-detected when the DB
-has a single model. Overridable env: `EVENTS_DB`, `RECORDINGS_ROOT`,
-`CLASSIFIER_IR`, `REVIEW_MANIFEST`. Each line: `{crop_id, src_event_key, wall_ms,
-camera, model, box, rotate_deg, pad_frac, predicted, conf, probs{name:p}}`.
-**Ordering** = top-1 probability ascending, tie-broken by the top-1−top-2 margin —
-the genuinely ambiguous crops (any cats, any confused pair) float to the top.
-`--confuse` is optional and only affects the UI highlight (not ordering/trust).
-For data captured before per-event rotation was recorded, pass
-`--default-rotate-deg <deg>` (the camera's rotation then). **The only thing on
-disk is `manifest.jsonl`.**
-
-> Bare invocation (outside `just`, in any env with openvino+av+cv2):
-> `python -m training.build_review_manifest --db … --recordings … --classifier … --out … --min-score 0.3`
-
-**Stage B — review web app** (host: needs `av` + this package, NOT openvino/torch).
+**Stage A — build the cluster manifest** (runs in a detector image because it
+already has PyAV/OpenCV/Numpy, and often torch via ultralytics). Low YOLO
+detector-confidence boxes are dropped first (`--min-score`, default 0.7).
+The manifest stores compact embeddings so mixed clusters can be split later in
+the browser.
 
 ```bash
-just review-setup                              # once: venv + fastapi/uvicorn/av/Pillow
-REVIEW_CONFUSE=alisa,felisis just review 8095  # → http://localhost:8095
+REVIEW_LABELS=alisa,chuzh,ellie,felisis \
+just cluster-manifest detector-grey --min-score 0.7
 ```
 
-Each crop is decoded on demand straight from the recordings
-(`training.decode_one_crop`, which reuses the same segment lookup + keyframe seek
-as the batch sources), encoded to an in-memory JPEG, and streamed — never written
-to a file. The page shows the crop big, the model's guess + confidence, the two
-top probabilities (the `REVIEW_CONFUSE` pair highlighted, if set), and one button
-per class plus `unknown` / `discard`; hotkeys `1..N`, `←/→` to navigate, a live
-`X / N` progress bar. Crops are shown in the detector's inference orientation
-(each rotated by its own recorded `rotate_deg`), so you judge exactly what the
-model sees.
+`just cluster-manifest` writes `data/review/clusters.json` by default. Useful
+overrides: `EVENTS_DB`, `RECORDINGS_ROOT`, `CLUSTER_MANIFEST`, `RECORDING_TZ`,
+`--camera`, `--model`, `--clusters`, `--default-rotate-deg`.
+
+Embedding choice:
+
+- `--embedding auto` (default) uses cached ImageNet EfficientNet-B0 features
+  when available, otherwise falls back to deterministic visual texture/color
+  features. This keeps the command usable offline.
+- `--embedding efficientnet --allow-download` lets torchvision fetch ImageNet
+  weights if the machine has network access.
+- `--embedding visual` is fastest and dependency-light, but mixed clusters are
+  more likely. Avoid `--no-store-embeddings` unless you do not need the split
+  button in the review UI.
+
+If review crops show unrelated frames or many `410 Gone` responses, first check
+timezone consistency. The Docker-side manifest builder and host-side review app
+must use the same `RECORDING_TZ` as mediamtx. The bundled `just` recipes default
+to `UTC`; override with `RECORDING_TZ=America/New_York` only if mediamtx was
+recording filenames in the server's EDT/EST timezone.
+
+**Stage B — bulk-label clusters** (host: needs `av` + FastAPI/Pillow).
+
+```bash
+just review-setup                                  # once
+REVIEW_LABELS=alisa,chuzh,ellie,felisis \
+just cluster-review 8095                           # http://localhost:8095
+```
+
+The page shows contact sheets per cluster. Label a pure cluster as one cat, mark
+junk as `discard`, mark uncertain crops as `unknown`, and split mixed clusters
+with `split x2` / `split x3` before labeling the child clusters. If a mixed
+cluster still is not worth splitting, mark it as `mixed` so it is not bulk-written
+into labels. Cluster labels are written as ordinary review rows keyed by
+`src_event_key`, so the training code consumes them without touching `events.db`.
 
 Corrections are **non-destructive**: they go to a *separate* writable
 `data/review/reviews.db` keyed by `src_event_key`, so the detector's rows in
 `events.db` are never touched and the database can stay read-only. Progress
-survives restart (already-reviewed crops are skipped; any crop can be reopened
-and re-labelled).
+survives restart.
 
 **Feeding corrections back into training.** `CropSource` carries each box's
 `events` rowid (`box.rowid` / `Sample.src_box.rowid`) and accepts a `reviews`
-map (`training.load_reviews("data/review/reviews.db")`): where a crop has a human
-label it overrides the detector's `box.cat`, and `discard` / `unknown` crops are
-dropped — unreviewed crops keep the detector label. Both training paths use it:
+map (`training.load_reviews("data/review/reviews.db")`): human labels are the
+only trusted identity labels for cold start, and `discard` / `unknown` crops are
+dropped. Unreviewed crops are ignored by `train_classifier.py` unless you
+explicitly opt into `--trust-classifier` later, after you already have a decent
+classifier.
 
 ```bash
-# disk dataset (ImageFolder) with corrected labels:
+# optional disk dataset (ImageFolder) with human labels; unreviewed crops are ignored:
 uv run python -m training.extract_classifier \
     --recordings data/recordings --db data/events/events.db \
     --out data/datasets/classifier --reviews-db data/review/reviews.db \
-    --min-score 0.3 --split-by-track
+    --min-score 0.7
 ```
 
 ```python
-# in-memory (no JPEGs), same correction overlay:
+# in-memory (no JPEGs), same review overlay:
 from training import CropSource, load_reviews
 src = CropSource(db, recordings, reviews=load_reviews("data/review/reviews.db"))
 ```
 
 ---
 
-## Recipe: train OUR classifier (to replace the donor)
+## Recipe: train the identity classifier
 
 `train_classifier.py` trains a fresh EfficientNet-B0 from the recordings +
 corrections and writes the **best-by-val** model to a NEW path. It does **not**
-touch the donor (`detector/models/cat_classifier.pt`) or the runtime — swapping
-is a later, separate step.
+touch the runtime model — swapping is a later, separate step.
 
 ```bash
 cd live2
@@ -271,22 +280,28 @@ python -m training.train_classifier \
     --confuse alisa,felisis \
     --pad-frac 0.15 \
     --min-recall 0.9
-# heavier pass when you have more data:  add --full-finetune
-# cheap volume (trust the donor on unreviewed crops):  --trust-detector --trust-conf 0.9
+# heavier pass when you have more data: add --full-finetune
+# later active-learning pass only: add --trust-classifier --trust-conf 0.9
 ```
 
 What it does, and why each part:
 
-- **Labels (human-only by default).** The donor confuses several pairs, so by
-  default NO detector label is trusted — training uses ONLY human-reviewed labels.
-  `--trust-detector` opts back in to the donor's label for unreviewed crops when
-  its `cat_score >= --trust-conf` (cheap volume, your call). `discard`/`unknown`
-  are dropped; class names are the sorted unique surviving labels, saved with the
-  model. `--confuse` here only highlights a cell in the confusion matrix.
-- **Honest split.** `track_id` is empty, so a random split leaks near-duplicate
-  neighbours. Crops are grouped into **episodes** (same camera, `wall_ms` gaps
-  `> --episode-gap-sec` start a new one) and whole episodes go to train OR val.
-  The split is stratified so val contains **every** class (per-class recall needs it).
+- **Labels (human-only by default).** Cold start trains ONLY on human-reviewed
+  labels. The detector `score` is a crop-quality gate ("probably a cat"), not
+  an identity label. `cat_score` is the existing identity classifier confidence
+  and is ignored in cold start. `--trust-classifier` is for a later
+  active-learning pass, when an existing classifier is already good enough to
+  reuse some unreviewed high-confidence labels. `discard`/`unknown` are dropped;
+  class names are the sorted unique surviving labels, saved with the model.
+  `--confuse` here only highlights a cell in the confusion matrix.
+- **Honest split by default.** A random per-image split leaks near-duplicate neighbours.
+  Crops are grouped into **episodes** (same camera, `wall_ms` gaps
+  `> --episode-gap-sec` start a new one) and whole episodes go to train, val, or
+  test. `--val-frac` and `--test-frac` control the ratios. Val selects the best
+  epoch; test is held out for the final honest report. Runtime operating
+  thresholds, such as opening the feeder only at `cat_score >= 0.9`, should be
+  chosen from val behavior and then verified once on test. The split is nudged
+  so val/test contain every class when possible.
 - **No JPEGs.** Crops are decoded from the recordings into RAM
   (`CropSource` → `TorchCachedDataset.materialise()`), trained on, discarded.
 - **Rotation, per-event.** Each crop is rotated by its own recorded `rotate_deg`
@@ -311,7 +326,7 @@ NOT crash — collect/relabel more crops (especially the confuse pair) and re-ru
 `{state_dict, class_names, num_classes}` format `export_classifier.py` expects)
 plus `metadata.json` (class_names, pad_frac, preprocessing spec, val metrics).
 
-**Export + swap the donor (later, deliberate step).**
+**Export + swap the classifier (later, deliberate step).**
 
 ```bash
 # 1) export the new .pt to OpenVINO IR (parity-gated, see ../detector/):
@@ -321,9 +336,71 @@ python detector/export_classifier.py \
     --crops <dir of real crops>          # for a meaningful parity check
 # 2) point the detector at it (per camera) and rebuild:
 #    cameras.yaml: classifier_weights: /opt/models/cat_classifier_openvino_NEW
-#    just configure && just rebuild-detectors
+#    just configure && just up
 # Keep classifier_pad_frac identical to what you trained with.
 ```
+
+**Compare models before swapping.** Evaluate current vs candidate on the same
+human-reviewed crops, with closed-set metrics and thresholded runtime behavior:
+
+```bash
+just compare-classifiers \
+    --candidate current=/opt/models/cat_classifier_openvino \
+    --candidate new=models/trained/<stamp>/cat_classifier.pt \
+    --baseline current \
+    --thresholds 0.7,0.8,0.9 \
+    --out reports/classifier_compare.json
+```
+
+The script decodes crops from recordings in memory and trusts only
+`reviews.db`. The conservative deploy signal is: candidate macro/min recall does
+not regress and high-confidence wrong predictions at the feeder threshold do not
+increase.
+
+**Weekly retraining.** Use the already-trained runtime classifier for
+active-learning queues, not as truth. Each week:
+
+1. Build/review new clusters for the recent time range.
+2. Update compact replay memory from human-reviewed crops.
+3. Train from fresh human labels plus replay memory.
+4. Compare current vs candidate with `compare-classifiers`.
+5. Export/swap only after comparison is clean.
+
+Replay memory stores a small balanced set of compressed numpy crops (`.npz`),
+not JPGs. It is train-only memory: it prevents forgetting, but it is not a
+replacement for a held-out test set.
+
+```bash
+just build-replay-set --per-class 500
+```
+
+The command merges the existing replay set with currently available reviewed
+crops, removes near-duplicates, keeps diverse examples per class, and writes
+`data/replay/manifest.jsonl` plus `data/replay/crops/.../*.npz`.
+
+To continue from the previous weekly classifier rather than ImageNet-only
+initialization, pass:
+
+```bash
+just train-classifier \
+    --init-from models/trained/<previous>/cat_classifier.pt \
+    --replay-set data/replay
+```
+
+For regression checking against old memory:
+
+```bash
+just compare-classifiers \
+    --candidate current=/opt/models/cat_classifier_openvino \
+    --candidate new=models/trained/<stamp>/cat_classifier.pt \
+    --baseline current \
+    --replay-set data/replay
+```
+
+If old recordings were pruned, old labels cannot be decoded for training. For a
+long-lived training corpus, either keep reviewed event segments longer
+(`PRUNER_KEEP_RECENT_HOURS`, `PRUNER_PRE_ROLL_SEC`, `PRUNER_POST_ROLL_SEC`, or a
+separate archive) or deliberately export an approved crop dataset.
 
 ---
 
@@ -409,11 +486,14 @@ training/
 ├── reviews.py        (load human corrections reviews.db → {rowid: label})
 ├── extract_classifier.py     (one-shot script wrapping CropSource)
 ├── extract_detector.py       (one-shot script wrapping FullFrameSource)
-├── build_review_manifest.py  (Stage A: metadata-only review manifest)
-└── train_classifier.py       (train OUR classifier; best-by-val → models/trained/)
+├── build_cluster_manifest.py (cold-start clustering manifest)
+├── build_review_manifest.py  (legacy single-crop review manifest)
+└── train_classifier.py       (train identity classifier; best-by-val → models/trained/)
 
-../review/            (Stage B: FastAPI label-review web app; `just review`)
-├── app.py            (on-demand in-memory crop decode; corrections → reviews.db)
+../review/            (FastAPI label-review apps; `just cluster-review`)
+├── cluster_app.py    (bulk cluster labels; corrections → reviews.db)
+├── app.py            (legacy single-crop review)
+├── static/cluster.html
 ├── static/index.html (one-page vanilla-JS reviewer)
 └── requirements.txt  (fastapi/uvicorn/av/numpy/Pillow — no openvino/torch)
 ```

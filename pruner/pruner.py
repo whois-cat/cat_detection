@@ -23,6 +23,7 @@ it read-only via URI; with WAL mode the detector can keep writing concurrently.
 Environment:
     RECORDINGS_DIR        — root of recordings (default /recordings)
     EVENTS_DB             — path to detector's SQLite DB (default /data/events/events.db)
+    RECORDING_TZ          — timezone used in segment filenames (default UTC)
     SEGMENT_DURATION_SEC  — must match mediamtx recordSegmentDuration (default 30)
     KEEP_PRE_ROLL_SEC     — keep this much before each detection (default 30)
     KEEP_POST_ROLL_SEC    — keep this much after each detection  (default 30)
@@ -34,8 +35,9 @@ import os
 import sqlite3
 import time
 from bisect import bisect_left
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 RECORDINGS_DIR     = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
 EVENTS_DB          = Path(os.environ.get("EVENTS_DB", "/data/events/events.db"))
@@ -47,17 +49,29 @@ PRUNE_INTERVAL_SEC = int(os.environ.get("PRUNE_INTERVAL_SEC", "3600"))
 DRY_RUN            = os.environ.get("DRY_RUN", "0") == "1"
 
 
+def _recording_tz():
+    raw = os.environ.get("RECORDING_TZ") or os.environ.get("TZ") or "UTC"
+    if raw.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(raw)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(f"invalid RECORDING_TZ/TZ value: {raw!r}") from exc
+
+
+RECORDING_TZ = _recording_tz()
+
+
 def parse_segment_timestamp_ms(name: str) -> int | None:
-    """mediamtx recordPath: <YYYY-MM-DD_HH-MM-SS-ffffff>.mp4 (local time)."""
+    """mediamtx recordPath: <YYYY-MM-DD_HH-MM-SS-ffffff>.mp4."""
     stem = name.rsplit(".", 1)[0]
     try:
         dt = datetime.strptime(stem, "%Y-%m-%d_%H-%M-%S-%f")
     except ValueError:
         return None
-    # mediamtx writes in LOCAL time. `.timestamp()` interprets naive datetimes
-    # as local for the host where the pruner runs — both containers share the
-    # same TZ if compose sets it (default UTC).
-    return int(dt.timestamp() * 1000)
+    # mediamtx writes in the recording container's wall-clock timezone. Parse
+    # explicitly so host tools and containers don't disagree.
+    return int(dt.replace(tzinfo=RECORDING_TZ).timestamp() * 1000)
 
 
 def load_event_times() -> list[int]:

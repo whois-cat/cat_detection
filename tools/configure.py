@@ -3,7 +3,7 @@
 Generates (all marked with `# GENERATED ...` headers):
   - mediamtx/mediamtx.yml             one path per camera + global server config
   - docker-compose.cameras.yml        one `detector-<id>` service per camera
-  - docker-compose.cameras.dev.yml    watchfiles override per detector (for `just devserver`)
+  - docker-compose.cameras.dev.yml    watchfiles override per detector (for `just dev`)
   - webui/nginx.conf                  per-camera detector upstreams + routing
   - webui/public/cameras.json         camera list the UI fetches at startup
 
@@ -204,7 +204,7 @@ def render_compose(cfg: dict) -> str:
                 "DOOR_CLOSE_TIMEOUT_SEC":  str(feeder.get("door_close_timeout_sec", 30)),
                 "MIN_MEAL_SEC":            str(feeder.get("min_meal_sec", 10)),
                 "PRESENCE_WINDOW_SEC":     str(feeder.get("presence_window_sec", 5)),
-                "CLASSIFIER_MIN_CONF":     str(feeder.get("classifier_min_conf", 0.5)),
+                "CLASSIFIER_MIN_CONF":     str(feeder.get("classifier_min_conf", 0.9)),
                 "OPEN_DEBOUNCE_SEC":       str(feeder.get("open_debounce_sec", 3)),
                 "MULTI_DEBOUNCE_SEC":      str(feeder.get("multi_debounce_sec", 2)),
             }

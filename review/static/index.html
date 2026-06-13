@@ -123,9 +123,10 @@ function render() {
   img.src = `/api/crop/${encodeURIComponent(q.crop_id)}?t=${Date.now()}`;
   stage.appendChild(img);
 
-  // prediction + sorted probability bars (confuse pair emphasised)
+  // Diagnostic classifier guess + sorted probability bars (confuse pair emphasised).
+  // Cold-start labeling should prefer the cluster review flow.
   document.getElementById('pred').innerHTML =
-      `model says <b>${q.predicted}</b> · conf ${(q.conf * 100).toFixed(1)}%`;
+      `classifier guess <b>${q.predicted}</b> · conf ${(q.conf * 100).toFixed(1)}%`;
   const ranked = Object.entries(q.probs).sort((a, b) => b[1] - a[1]);
   document.getElementById('probs').innerHTML = ranked.map(([n, p]) => `
       <div class="prow ${M.confuse.includes(n) ? 'confuse' : ''}">

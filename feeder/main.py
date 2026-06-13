@@ -34,7 +34,7 @@ Env vars (all from configure.py — nothing hardcoded):
   DOOR_CLOSE_TIMEOUT_SEC  seconds without detection before door closes (default 30)
   MIN_MEAL_SEC            min meal duration (sec) to record a cooldown (default 10)
   PRESENCE_WINDOW_SEC     sliding window (sec) for n_cats / identity smoothing (default 5)
-  CLASSIFIER_MIN_CONF     min cat_score to participate in identity vote (default 0.5)
+  CLASSIFIER_MIN_CONF     min cat_score to participate in identity vote (default 0.9)
   OPEN_DEBOUNCE_SEC       allowed cat must hold the open-verdict this long before
                           the door opens (default 3)
   MULTI_DEBOUNCE_SEC      a multi_cat / identity-change condition must hold this
@@ -72,7 +72,7 @@ COOLDOWN_DB = Path(
 DOOR_CLOSE_TIMEOUT_SEC = float(os.environ.get("DOOR_CLOSE_TIMEOUT_SEC", "30"))
 MIN_MEAL_SEC           = float(os.environ.get("MIN_MEAL_SEC", "10"))
 PRESENCE_WINDOW_SEC    = float(os.environ.get("PRESENCE_WINDOW_SEC", "5"))
-CLASSIFIER_MIN_CONF    = float(os.environ.get("CLASSIFIER_MIN_CONF", "0.5"))
+CLASSIFIER_MIN_CONF    = float(os.environ.get("CLASSIFIER_MIN_CONF", "0.9"))
 OPEN_DEBOUNCE_SEC      = float(os.environ.get("OPEN_DEBOUNCE_SEC", "3"))
 MULTI_DEBOUNCE_SEC     = float(os.environ.get("MULTI_DEBOUNCE_SEC", "2"))
 

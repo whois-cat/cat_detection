@@ -1,9 +1,9 @@
 """Load human label corrections (Stage B reviews.db) for training.
 
 The review web app writes non-destructive corrections to a separate reviews.db
-keyed by `src_event_key` (the events-table rowid). This maps that key → corrected
-label so the training sources can prefer a human label over the detector's guess
-WITHOUT touching events.db. See training/README.md "Recipe: label review".
+keyed by `src_event_key` (the events-table rowid). This maps that key to a
+human label WITHOUT touching events.db. See training/README.md "Recipe: label
+review".
 """
 from __future__ import annotations
 

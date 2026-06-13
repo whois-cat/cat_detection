@@ -38,7 +38,7 @@ does it look like that" doc. This file is just the "how do I run it".
 cp .env.example   .env             # WEB_PORT + pruner knobs
 cp cameras.yaml.example cameras.yaml
 # Edit cameras.yaml — at minimum: webrtc_host, and one RTSP URL per camera.
-just devserver                     # runs `just configure` then docker compose up
+just dev                           # runs `just configure` then docker compose up
 # or step-by-step:
 #   just configure                 # render mediamtx.yml, compose overlays, nginx.conf
 #   docker compose -f docker-compose.yml -f docker-compose.cameras.yml up -d --build

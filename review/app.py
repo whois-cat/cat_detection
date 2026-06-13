@@ -1,8 +1,8 @@
-"""Stage B — label-review web app.
+"""Legacy single-crop label-review web app.
 
-A tiny FastAPI service for hand-correcting cat-crop labels (the alisa↔felisis
-confusion). It depends on `av` + the `training` package for on-the-fly decode,
-NOT on openvino/torch — all inference already happened in Stage A.
+A tiny FastAPI service for hand-correcting individual cat-crop labels. Prefer
+`review.cluster_app` for cold-start identity labeling; this legacy view is still
+useful for spot checks and active-learning queues.
 
 Design constraints (see the task brief):
   - NO image files, ever. Each crop is decoded from the recordings into memory
@@ -13,7 +13,7 @@ Design constraints (see the task brief):
     NON-DESTRUCTIVELY to a SEPARATE reviews.db keyed by src_event_key, so the
     detector's rows are untouched and the work is fully resumable.
 
-Config (env vars; the `just review` recipe sets sane defaults):
+Config (env vars; the old single-crop review runner can set these):
   REVIEW_MANIFEST   manifest.jsonl from Stage A      (default data/review/manifest.jsonl)
   RECORDINGS_ROOT   recordings root                  (default data/recordings)
   REVIEW_DB         writable corrections DB          (default data/review/reviews.db)

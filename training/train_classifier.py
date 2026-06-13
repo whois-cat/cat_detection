@@ -1,9 +1,9 @@
-"""Train OUR cat-identity classifier (replaces the donor that confuses alisa↔felisis).
+"""Train a cat-identity classifier from human-reviewed labels.
 
 CPU-friendly. Reads crops straight from the recordings in memory (no JPEGs on
 disk), applies the human label corrections, trains an EfficientNet-B0, and writes
-the BEST-by-val model to a NEW path. The donor model and the runtime are NOT
-touched — swapping it into production is a separate, later step.
+the BEST-by-val model to a NEW path. The runtime is NOT touched — swapping the
+model into production is a separate, later step.
 
 Pipeline (all reused from this package):
   - training.CropSource            — decode crops from recordings by events coords
@@ -13,16 +13,17 @@ Pipeline (all reused from this package):
   - detector/classifier.py::_preprocess — the EXACT runtime eval transform
 
 Label policy (flags; safe defaults):
-  - confuse pair (--confuse alisa,felisis): ONLY human labels are trusted.
-  - other classes: human label, OR the detector label when its classifier
-    confidence (events.cat_score) >= --trust-conf (default 0.9).
+  - cold start: ONLY human labels are trusted.
+  - later active-learning passes may opt into classifier labels with
+    --trust-classifier when events.cat_score >= --trust-conf (default 0.9).
+    The detector gate is separate: --min-score filters events.score.
   - discard/unknown are dropped. Class names come from the surviving labels
     (sorted, unique) — never hardcoded — and are saved with the model.
 
 Honest split: crops are grouped into episodes (same camera, wall_ms gaps >
---episode-gap-sec start a new one); a whole episode goes entirely to train OR
-val, so near-duplicate neighbours never straddle the split. The val set is forced
-to contain both confuse cats, else the confusion metric would be empty.
+--episode-gap-sec start a new one); a whole episode goes entirely to train, val,
+or test, so near-duplicate neighbours never straddle the split. Val chooses the
+best epoch; test is held out for the final honest report.
 
 Run:  python -m training.train_classifier --db data/events/events.db \
           --recordings data/recordings --reviews-db data/review/reviews.db \
@@ -34,6 +35,7 @@ import argparse
 import json
 import logging
 import random
+import sys
 from collections import defaultdict, namedtuple
 from datetime import datetime
 from pathlib import Path
@@ -54,17 +56,16 @@ Meta = namedtuple("Meta", ["label", "camera", "wall_ms"])
 
 # --------------------------------------------------------------- label policy --
 
-def decide_label(det_label, det_conf, human, trust_detector, trust_conf):
+def decide_label(det_label, det_conf, human, trust_classifier, trust_conf):
     """Final training label for one crop, or None to drop it.
 
-    Default (trust_detector=False): ONLY human labels are used — the donor
-    confuses several pairs, so we don't trust ANY of its labels. With
-    --trust-detector, an unreviewed crop may also use the donor's label when its
-    cat_score >= trust_conf. discard/unknown are always dropped.
+    Default (trust_classifier=False): ONLY human labels are used. With
+    --trust-classifier, an unreviewed crop may also use the existing classifier's
+    label when its cat_score >= trust_conf. discard/unknown are always dropped.
     """
     if human is not None:
         return None if human in DROP_LABELS else human
-    if not trust_detector:
+    if not trust_classifier:
         return None                      # human-only by default
     if not det_label or det_label in DROP_LABELS:
         return None
@@ -98,45 +99,75 @@ def build_episodes(metas: list[Meta], gap_ms: int) -> list[list[int]]:
 
 
 def split_episodes(episodes: list[list[int]], metas: list[Meta], *,
-                   val_frac: float, required: set[str], seed: int):
-    """Assign whole episodes to train/val. Stratify so val holds EVERY class in
-    `required` (per-class recall needs each present). Returns (train_idx, val_idx)
-    as crop-index lists."""
+                   val_frac: float, test_frac: float,
+                   required: set[str], seed: int):
+    """Assign whole episodes to train/val/test.
+
+    The unit of splitting is an episode, never an individual crop, so adjacent
+    near-duplicates cannot leak across splits. Val/test are nudged to contain
+    every class when possible so per-class metrics are meaningful.
+    """
+    if val_frac < 0 or test_frac < 0 or val_frac + test_frac >= 1:
+        raise ValueError("--val-frac and --test-frac must be >=0 and sum to < 1")
     rng = random.Random(seed)
     order = list(range(len(episodes)))
     rng.shuffle(order)
 
     total = sum(len(e) for e in episodes)
-    target = val_frac * total
+    test_target = test_frac * total
+    val_target = val_frac * total
+    test_eps: set[int] = set()
     val_eps: set[int] = set()
+
     n = 0
     for e in order:
-        if n >= target:
+        if n >= test_target:
             break
+        test_eps.add(e)
+        n += len(episodes[e])
+
+    n = 0
+    for e in order:
+        if n >= val_target:
+            break
+        if e in test_eps:
+            continue
         val_eps.add(e)
         n += len(episodes[e])
 
     def ep_labels(e: int) -> set[str]:
         return {metas[i].label for i in episodes[e]}
 
-    # Guarantee each required class appears in val (move a train episode if need).
-    val_label_union = set().union(*(ep_labels(e) for e in val_eps)) if val_eps else set()
-    for cat in required:
-        if cat in val_label_union:
-            continue
-        for e in order:
-            if e not in val_eps and cat in ep_labels(e):
-                val_eps.add(e)
-                val_label_union |= ep_labels(e)
-                break
-        else:
-            log.warning("class %r not present in ANY episode — its val recall "
-                        "will be 0/empty", cat)
+    def ensure_labels(split_name: str, target_eps: set[int], other_eps: set[int]) -> None:
+        label_union = set().union(*(ep_labels(e) for e in target_eps)) if target_eps else set()
+        for cat in required:
+            if cat in label_union:
+                continue
+            for e in order:
+                if e not in target_eps and e not in other_eps and cat in ep_labels(e):
+                    target_eps.add(e)
+                    label_union |= ep_labels(e)
+                    break
+            else:
+                log.warning(
+                    "class %r not present in %s — metric may be empty for that class",
+                    cat, split_name,
+                )
 
-    train_idx, val_idx = [], []
+    if val_frac > 0:
+        ensure_labels("val", val_eps, test_eps)
+    if test_frac > 0:
+        ensure_labels("test", test_eps, val_eps)
+
+    train_idx, val_idx, test_idx = [], [], []
     for e in range(len(episodes)):
-        (val_idx if e in val_eps else train_idx).extend(episodes[e])
-    return train_idx, val_idx
+        if e in val_eps:
+            val_idx.extend(episodes[e])
+        elif e in test_eps:
+            test_idx.extend(episodes[e])
+        else:
+            train_idx.extend(episodes[e])
+    return train_idx, val_idx, test_idx
 
 
 # ----------------------------------------------------------------- metrics ----
@@ -213,26 +244,32 @@ def main() -> None:
     ap.add_argument("--confuse", default="",
                     help="OPTIONAL pair to highlight in the confusion matrix "
                          "(e.g. alisa,felisis); does NOT affect trust or split")
-    ap.add_argument("--trust-detector", action="store_true",
-                    help="also use the donor's labels for unreviewed crops (OFF by "
-                         "default — human labels only, since the donor confuses "
-                         "several pairs)")
+    ap.add_argument("--trust-classifier", action="store_true",
+                    help="also use classifier labels for unreviewed crops (OFF by "
+                        "default — human labels only for cold start)")
+    ap.add_argument("--trust-detector", dest="trust_classifier", action="store_true",
+                    help=argparse.SUPPRESS)
     ap.add_argument("--trust-conf", type=float, default=0.9,
-                    help="min detector cat_score to trust its label; only used "
-                         "with --trust-detector")
+                    help="min identity cat_score required before --trust-classifier may "
+                         "reuse an existing classifier label")
+    ap.add_argument("--replay-set", type=Path, action="append", default=[],
+                    help="compact replay set directory/manifest; added to train only")
     ap.add_argument("--pad-frac", type=float, default=0.15,
                     help="crop context padding — MUST match the detector "
                          "CLASSIFIER_PAD_FRAC and build_review_manifest --pad-frac")
     ap.add_argument("--default-rotate-deg", type=int, default=0,
                     help="rotation to assume for events recorded BEFORE rotate_deg "
                          "was persisted (set to the camera's rotate_deg then)")
-    ap.add_argument("--min-score", type=float, default=None, help="drop low YOLO-score boxes")
+    ap.add_argument("--min-score", type=float, default=0.7, help="drop low YOLO-score boxes")
     ap.add_argument("--episode-gap-sec", type=float, default=60.0)
     ap.add_argument("--val-frac", type=float, default=0.2)
+    ap.add_argument("--test-frac", type=float, default=0.1)
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--patience", type=int, default=6, help="early stop on val macro-recall")
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=None, help="default 1e-3 head / 1e-4 full")
+    ap.add_argument("--init-from", type=Path, default=None,
+                    help="optional previous cat_classifier.pt checkpoint to fine-tune from")
     ap.add_argument("--full-finetune", action="store_true",
                     help="train the whole backbone (low LR) instead of head + last block")
     ap.add_argument("--num-workers", type=int, default=0, help="keep 0 on CPU (fork-safe)")
@@ -251,8 +288,13 @@ def main() -> None:
     from torch.utils.data import DataLoader, Dataset
     from torchvision import models, transforms as T
 
-    from classifier import _preprocess  # exact runtime eval preprocessing
+    try:
+        from classifier import _preprocess  # exact runtime eval preprocessing
+    except ImportError:
+        sys.path.insert(0, str(ROOT / "detector"))
+        from classifier import _preprocess
     from training import CropSource, load_reviews
+    from training.replay import load_replay_set
     from training.torch_dataset import TorchCachedDataset
 
     # Determinism.
@@ -272,10 +314,10 @@ def main() -> None:
         human = reviews.get(sb.rowid) if sb and sb.rowid is not None else None
         label = decide_label(sb.cat if sb else None,
                              sb.cat_score if sb else None,
-                             human, args.trust_detector, args.trust_conf)
+                             human, args.trust_classifier, args.trust_conf)
         return Meta(label=label, camera=sample.camera_id, wall_ms=sample.wall_ms)
 
-    # CropSource WITHOUT reviews= (we need the raw detector label/conf for policy).
+    # CropSource WITHOUT reviews= (we need raw classifier labels/conf for policy).
     # default_rotate_deg only affects pre-migration events with NULL rotate_deg.
     src = CropSource(db_path=args.db, recordings_root=args.recordings,
                      camera_id=args.camera, model=args.model,
@@ -288,12 +330,21 @@ def main() -> None:
     kept = [(img, m) for (img, m) in items if m.label is not None]
     if not kept:
         raise SystemExit("no usable crops after the label policy — loosen "
-                         "--trust-conf or add human reviews")
-    images = [img for img, _ in kept]
-    metas = [m for _, m in kept]
+                         "--trust-classifier or add human reviews")
+    fresh_images = [img for img, _ in kept]
+    fresh_metas = [m for _, m in kept]
     log.info("kept %d / %d crops after label policy", len(kept), len(items))
 
-    classes = sorted({m.label for m in metas})
+    replay_items = []
+    for replay_path in args.replay_set:
+        replay_items.extend(load_replay_set(replay_path))
+    if replay_items:
+        log.info("loaded %d replay crops from %d replay set(s)",
+                 len(replay_items), len(args.replay_set))
+    replay_images = [img for img, _ in replay_items]
+    replay_metas = [m for _, m in replay_items]
+
+    classes = sorted({m.label for m in [*fresh_metas, *replay_metas]})
     cls_to_idx = {c: i for i, c in enumerate(classes)}
     log.info("classes (%d): %s", len(classes), classes)
     for c in sorted(confuse):
@@ -301,11 +352,28 @@ def main() -> None:
             log.warning("confuse cat %r has NO crops — its confusion metric is empty", c)
 
     # --- honest, episode-grouped, confuse-stratified split ---
-    episodes = build_episodes(metas, int(args.episode_gap_sec * 1000))
-    train_idx, val_idx = split_episodes(episodes, metas, val_frac=args.val_frac,
-                                        required=set(classes), seed=args.seed)
-    log.info("%d episodes -> train %d crops / val %d crops",
-             len(episodes), len(train_idx), len(val_idx))
+    episodes = build_episodes(fresh_metas, int(args.episode_gap_sec * 1000))
+    train_idx, val_idx, test_idx = split_episodes(
+        episodes, fresh_metas,
+        val_frac=args.val_frac, test_frac=args.test_frac,
+        required={m.label for m in fresh_metas}, seed=args.seed,
+    )
+    images = fresh_images + replay_images
+    metas = fresh_metas + replay_metas
+    if replay_metas:
+        train_idx.extend(range(len(fresh_metas), len(metas)))
+    log.info("%d episodes -> train %d crops / val %d crops / test %d crops",
+             len(episodes), len(train_idx), len(val_idx), len(test_idx))
+    train_classes = {metas[j].label for j in train_idx}
+    missing_train = sorted(set(classes) - train_classes)
+    if missing_train:
+        raise SystemExit(
+            "train split has no crops for class(es): "
+            + ", ".join(missing_train)
+            + ". Add more reviewed episodes or reduce --val-frac/--test-frac."
+        )
+    if not val_idx:
+        raise SystemExit("validation split is empty; reduce --test-frac or add more episodes")
 
     # --- transforms: train augments; val is byte-identical to runtime ---
     train_pipe = T.Compose([
@@ -337,10 +405,13 @@ def main() -> None:
 
     train_ds = Crops(train_idx, train_tf)
     val_ds = Crops(val_idx, eval_tf)
+    test_ds = Crops(test_idx, eval_tf)
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                           num_workers=args.num_workers, generator=g)
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers)
+    test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                         num_workers=args.num_workers)
 
     # --- class-imbalance weighting (inverse frequency on TRAIN) ---
     counts = np.bincount([cls_to_idx[metas[j].label] for j in train_idx],
@@ -352,6 +423,16 @@ def main() -> None:
     # --- model: EfficientNet-B0 (ImageNet), new head ---
     model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(classes))
+    if args.init_from:
+        checkpoint = torch.load(str(args.init_from), map_location="cpu", weights_only=False)
+        checkpoint_classes = list(checkpoint.get("class_names", []))
+        if checkpoint_classes != classes:
+            raise SystemExit(
+                "--init-from class_names do not match current reviewed labels: "
+                f"{checkpoint_classes} != {classes}"
+            )
+        model.load_state_dict(checkpoint["state_dict"])
+        log.info("initialized model from %s", args.init_from)
 
     if args.full_finetune:
         lr = args.lr if args.lr is not None else 1e-4
@@ -427,7 +508,19 @@ def main() -> None:
     print(f"\n===== BEST model (epoch {best['epoch']}) on val =====")
     metrics = print_report(cm, classes, confuse)
 
-    # --- save to a NEW path (donor untouched); export_classifier-compatible .pt ---
+    if test_idx:
+        y_true, y_pred = [], []
+        with torch.no_grad():
+            for x, y in test_dl:
+                y_true.extend(y.tolist())
+                y_pred.extend(model(x).argmax(1).tolist())
+        test_cm = confusion(y_true, y_pred, len(classes))
+        print("\n===== Held-out TEST set =====")
+        test_metrics = print_report(test_cm, classes, confuse)
+    else:
+        test_metrics = None
+
+    # --- save to a NEW path; export_classifier-compatible .pt ---
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = args.out_root / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -445,9 +538,13 @@ def main() -> None:
             "interpolation": "bilinear",
             "note": "byte-identical to detector/classifier.py::_preprocess",
         },
+        "trust_classifier": args.trust_classifier,
         "trust_conf": args.trust_conf, "confuse": sorted(confuse),
+        "replay_sets": [str(p) for p in args.replay_set],
+        "replay_count": len(replay_metas),
+        "init_from": str(args.init_from) if args.init_from else None,
         "full_finetune": args.full_finetune, "best_epoch": best["epoch"],
-        "val_metrics": metrics,
+        "val_metrics": metrics, "test_metrics": test_metrics,
         "counts_train": dict(zip(classes, counts.astype(int).tolist())),
     }
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -465,15 +562,15 @@ def main() -> None:
             failing[c] = 0.0
     if failing:
         print("\n" + "!" * 64)
-        print(f"FAIL — NOT ready to replace the donor (need recall >= {args.min_recall} "
-              "for every class incl. alisa & felisis).")
+        print(f"FAIL — NOT ready for production (need recall >= {args.min_recall} "
+              "for every class incl. the confuse pair).")
         for c, r in sorted(failing.items()):
             print(f"   {c}: recall={r:.3f}")
         print("Collect/relabel more crops (especially the confuse pair) and re-train.")
         print("!" * 64)
     else:
         print(f"\nPASS — every class recall >= {args.min_recall} (incl. the confuse pair). "
-              "Model is a candidate to replace the donor (export + swap is a separate step).")
+              "Model is a production candidate (export + swap is a separate step).")
 
 
 if __name__ == "__main__":

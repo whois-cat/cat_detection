@@ -210,8 +210,8 @@ class CropSource(SampleSource):
         super().__init__(*args, **kwargs)
         self.pad_frac = pad_frac
         # Human label corrections (training.reviews.load_reviews): src_event_key
-        # (== box.rowid) → label. When a box has a correction it overrides the
-        # detector's cat; labels in drop_labels are skipped entirely.
+        # (== box.rowid) -> label. When a box has a correction it overrides the
+        # event's identity label; labels in drop_labels are skipped entirely.
         self.reviews = reviews or {}
         self.drop_labels = set(drop_labels)
         # Fallback rotation for events recorded BEFORE rotate_deg was persisted

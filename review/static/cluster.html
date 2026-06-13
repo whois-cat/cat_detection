@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cat cluster review</title>
+<style>
+  :root { --bg:#11131a; --panel:#171a23; --fg:#e6e8ee; --muted:#8b90a0;
+          --line:#2a2f3d; --accent:#4f8cff; --ok:#36c5a0; --warn:#ffbd4a; }
+  * { box-sizing:border-box; }
+  body { margin:0; height:100vh; display:grid; grid-template-rows:auto 1fr;
+         background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:15px; }
+  .hint { color:var(--muted); }
+  .grow { flex:1; }
+  #bar { width:260px; height:4px; overflow:hidden; border-radius:3px; background:#262a36; }
+  #bar i { display:block; height:100%; width:0; background:var(--accent); }
+  main { min-height:0; display:grid; grid-template-columns:280px 1fr 340px; }
+  nav, aside { min-height:0; overflow:auto; background:var(--panel); }
+  nav { border-right:1px solid var(--line); padding:10px; }
+  aside { border-left:1px solid var(--line); padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .cluster { width:100%; display:flex; justify-content:space-between; gap:8px; padding:8px 10px;
+             background:#1b1f2a; color:var(--fg); border:1px solid var(--line);
+             border-radius:6px; cursor:pointer; margin-bottom:6px; text-align:left; }
+  .cluster:hover, .cluster.active { border-color:var(--accent); }
+  .cluster.done { opacity:.65; }
+  .cluster.child { margin-left:18px; width:calc(100% - 18px); }
+  .cluster .status { color:var(--muted); font-size:12px; }
+  #stage { min-width:0; min-height:0; display:flex; align-items:center; justify-content:center; padding:16px; overflow:auto; }
+  #sheet { max-width:100%; max-height:100%; object-fit:contain; border-radius:6px; background:#08090d; }
+  .mode { display:flex; gap:8px; }
+  button { background:#1d2230; color:var(--fg); border:1px solid var(--line); border-radius:7px;
+           padding:9px 11px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); }
+  .labels { display:flex; flex-direction:column; gap:8px; margin-top:auto; }
+  .label { display:flex; align-items:center; gap:10px; text-align:left; font-weight:600; }
+  .label .k { width:24px; height:24px; display:inline-flex; align-items:center; justify-content:center;
+              border-radius:5px; background:#30364a; color:#cbd3e5; font-size:12px; }
+  .mixed { border-color:var(--warn); }
+  .discard { color:var(--muted); }
+  .meta { display:grid; gap:4px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>cat cluster review</h1>
+  <span id="title" class="hint"></span>
+  <div class="grow"></div>
+  <div id="bar"><i></i></div>
+  <span id="progress" class="hint">0 / 0</span>
+</header>
+<main>
+  <nav id="clusters"></nav>
+  <section id="stage"><img id="sheet" alt=""></section>
+  <aside>
+    <div class="meta">
+      <b id="clusterName">cluster</b>
+      <span id="clusterMeta"></span>
+      <span id="clusterStatus"></span>
+    </div>
+	    <div class="mode">
+	      <button onclick="setMode('representative')">representative</button>
+	      <button onclick="setMode('random')">random</button>
+	      <button onclick="setMode('outliers')">outliers</button>
+	    </div>
+	    <div class="mode">
+	      <button onclick="splitCluster(2)">split x2</button>
+	      <button onclick="splitCluster(3)">split x3</button>
+	    </div>
+	    <div class="labels" id="buttons"></div>
+	    <div class="hint">keys: 1..N label · x split · m mixed · s skip · ←/→ cluster</div>
+  </aside>
+</main>
+<script>
+let M = null;
+let idx = 0;
+let mode = 'representative';
+let ACTIONS = [];
+
+async function load() {
+  M = await (await fetch('/api/clusters')).json();
+  ACTIONS = [...M.labels, ...M.extra_labels, 'mixed', 'skip'];
+  idx = Math.max(0, M.queue.findIndex(c => !c.status));
+  if (idx < 0) idx = 0;
+  renderButtons();
+  render();
+}
+
+function curr() { return M.queue[idx]; }
+
+function renderButtons() {
+  const wrap = document.getElementById('buttons');
+  wrap.innerHTML = '';
+  ACTIONS.forEach((lab, i) => {
+    const b = document.createElement('button');
+    b.className = 'label' + (lab === 'discard' || lab === 'skip' ? ' discard' : '')
+                         + (lab === 'mixed' ? ' mixed' : '');
+    b.innerHTML = `<span class="k">${i + 1}</span><span>${lab}</span>`;
+    b.onclick = () => choose(lab);
+    wrap.appendChild(b);
+  });
+}
+
+function renderList() {
+  const nav = document.getElementById('clusters');
+  nav.innerHTML = '';
+  M.queue.forEach((c, i) => {
+    const b = document.createElement('button');
+	    b.className = 'cluster' + (i === idx ? ' active' : '') + (c.status ? ' done' : '')
+	                         + (c.split_child ? ' child' : '');
+	    const status = c.status ? `${c.status.label || c.status.status}` : 'open';
+	    const name = c.parent_id == null ? `#${c.cluster_id}` : `#${c.parent_id} → #${c.cluster_id}`;
+	    b.innerHTML = `<span>${name} · ${c.size}</span><span class="status">${status}</span>`;
+    b.onclick = () => { idx = i; render(); };
+    nav.appendChild(b);
+  });
+}
+
+function render() {
+  const c = curr();
+  renderList();
+  document.getElementById('progress').textContent =
+      `${M.done_clusters} / ${M.total_clusters} clusters · ${M.reviewed_items} crops`;
+  document.getElementById('bar').firstElementChild.style.width =
+      (100 * M.done_clusters / Math.max(1, M.total_clusters)) + '%';
+  document.getElementById('title').textContent =
+      `detector min_score ${M.params.min_score ?? 'n/a'}`;
+	  document.getElementById('clusterName').textContent = `cluster #${c.cluster_id}`;
+	  document.getElementById('clusterMeta').textContent =
+	      `${c.size} crops · ${c.reviewed_items} labelled`
+	      + (c.parent_id == null ? '' : ` · split from #${c.parent_id}`);
+  document.getElementById('clusterStatus').textContent =
+      c.status ? `status: ${c.status.status} ${c.status.label || ''}` : 'status: open';
+  document.getElementById('sheet').src =
+      `/api/cluster/${c.cluster_id}/sheet?mode=${mode}&limit=48&cols=8&thumb=150&t=${Date.now()}`;
+}
+
+function setMode(next) { mode = next; render(); }
+
+	async function choose(label) {
+  const c = curr();
+  const r = await fetch('/api/cluster_review', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cluster_id:c.cluster_id, label})
+  });
+  if (!r.ok) { alert('save failed'); return; }
+	  await load();
+	}
+
+	async function splitCluster(parts) {
+	  const c = curr();
+	  const r = await fetch('/api/cluster_split', {
+	    method:'POST', headers:{'Content-Type':'application/json'},
+	    body:JSON.stringify({cluster_id:c.cluster_id, parts})
+	  });
+	  if (!r.ok) {
+	    const msg = await r.text();
+	    alert(`split failed: ${msg}`);
+	    return;
+	  }
+	  await load();
+	}
+
+function go(d) {
+  idx = Math.max(0, Math.min(M.queue.length - 1, idx + d));
+  render();
+}
+
+document.addEventListener('keydown', e => {
+	  if (e.key === 'ArrowRight') return go(1);
+	  if (e.key === 'ArrowLeft') return go(-1);
+	  if (e.key === 'x') return splitCluster(2);
+	  if (e.key === 'm') return choose('mixed');
+  if (e.key === 's') return choose('skip');
+  const n = parseInt(e.key, 10);
+  if (!Number.isNaN(n) && n >= 1 && n <= ACTIONS.length) choose(ACTIONS[n - 1]);
+});
+
+load();
+</script>
+</body>
+</html>
