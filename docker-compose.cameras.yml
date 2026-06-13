@@ -15,7 +15,10 @@ services:
       BLOB_MIN_AREA: 5000
       YOLO_WEIGHTS: "/opt/models/yolov8n_int8_openvino_model/"
       YOLO_CONF: 0.25
+      DETECTOR_UNKNOWN_CONF: 0.5
+      CLASSIFIER_PAD_FRAC: 0.15
       DETECT_ROI: "0,0,1,1"
+      IGNORE_REGIONS: "[]"
       ACTION_POLYGON: "0,0,1,1"
       FRAME_ROTATE_DEG: 90
       EVENTS_DB: "/data/events/events.db"

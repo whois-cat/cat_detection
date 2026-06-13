@@ -158,7 +158,7 @@ def _index_for(camera: str) -> SegmentIndex:
         return idx
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=1024)
 def _crop_rgb(crop_id: str) -> np.ndarray:
     item = BY_ID[crop_id]
     b = item["box"]
@@ -252,15 +252,15 @@ def api_clusters() -> JSONResponse:
 
 @app.get("/api/cluster/{cluster_id}/sheet")
 def api_sheet(cluster_id: int, mode: str = "representative",
-              limit: int = 48, cols: int = 8, thumb: int = 150) -> Response:
+              limit: int = 24, cols: int = 6, thumb: int = 128) -> Response:
     cluster = _cluster_by_id(cluster_id)
     if cluster is None:
         raise HTTPException(status_code=404, detail="unknown cluster")
     if mode not in {"representative", "random", "outliers"}:
         raise HTTPException(status_code=400, detail="bad mode")
-    limit = max(1, min(96, int(limit)))
-    cols = max(1, min(12, int(cols)))
-    thumb = max(80, min(240, int(thumb)))
+    limit = max(1, min(48, int(limit)))
+    cols = max(1, min(8, int(cols)))
+    thumb = max(80, min(180, int(thumb)))
     selected = _select_cluster_items(cluster, mode, limit)
     rows = (len(selected) + cols - 1) // cols
     sheet = Image.new("RGB", (cols * thumb, max(1, rows) * thumb), (12, 14, 20))

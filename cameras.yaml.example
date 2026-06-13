@@ -39,6 +39,17 @@
 #                         Change all three together or not at all.
 #   rotate_deg      — internal-to-model rotation, 0/90/180/270.
 #   detect_roi      — camera-coord rectangle, "x0,y0,x1,y1" in [0..1].
+#   ignore_regions  — optional detector false-positive masks in camera coords.
+#                     Detections whose BOX CENTER lands inside one of these
+#                     regions are dropped before events/review/training. Use for
+#                     static objects YOLO confuses for cats, such as a feeder or
+#                     bowl. Keep regions tight so real cats beside the bowl stay.
+#                     Shapes can be:
+#                       ignore_regions:
+#                         - name: feeder_bowl
+#                           rect: [0.35, 0.02, 0.68, 0.34]
+#                         - name: left_fixture
+#                           points: [[0.0,0.4], [0.1,0.4], [0.1,0.8], [0.0,0.8]]
 #   action_polygon  — camera-coord polygon (rect or N-vertex; see .env.example).
 #   blob_bright_threshold, blob_min_area — for DETECTOR_TYPE=blob.
 #   artificial_delay_ms — initial value for the UI delay slider.

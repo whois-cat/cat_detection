@@ -26,7 +26,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
 import av
 import numpy as np
@@ -136,7 +136,8 @@ class SampleSource(ABC):
                  cat: str | None = None,
                  t_from: int | None = None,
                  t_to: int | None = None,
-                 min_score: float | None = None):
+                 min_score: float | None = None,
+                 box_filter: Callable[[FrameRecord, Box], bool] | None = None):
         self.db_path = Path(db_path)
         self.recordings_root = Path(recordings_root)
         self.camera_id = camera_id
@@ -145,6 +146,7 @@ class SampleSource(ABC):
         self.t_from = t_from
         self.t_to = t_to
         self.min_score = min_score
+        self.box_filter = box_filter
         self._segment_indices: dict[str, SegmentIndex] = {}
 
     def _index_for(self, camera_id: str) -> SegmentIndex:
@@ -166,6 +168,11 @@ class SampleSource(ABC):
             # recording dirs are separate).
             by_camera: dict[str, list[FrameRecord]] = {}
             for fr in frames:
+                if self.box_filter is not None:
+                    boxes = [box for box in fr.boxes if self.box_filter(fr, box)]
+                    if not boxes:
+                        continue
+                    fr = replace(fr, boxes=boxes)
                 by_camera.setdefault(fr.camera_id, []).append(fr)
             for camera_id, fr_list in by_camera.items():
                 idx = self._index_for(camera_id)

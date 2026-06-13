@@ -242,11 +242,47 @@ def main() -> None:
                          "0 disables")
     ap.add_argument("--dedupe-threshold", type=float, default=0.995,
                     help="cosine similarity threshold for duplicate crops")
+    ap.add_argument("--ignore-config", type=Path, default=ROOT / "cameras.yaml",
+                    help="camera config with ignore_regions (default: cameras.yaml)")
+    ap.add_argument("--no-ignore-config", action="store_true",
+                    help="do not load ignore_regions from cameras.yaml")
+    ap.add_argument("--ignore-region", action="append", default=[],
+                    help="extra ignored region as CAMERA:x0,y0,x1,y1 or global "
+                         "x0,y0,x1,y1 in camera-normalized coords")
     ap.add_argument("--labels", default="",
                     help="optional comma-separated label names for the review UI")
     args = ap.parse_args()
 
     from training import CropSource
+    from training.regions import (
+        box_center_in_ignore_region,
+        load_ignore_regions_from_camera_config,
+        merge_regions,
+        parse_region_specs,
+        regions_to_jsonable,
+    )
+
+    ignored_by_region = 0
+    config_regions = (
+        {}
+        if args.no_ignore_config
+        else load_ignore_regions_from_camera_config(args.ignore_config)
+    )
+    cli_regions = parse_region_specs(args.ignore_region)
+    ignore_regions = merge_regions(config_regions, cli_regions)
+
+    def keep_box(frame, box) -> bool:
+        nonlocal ignored_by_region
+        if box_center_in_ignore_region(
+            frame.camera_id,
+            frame.frame_w,
+            frame.frame_h,
+            box,
+            ignore_regions,
+        ):
+            ignored_by_region += 1
+            return False
+        return True
 
     src = CropSource(
         db_path=args.db,
@@ -258,7 +294,11 @@ def main() -> None:
         min_score=args.min_score,
         pad_frac=args.pad_frac,
         default_rotate_deg=args.default_rotate_deg,
+        box_filter=keep_box if ignore_regions else None,
     )
+    if ignore_regions:
+        total_regions = sum(len(v) for v in ignore_regions.values())
+        print(f"[cluster] using {total_regions} ignore region(s)")
 
     extractor = build_extractor(
         args.embedding,
@@ -317,6 +357,8 @@ def main() -> None:
         raise SystemExit("no usable crops left after duplicate filtering")
     if deduped:
         print(f"[cluster] dropped {deduped} near-duplicate crops")
+    if ignored_by_region:
+        print(f"[cluster] dropped {ignored_by_region} crops inside ignore region(s)")
 
     k = args.clusters or default_cluster_count(len(items))
     labels, distances = kmeans(x, k, seed=args.seed, max_iter=args.max_iter)
@@ -370,6 +412,8 @@ def main() -> None:
             "dedupe_window_sec": args.dedupe_window_sec,
             "dedupe_threshold": args.dedupe_threshold,
             "deduped": deduped,
+            "ignored_by_region": ignored_by_region,
+            "ignore_regions": regions_to_jsonable(ignore_regions),
         },
         "labels": labels_hint,
         "items": items,

@@ -69,6 +69,9 @@ pruner
 - Detector confidence and identity confidence are different things:
   `events.score` means "detector thinks this box is a cat"; `cat_score` means
   "identity classifier thinks this is a specific cat".
+- Static false positives such as a feeder or bowl should be configured as
+  `ignore_regions` in `cameras.yaml`. Detections whose box center lands inside
+  these camera-normalized regions are dropped before events/review/training.
 
 ## Data Layout
 

@@ -29,6 +29,7 @@
   .cluster .status { color:var(--muted); font-size:12px; }
   #stage { min-width:0; min-height:0; display:flex; align-items:center; justify-content:center; padding:16px; overflow:auto; }
   #sheet { max-width:100%; max-height:100%; object-fit:contain; border-radius:6px; background:#08090d; }
+  #sheet.loading { opacity:.35; }
   .mode { display:flex; gap:8px; }
   button { background:#1d2230; color:var(--fg); border:1px solid var(--line); border-radius:7px;
            padding:9px 11px; cursor:pointer; font:inherit; }
@@ -132,8 +133,11 @@ function render() {
 	      + (c.parent_id == null ? '' : ` · split from #${c.parent_id}`);
   document.getElementById('clusterStatus').textContent =
       c.status ? `status: ${c.status.status} ${c.status.label || ''}` : 'status: open';
-  document.getElementById('sheet').src =
-      `/api/cluster/${c.cluster_id}/sheet?mode=${mode}&limit=48&cols=8&thumb=150&t=${Date.now()}`;
+  const sheet = document.getElementById('sheet');
+  sheet.classList.add('loading');
+  sheet.onload = () => sheet.classList.remove('loading');
+  sheet.src =
+      `/api/cluster/${c.cluster_id}/sheet?mode=${mode}&limit=24&cols=6&thumb=128&t=${Date.now()}`;
 }
 
 function setMode(next) { mode = next; render(); }

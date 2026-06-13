@@ -169,6 +169,7 @@ def render_compose(cfg: dict) -> str:
             ),
             "CLASSIFIER_PAD_FRAC": cam.get("classifier_pad_frac", 0.15),
             "DETECT_ROI":          cam.get("detect_roi", "0,0,1,1"),
+            "IGNORE_REGIONS":      json.dumps(cam.get("ignore_regions", [])),
             "ACTION_POLYGON":      cam.get("action_polygon", "0,0,1,1"),
             "FRAME_ROTATE_DEG":    cam.get("rotate_deg", 0),
             "EVENTS_DB":           "/data/events/events.db",

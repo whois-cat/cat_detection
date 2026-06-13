@@ -99,6 +99,39 @@ DETECT_ROI_IS_FULL = DETECT_ROI == (0.0, 0.0, 1.0, 1.0)
 ACTION_ROI_IS_FULL = ACTION_POLYGON == [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 
 
+def _parse_ignore_regions() -> list[list[tuple[float, float]]]:
+    raw = os.environ.get("IGNORE_REGIONS", "").strip()
+    if not raw:
+        return []
+    data = json.loads(raw)
+    regions = []
+    for i, region in enumerate(data):
+        coords = region
+        if isinstance(region, dict):
+            coords = region.get("rect", region.get("points", region.get("polygon")))
+        if isinstance(coords, str):
+            vals = [float(v.strip()) for v in coords.split(",") if v.strip()]
+        elif coords and all(isinstance(v, (list, tuple)) for v in coords):
+            vals = [float(x) for pair in coords for x in pair]
+        else:
+            vals = [float(v) for v in coords]
+        if len(vals) == 4:
+            x0, y0, x1, y1 = vals
+            points = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        elif len(vals) >= 6 and len(vals) % 2 == 0:
+            points = [(vals[j], vals[j + 1]) for j in range(0, len(vals), 2)]
+        else:
+            raise ValueError(f"IGNORE_REGIONS[{i}] must be a rect or polygon")
+        for x, y in points:
+            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                raise ValueError(f"IGNORE_REGIONS[{i}] point out of [0,1]: {(x, y)!r}")
+        regions.append(points)
+    return regions
+
+
+IGNORE_REGIONS = _parse_ignore_regions()
+
+
 def _unrotate_box_to_camera(rx: int, ry: int, rw: int, rh: int,
                             rot_W: int, rot_H: int) -> tuple[int, int, int, int]:
     """Map a pixel-space box from the rotated inference image back to the
@@ -242,6 +275,18 @@ def detector_loop():
                 b["x"], b["y"], b["w"], b["h"], rot_W, rot_H,
             )
             boxes.append({**b, "x": ux + x0, "y": uy + y0, "w": uw, "h": uh})
+        if IGNORE_REGIONS:
+            boxes = [
+                b for b in boxes
+                if not any(
+                    _point_in_polygon(
+                        (b["x"] + b["w"] * 0.5) / cam_W,
+                        (b["y"] + b["h"] * 0.5) / cam_H,
+                        region,
+                    )
+                    for region in IGNORE_REGIONS
+                )
+            ]
 
         wall_ms = int(time.time() * 1000)
         pts = int(frame.pts)

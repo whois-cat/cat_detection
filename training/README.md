@@ -206,6 +206,13 @@ just cluster-manifest detector-grey --min-score 0.7
 overrides: `EVENTS_DB`, `RECORDINGS_ROOT`, `CLUSTER_MANIFEST`, `RECORDING_TZ`,
 `--camera`, `--model`, `--clusters`, `--default-rotate-deg`.
 
+Static false positives can be masked before review. Add tight
+`ignore_regions` to `cameras.yaml` for objects like a feeder or bowl; detections
+whose box center falls inside those camera-normalized regions are dropped by
+the detector and by `build_cluster_manifest`. For one-off experiments, pass
+`--ignore-region grey:0.35,0.02,0.68,0.34`. Use tight regions so real cats next
+to the feeder are not removed.
+
 Embedding choice:
 
 - `--embedding auto` (default) uses cached ImageNet EfficientNet-B0 features
