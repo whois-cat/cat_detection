@@ -181,7 +181,7 @@ def _crop_rgb(crop_id: str) -> np.ndarray:
     return np.ascontiguousarray(crop_bgr[..., ::-1])
 
 
-def _select_cluster_items(cluster: dict, mode: str, limit: int) -> list[dict]:
+def _select_cluster_items(cluster: dict, mode: str, limit: int | None = None) -> list[dict]:
     members = [ITEMS[i] for i in cluster["item_indices"]]
     if mode == "outliers":
         members = list(reversed(members))
@@ -189,7 +189,7 @@ def _select_cluster_items(cluster: dict, mode: str, limit: int) -> list[dict]:
         rng = random.Random(int(cluster["cluster_id"]))
         members = members[:]
         rng.shuffle(members)
-    return members[:limit]
+    return members if limit is None else members[:limit]
 
 
 def _placeholder(text: str, size: int) -> Image.Image:
@@ -269,6 +269,38 @@ def api_sheet(cluster_id: int, mode: str = "representative",
         sheet.paste(tile, ((i % cols) * thumb, (i // cols) * thumb))
     buf = io.BytesIO()
     sheet.save(buf, format="JPEG", quality=88)
+    return Response(content=buf.getvalue(), media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/cluster/{cluster_id}/items")
+def api_cluster_items(cluster_id: int, mode: str = "representative") -> JSONResponse:
+    cluster = _cluster_by_id(cluster_id)
+    if cluster is None:
+        raise HTTPException(status_code=404, detail="unknown cluster")
+    if mode not in {"representative", "random", "outliers"}:
+        raise HTTPException(status_code=400, detail="bad mode")
+    reviews = _reviews_map()
+    items = []
+    for item in _select_cluster_items(cluster, mode, limit=None):
+        items.append({
+            "crop_id": item["crop_id"],
+            "camera": item["camera"],
+            "wall_ms": item["wall_ms"],
+            "score": item.get("score"),
+            "label": reviews.get(item["crop_id"]),
+        })
+    return JSONResponse({"cluster_id": cluster_id, "mode": mode, "items": items})
+
+
+@app.get("/api/crop/{crop_id:path}")
+def api_crop(crop_id: str, thumb: int = 144) -> Response:
+    if crop_id not in BY_ID:
+        raise HTTPException(status_code=404, detail="unknown crop")
+    thumb = max(80, min(260, int(thumb)))
+    img = _thumb(crop_id, thumb)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=88)
     return Response(content=buf.getvalue(), media_type="image/jpeg",
                     headers={"Cache-Control": "no-store"})
 

@@ -62,6 +62,17 @@ cluster-review PORT="8095":
     uv run --with-requirements review/requirements.txt \
         python -m uvicorn review.cluster_app:app --host 0.0.0.0 --port {{PORT}}
 
+# Rebuild detector events from recordings with offline YOLO. Useful when live
+# detector events are polluted by static false positives.
+rescan-recordings *ARGS:
+    {{COMPOSE}} run --rm --no-deps \
+        -e RECORDING_TZ="${RECORDING_TZ:-UTC}" \
+        -v "$PWD":/work -w /work {{CLUSTER_SERVICE}} \
+        python -m training.rescan_recordings \
+            --db "${EVENTS_DB:-data/events/events.db}" \
+            --recordings "${RECORDINGS_ROOT:-data/recordings}" \
+            {{ARGS}}
+
 # Train the identity classifier from reviewed labels. Args pass through.
 train-classifier *ARGS:
     uv run python -m training.train_classifier \

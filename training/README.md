@@ -202,6 +202,14 @@ REVIEW_LABELS=alisa,chuzh,ellie,felisis \
 just cluster-manifest --min-score 0.7
 ```
 
+If the live detector event pool is polluted by static false positives, rebuild
+review-only events from the recordings with the non-quantized YOLO path:
+
+```bash
+just rescan-recordings --conf 0.3 --imgsz 512 --sample-interval-sec 1
+just cluster-manifest --model offline-yolov8n --min-score 0.3 --clusters 80
+```
+
 `just cluster-manifest` writes `data/review/clusters.json` by default. Useful
 overrides: `EVENTS_DB`, `RECORDINGS_ROOT`, `CLUSTER_MANIFEST`, `RECORDING_TZ`,
 `--camera`, `--model`, `--clusters`, `--default-rotate-deg`.

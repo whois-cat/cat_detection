@@ -27,9 +27,14 @@
   .cluster.done { opacity:.65; }
   .cluster.child { margin-left:18px; width:calc(100% - 18px); }
   .cluster .status { color:var(--muted); font-size:12px; }
-  #stage { min-width:0; min-height:0; display:flex; align-items:center; justify-content:center; padding:16px; overflow:auto; }
-  #sheet { max-width:100%; max-height:100%; object-fit:contain; border-radius:6px; background:#08090d; }
-  #sheet.loading { opacity:.35; }
+  #stage { min-width:0; min-height:0; padding:16px; overflow:auto; }
+  #grid { min-height:100%; display:grid; grid-template-columns:repeat(auto-fill, minmax(132px, 1fr));
+          align-content:start; gap:10px; }
+  .crop { min-width:0; display:flex; flex-direction:column; gap:4px; padding:6px;
+          border-radius:6px; background:#08090d; border:1px solid #111521; }
+  .crop img { width:100%; aspect-ratio:1/1; object-fit:contain; display:block; border-radius:4px; background:#08090d; }
+  .crop small { color:var(--muted); font:11px/1.2 ui-monospace, monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #grid.loading { opacity:.35; }
   .mode { display:flex; gap:8px; }
   button { background:#1d2230; color:var(--fg); border:1px solid var(--line); border-radius:7px;
            padding:9px 11px; cursor:pointer; font:inherit; }
@@ -53,7 +58,7 @@
 </header>
 <main>
   <nav id="clusters"></nav>
-  <section id="stage"><img id="sheet" alt=""></section>
+  <section id="stage"><div id="grid"></div></section>
   <aside>
     <div class="meta">
       <b id="clusterName">cluster</b>
@@ -78,6 +83,7 @@ let M = null;
 let idx = 0;
 let mode = 'representative';
 let ACTIONS = [];
+let renderSeq = 0;
 
 async function load() {
   M = await (await fetch('/api/clusters')).json();
@@ -133,14 +139,45 @@ function render() {
 	      + (c.parent_id == null ? '' : ` · split from #${c.parent_id}`);
   document.getElementById('clusterStatus').textContent =
       c.status ? `status: ${c.status.status} ${c.status.label || ''}` : 'status: open';
-  const sheet = document.getElementById('sheet');
-  sheet.classList.add('loading');
-  sheet.onload = () => sheet.classList.remove('loading');
-  sheet.src =
-      `/api/cluster/${c.cluster_id}/sheet?mode=${mode}&limit=24&cols=6&thumb=128&t=${Date.now()}`;
+  renderGrid(c);
 }
 
 function setMode(next) { mode = next; render(); }
+
+async function renderGrid(c) {
+  const seq = ++renderSeq;
+  document.getElementById('stage').scrollTop = 0;
+  const grid = document.getElementById('grid');
+  grid.classList.add('loading');
+  grid.innerHTML = '';
+  const r = await fetch(`/api/cluster/${c.cluster_id}/items?mode=${mode}&t=${Date.now()}`);
+  if (seq !== renderSeq) return;
+  if (!r.ok) {
+    grid.innerHTML = '<div class="hint">failed to load cluster items</div>';
+    grid.classList.remove('loading');
+    return;
+  }
+  const data = await r.json();
+  if (seq !== renderSeq) return;
+  const frag = document.createDocumentFragment();
+  data.items.forEach((item, i) => {
+    const card = document.createElement('div');
+    card.className = 'crop';
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.alt = item.crop_id;
+    img.src = `/api/crop/${encodeURIComponent(item.crop_id)}?thumb=160`;
+    const meta = document.createElement('small');
+    const score = item.score == null ? '' : ` · ${(item.score * 100).toFixed(0)}%`;
+    meta.textContent = `${i + 1}/${data.items.length} · ${item.camera}${score}${item.label ? ` · ${item.label}` : ''}`;
+    card.appendChild(img);
+    card.appendChild(meta);
+    frag.appendChild(card);
+  });
+  grid.appendChild(frag);
+  grid.classList.remove('loading');
+}
 
 	async function choose(label) {
   const c = curr();

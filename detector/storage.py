@@ -57,6 +57,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE events ADD COLUMN cat_score REAL")
     if "rotate_deg" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN rotate_deg INTEGER")
+    if "source" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'detector'")
 
 
 def insert_event(conn: sqlite3.Connection, *,
