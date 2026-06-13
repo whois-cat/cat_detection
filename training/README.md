@@ -199,7 +199,7 @@ the browser.
 
 ```bash
 REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-just cluster-manifest detector-grey --min-score 0.7
+just cluster-manifest --min-score 0.7
 ```
 
 `just cluster-manifest` writes `data/review/clusters.json` by default. Useful

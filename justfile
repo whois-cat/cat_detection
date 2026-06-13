@@ -4,6 +4,7 @@ set dotenv-load := true
 
 COMPOSE := "docker compose -f docker-compose.yml -f docker-compose.cameras.yml"
 DEV_COMPOSE := COMPOSE + " -f docker-compose.dev.yml -f docker-compose.cameras.dev.yml"
+CLUSTER_SERVICE := env_var_or_default("CLUSTER_SERVICE", "detector-grey")
 
 default:
     @just --list
@@ -37,12 +38,13 @@ logs SERVICE="":
 review-setup:
     uv run --with-requirements review/requirements.txt python -c "import av, fastapi, numpy, PIL, uvicorn; print('review deps ok')"
 
-# Cold-start clustering manifest. SERVICE is a detector service, e.g. detector-grey.
+# Cold-start clustering manifest. Uses one detector container as the Python runtime.
+# Override CLUSTER_SERVICE only if detector-grey is not present.
 # Override REVIEW_LABELS/RECORDING_TZ; pass --embedding efficientnet if weights are cached.
-cluster-manifest SERVICE *ARGS:
+cluster-manifest *ARGS:
     {{COMPOSE}} run --rm --no-deps \
         -e RECORDING_TZ="${RECORDING_TZ:-UTC}" \
-        -v "$PWD":/work -w /work {{SERVICE}} \
+        -v "$PWD":/work -w /work {{CLUSTER_SERVICE}} \
         python -m training.build_cluster_manifest \
             --db "${EVENTS_DB:-data/events/events.db}" \
             --recordings "${RECORDINGS_ROOT:-data/recordings}" \

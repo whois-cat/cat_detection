@@ -17,6 +17,9 @@ from pathlib import Path
 import numpy as np
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 class VisualExtractor:
     name = "visual"
 
