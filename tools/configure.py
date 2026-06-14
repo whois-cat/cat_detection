@@ -47,6 +47,18 @@ def _flat_points(raw) -> list[float]:
     raise ValueError(f"unsupported region coordinates: {raw!r}")
 
 
+def _csv_coords(values: list[float]) -> str:
+    return ",".join(f"{v:g}" for v in values)
+
+
+def _decision_region_value(cam: dict):
+    return cam.get("decision_polygon", cam.get("action_polygon", "0,0,1,1"))
+
+
+def _detect_roi_value(cam: dict):
+    return cam.get("detect_roi", "0,0,1,1")
+
+
 def _polygon_from_value(raw) -> list[list[float]]:
     vals = _flat_points(raw)
     if len(vals) == 4:
@@ -60,6 +72,10 @@ def _polygon_from_value(raw) -> list[list[float]]:
         if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
             raise ValueError(f"region point out of [0,1]: {(x, y)!r}")
     return points
+
+
+def _polygon_env_value(raw) -> str:
+    return _csv_coords([coord for point in _polygon_from_value(raw) for coord in point])
 
 
 def _rect_from_value(raw) -> list[float]:
@@ -214,10 +230,10 @@ def render_compose(cfg: dict) -> str:
                 cam.get("classifier_min_conf", 0.5),
             ),
             "CLASSIFIER_PAD_FRAC": cam.get("classifier_pad_frac", 0.15),
-            "DETECT_ROI":          cam.get("detect_roi", "0,0,1,1"),
+            "DETECT_ROI":          _csv_coords(_rect_from_value(_detect_roi_value(cam))),
             "IGNORE_REGIONS":      json.dumps(cam.get("ignore_regions", [])),
             "IGNORE_REGION_MIN_COVERAGE": cam.get("ignore_region_min_coverage", 0.8),
-            "ACTION_POLYGON":      cam.get("action_polygon", "0,0,1,1"),
+            "ACTION_POLYGON":      _polygon_env_value(_decision_region_value(cam)),
             "FRAME_ROTATE_DEG":    cam.get("rotate_deg", 0),
             "EVENTS_DB":           "/data/events/events.db",
             "WS_PORT":             "8091",
@@ -377,8 +393,9 @@ def render_cameras_json(cfg: dict) -> str:
         {
             "id":    cam["id"],
             "label": cam.get("label", cam["id"].replace("-", " ").title()),
-            "detect_roi": _rect_from_value(cam.get("detect_roi", "0,0,1,1")),
-            "action_polygon": _polygon_from_value(cam.get("action_polygon", "0,0,1,1")),
+            "detect_roi": _rect_from_value(_detect_roi_value(cam)),
+            "action_polygon": _polygon_from_value(_decision_region_value(cam)),
+            "decision_polygon": _polygon_from_value(_decision_region_value(cam)),
             "ignore_regions": _ignore_regions_for_ui(cam),
             "ignore_region_min_coverage": cam.get("ignore_region_min_coverage", 0.8),
         }

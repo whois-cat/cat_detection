@@ -149,7 +149,7 @@
 
     // ROI overlays (drawn first so detection boxes sit on top). Only render
     // when the region is a sub-region of the frame; full-frame ROIs would just
-    // be a border. ACTION_ROI may be an arbitrary polygon (perspective).
+    // be a border. The feeder decision zone may be an arbitrary polygon.
     const FULL_RECT = (r) => r && r[0] === 0 && r[1] === 0 && r[2] === 1 && r[3] === 1;
     const FULL_POLY = (p) => p && p.length === 4
       && p[0][0] === 0 && p[0][1] === 0 && p[1][0] === 1 && p[1][1] === 0
@@ -208,7 +208,7 @@
     }
     if (actionPolygon && !FULL_POLY(actionPolygon)) {
       let minX = Infinity, minY = Infinity;
-      drawPath('#ffd454', 'ACTION', () => {
+      drawPath('#ffd454', 'DECISION', () => {
         actionPolygon.forEach(([x, y], i) => {
           const px = x * canvas.width, py = y * canvas.height;
           if (px < minX) minX = px;
@@ -436,7 +436,8 @@
       if (ev.kind === 'stats') {
         stats = ev;
         if (Array.isArray(ev.detect_roi) && ev.detect_roi.length === 4) detectRoi = ev.detect_roi;
-        if (Array.isArray(ev.action_polygon) && ev.action_polygon.length >= 3) actionPolygon = ev.action_polygon;
+        const decision = ev.decision_polygon || ev.action_polygon;
+        if (Array.isArray(decision) && decision.length >= 3) actionPolygon = decision;
         if (Array.isArray(ev.ignore_regions)) ignoreRegions = ev.ignore_regions;
         return;
       }
@@ -463,8 +464,9 @@
     detectRoi = Array.isArray(cam?.detect_roi) && cam.detect_roi.length === 4
       ? cam.detect_roi
       : null;
-    actionPolygon = Array.isArray(cam?.action_polygon) && cam.action_polygon.length >= 3
-      ? cam.action_polygon
+    const decision = cam?.decision_polygon || cam?.action_polygon;
+    actionPolygon = Array.isArray(decision) && decision.length >= 3
+      ? decision
       : null;
     ignoreRegions = Array.isArray(cam?.ignore_regions) ? cam.ignore_regions : [];
   }

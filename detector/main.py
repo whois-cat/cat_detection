@@ -22,6 +22,7 @@ Also broadcast on the same WS, identified by `kind` field:
    "active_tracks": int, "camera_id": str, "model": str,
    "detect_roi": [x0,y0,x1,y1],
    "action_polygon": [[x,y], ...],
+   "decision_polygon": [[x,y], ...],  # alias of action_polygon
    "ignore_regions": [{"name": str, "points": [[x,y], ...]}]}
 
 Storage: SQLite at /data/events/events.db (one row per detection box).
@@ -47,9 +48,20 @@ RTSP_SOURCE   = os.environ["RTSP_SOURCE"]
 CAMERA_ID     = os.environ.get("CAMERA_ID", "default")
 DETECTOR_TYPE = os.environ.get("DETECTOR_TYPE", "blob")
 
+
+def _parse_coord_values(raw: str) -> list[float]:
+    raw = raw.strip()
+    if raw.startswith("["):
+        data = json.loads(raw)
+        if data and all(isinstance(v, (list, tuple)) for v in data):
+            return [float(x) for pair in data for x in pair]
+        return [float(v) for v in data]
+    return [float(v.strip()) for v in raw.split(",") if v.strip()]
+
+
 def _parse_rect(env_name: str) -> tuple[float, float, float, float]:
     raw = os.environ.get(env_name, "0,0,1,1")
-    parts = tuple(float(v) for v in raw.split(","))
+    parts = tuple(_parse_coord_values(raw))
     assert len(parts) == 4, f"{env_name} must be x0,y0,x1,y1"
     return parts  # type: ignore[return-value]
 
@@ -58,7 +70,7 @@ def _parse_polygon(env_name: str) -> list[tuple[float, float]]:
     """Parse a polygon from a flat comma-separated list of fractional coords.
     4 values = axis-aligned rect (expanded to 4 vertices); >4 = explicit polygon."""
     raw = os.environ.get(env_name, "0,0,1,1")
-    vals = [float(v) for v in raw.split(",")]
+    vals = _parse_coord_values(raw)
     assert len(vals) >= 4 and len(vals) % 2 == 0, \
         f"{env_name} must be an even number of fractional coords (>=4)"
     if len(vals) == 4:
@@ -507,6 +519,7 @@ async def stats_task():
             # its native (camera) orientation, so these draw directly.
             "detect_roi":     list(DETECT_ROI),
             "action_polygon": [[x, y] for x, y in ACTION_POLYGON],
+            "decision_polygon": [[x, y] for x, y in ACTION_POLYGON],
             "ignore_regions": [
                 {
                     "name": region["name"],

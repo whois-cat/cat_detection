@@ -38,6 +38,9 @@
 #                           training  train_classifier     --pad-frac
 #                         Change all three together or not at all.
 #   rotate_deg      — internal-to-model rotation, 0/90/180/270.
+#                     All zones below are still drawn in the camera/UI image
+#                     orientation, not in the rotated model input. Different
+#                     camera angles should have different per-camera zones.
 #   detect_roi      — camera-coord rectangle, "x0,y0,x1,y1" in [0..1].
 #   ignore_regions  — optional detector false-positive masks in camera coords.
 #                     Detections are dropped before events/review/training only
@@ -53,7 +56,19 @@
 #                           rect: [0.35, 0.02, 0.68, 0.34]
 #                         - name: left_fixture
 #                           points: [[0.0,0.4], [0.1,0.4], [0.1,0.8], [0.0,0.8]]
-#   action_polygon  — camera-coord polygon (rect or N-vertex; see .env.example).
+#   decision_polygon — camera-coord polygon where feeder decisions are allowed.
+#                     Detections outside it are still shown/recorded, but the
+#                     feeder treats them as out-of-zone and will not open from
+#                     them. Preferred name; legacy live2 alias: action_polygon.
+#                     Define this separately for each camera angle. Coordinates
+#                     are normalized fractions of that camera's UI image:
+#                     x=0 left, x=1 right, y=0 top, y=1 bottom.
+#                     Shapes can be a rect [x0,y0,x1,y1] or N points:
+#                       decision_polygon:
+#                         - [0.10, 0.20]
+#                         - [0.85, 0.20]
+#                         - [0.85, 0.95]
+#                         - [0.10, 0.95]
 #   blob_bright_threshold, blob_min_area — for DETECTOR_TYPE=blob.
 #   artificial_delay_ms — initial value for the UI delay slider.
 #
@@ -102,6 +117,11 @@ cameras:
     rtsp: rtsp://192.168.0.214:554/stream1
     detector_type: yolo_cat
     rotate_deg: 0
+    decision_polygon:
+      - [0.10, 0.20]
+      - [0.85, 0.20]
+      - [0.85, 0.95]
+      - [0.10, 0.95]
     feeder:
       id: feeder1
       api_base_url: http://192.168.0.100
