@@ -31,6 +31,10 @@ class FeederClient:
         import httpx
 
         url = f"{self._base}{path}"
+        def body_preview(resp) -> str:
+            text = (resp.text or "").strip()
+            return f" body={text[:200]!r}" if text else ""
+
         for attempt in range(2):
             try:
                 if json_body is None:
@@ -41,14 +45,19 @@ class FeederClient:
                     return True
                 if 400 <= resp.status_code < 500:
                     print(
-                        f"[feeder={self._fid}] POST {path} → {resp.status_code} (4xx, no retry)",
+                        f"[feeder={self._fid}] POST {path} → {resp.status_code}"
+                        f" (4xx, no retry){body_preview(resp)}",
                         flush=True,
                     )
                     return False
                 if attempt == 0:
                     time.sleep(_RETRY_BACKOFF_SEC)
                     continue
-                print(f"[feeder={self._fid}] POST {path} → {resp.status_code}", flush=True)
+                print(
+                    f"[feeder={self._fid}] POST {path} → {resp.status_code}"
+                    f"{body_preview(resp)}",
+                    flush=True,
+                )
                 return False
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 if attempt == 0:
@@ -89,6 +98,8 @@ class FeederClient:
         )
         if ok:
             print(f"[feeder={self._fid}] display text: {text!r}", flush=True)
+        else:
+            print(f"[feeder={self._fid}] display text failed: {text!r}", flush=True)
         return ok
 
     @property

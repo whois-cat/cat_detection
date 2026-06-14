@@ -207,12 +207,19 @@ review-only events from the recordings with the non-quantized YOLO path:
 
 ```bash
 just rescan-recordings --conf 0.3 --imgsz 512 --sample-interval-sec 1
-just cluster-manifest --model offline-yolov8n --min-score 0.3 --clusters 80
+just cluster-manifest --model offline-yolov8n --min-score 0.5 --clusters 100
 ```
 
 `just cluster-manifest` writes `data/review/clusters.json` by default. Useful
 overrides: `EVENTS_DB`, `RECORDINGS_ROOT`, `CLUSTER_MANIFEST`, `RECORDING_TZ`,
 `--camera`, `--model`, `--clusters`, `--default-rotate-deg`.
+
+The manifest builder intentionally keeps the review set compact. By default it
+drops near-identical crops within a 15-second per-camera window and caps each
+cluster at 96 diverse examples (`--dedupe-window-sec`, `--dedupe-threshold`,
+`--max-cluster-size`). This avoids browser-heavy clusters with hundreds of
+nearly identical feeder frames. Use `--max-cluster-size 0` only when you really
+want every crop in the review UI.
 
 Static false positives can be masked before review. Add tight
 `ignore_regions` to `cameras.yaml` for objects like a feeder or bowl; detections

@@ -42,7 +42,8 @@ Env vars (all from configure.py — nothing hardcoded):
                           the door opens (default 3)
   MULTI_DEBOUNCE_SEC      a multi_cat / identity-change condition must hold this
                           long before an open door closes (default 2)
-  DISPLAY_TEXT_INTERVAL   seconds for feeder display text update (default 2)
+  DISPLAY_TEXT_INTERVAL   seconds the feeder display should keep each text update
+                          visible; refreshed while the door is open (default 2)
 """
 from __future__ import annotations
 
@@ -79,7 +80,7 @@ PRESENCE_WINDOW_SEC    = float(os.environ.get("PRESENCE_WINDOW_SEC", "5"))
 CLASSIFIER_MIN_CONF    = float(os.environ.get("CLASSIFIER_MIN_CONF", "0.9"))
 OPEN_DEBOUNCE_SEC      = float(os.environ.get("OPEN_DEBOUNCE_SEC", "3"))
 MULTI_DEBOUNCE_SEC     = float(os.environ.get("MULTI_DEBOUNCE_SEC", "2"))
-DISPLAY_TEXT_INTERVAL  = int(os.environ.get("DISPLAY_TEXT_INTERVAL", "2"))
+DISPLAY_TEXT_INTERVAL  = max(1, int(os.environ.get("DISPLAY_TEXT_INTERVAL", "2")))
 
 WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 
@@ -89,6 +90,27 @@ _zone: ZoneState
 _fsm: DoorFSM
 _last_event_monotonic: float | None = None
 _last_event_wall_t: float | None = None
+_last_display_monotonic: float | None = None
+_last_display_cat: str | None = None
+
+
+def _refresh_display_text(client: FeederClient, cat: str | None, *, force: bool = False) -> None:
+    """Keep the feeder display showing the cat the door is open for."""
+    global _last_display_monotonic, _last_display_cat
+    if not cat:
+        return
+    now = time.monotonic()
+    refresh_after = max(1.0, DISPLAY_TEXT_INTERVAL * 0.75)
+    if (
+        not force
+        and _last_display_cat == cat
+        and _last_display_monotonic is not None
+        and now - _last_display_monotonic < refresh_after
+    ):
+        return
+    if client.set_display_text(cat, DISPLAY_TEXT_INTERVAL):
+        _last_display_cat = cat
+        _last_display_monotonic = now
 
 
 def _handle_event(
@@ -124,7 +146,7 @@ def _handle_event(
     if cmd.kind == "open":
         if client.set_door("open", cmd.reason):
             _fsm.confirm_open(cmd.cat, wall_t)
-            client.set_display_text(cmd.cat, DISPLAY_TEXT_INTERVAL)
+            _refresh_display_text(client, cmd.cat, force=True)
             print(f"[feeder={FEEDER_ID}] door opened: cat={cmd.cat}", flush=True)
 
     elif cmd.kind == "close":
@@ -141,6 +163,8 @@ def _handle_event(
             _fsm.confirm_close()
 
     # cmd.kind is None: arming / latch hold / closing debounce — no door change.
+    if _fsm.state in {"open", "closing"}:
+        _refresh_display_text(client, _fsm.door_cat)
 
 
 def _fail_safe_close(client: FeederClient, cooldown: CooldownState, reason: str) -> None:

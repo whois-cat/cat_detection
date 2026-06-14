@@ -176,6 +176,84 @@ def dedupe_nearby(items: list[dict], x: np.ndarray, *, window_sec: float,
     return [items[i] for i in keep], x[keep], dropped
 
 
+def thin_cluster_members(
+    members: list[int],
+    items: list[dict],
+    *,
+    max_size: int,
+    seed: int,
+    cluster_id: int,
+) -> tuple[list[int], int]:
+    """Keep a compact, useful review sample from a large cluster.
+
+    We keep center-near examples for fast bulk labelling, a few outliers so
+    mixed clusters remain visible, and time-spread samples so a long static
+    sequence does not collapse to only adjacent frames.
+    """
+    if max_size <= 0 or len(members) <= max_size:
+        return members, 0
+
+    by_distance = sorted(members, key=lambda i: float(items[i].get("distance", 0.0)))
+    selected: list[int] = []
+    selected_set: set[int] = set()
+
+    def add(indices: list[int]) -> None:
+        for i in indices:
+            if len(selected) >= max_size:
+                return
+            if i not in selected_set:
+                selected.append(i)
+                selected_set.add(i)
+
+    center_quota = max(1, int(max_size * 0.55))
+    outlier_quota = max(1, int(max_size * 0.15))
+    add(by_distance[:center_quota])
+    add(list(reversed(by_distance[-outlier_quota:])))
+
+    remaining = [
+        i for i in sorted(members, key=lambda j: (items[j]["camera"], items[j]["wall_ms"]))
+        if i not in selected_set
+    ]
+    slots = max_size - len(selected)
+    if slots > 0 and remaining:
+        if len(remaining) <= slots:
+            add(remaining)
+        else:
+            step = len(remaining) / slots
+            spread = [remaining[min(len(remaining) - 1, int((n + 0.5) * step))]
+                      for n in range(slots)]
+            add(spread)
+
+    if len(selected) < max_size:
+        rng = np.random.default_rng(seed + cluster_id)
+        rest = [i for i in members if i not in selected_set]
+        if rest:
+            shuffled = [rest[i] for i in rng.permutation(len(rest)).tolist()]
+            add(shuffled)
+
+    selected.sort(key=lambda i: float(items[i].get("distance", 0.0)))
+    return selected, len(members) - len(selected)
+
+
+def compact_items_to_clusters(
+    items: list[dict],
+    clusters: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    used = sorted({int(i) for cluster in clusters for i in cluster["item_indices"]})
+    old_to_new = {old: new for new, old in enumerate(used)}
+    compacted_items = [items[i] for i in used]
+    compacted_clusters = []
+    for cluster in clusters:
+        c = dict(cluster)
+        c["item_indices"] = [old_to_new[int(i)] for i in cluster["item_indices"]]
+        c["representatives"] = [
+            compacted_items[i]["crop_id"] for i in c["item_indices"][:24]
+        ]
+        c["size"] = len(c["item_indices"])
+        compacted_clusters.append(c)
+    return compacted_items, compacted_clusters
+
+
 def kmeans(x: np.ndarray, k: int, *, seed: int, max_iter: int) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     n = x.shape[0]
@@ -240,11 +318,13 @@ def main() -> None:
                     help="allow torchvision to download EfficientNet weights")
     ap.add_argument("--no-store-embeddings", action="store_true",
                     help="smaller manifest, but disables split-cluster in review UI")
-    ap.add_argument("--dedupe-window-sec", type=float, default=2.0,
+    ap.add_argument("--dedupe-window-sec", type=float, default=15.0,
                     help="drop near-identical crops within this per-camera window; "
                          "0 disables")
     ap.add_argument("--dedupe-threshold", type=float, default=0.995,
                     help="cosine similarity threshold for duplicate crops")
+    ap.add_argument("--max-cluster-size", type=int, default=96,
+                    help="max crops kept per cluster after clustering; 0 disables")
     ap.add_argument("--ignore-config", type=Path, default=ROOT / "cameras.yaml",
                     help="camera config with ignore_regions (default: cameras.yaml)")
     ap.add_argument("--no-ignore-config", action="store_true",
@@ -393,14 +473,26 @@ def main() -> None:
             items[i]["cluster"] = new
 
     clusters = []
+    thinned_by_cluster = 0
     for cluster_id, members in sorted(remapped.items()):
         members.sort(key=lambda i: items[i]["distance"])
+        members, dropped = thin_cluster_members(
+            members,
+            items,
+            max_size=args.max_cluster_size,
+            seed=args.seed,
+            cluster_id=cluster_id,
+        )
+        thinned_by_cluster += dropped
         clusters.append({
             "cluster_id": cluster_id,
             "size": len(members),
             "item_indices": members,
             "representatives": [items[i]["crop_id"] for i in members[:24]],
         })
+    if thinned_by_cluster:
+        items, clusters = compact_items_to_clusters(items, clusters)
+        print(f"[cluster] dropped {thinned_by_cluster} excess crops from large clusters")
 
     labels_hint = [v.strip() for v in args.labels.split(",") if v.strip()]
     out = {
@@ -419,6 +511,8 @@ def main() -> None:
             "dedupe_window_sec": args.dedupe_window_sec,
             "dedupe_threshold": args.dedupe_threshold,
             "deduped": deduped,
+            "max_cluster_size": args.max_cluster_size,
+            "thinned_by_cluster": thinned_by_cluster,
             "ignored_by_region": ignored_by_region,
             "ignore_region_min_coverage": args.ignore_region_min_coverage,
             "ignore_regions": regions_to_jsonable(ignore_regions),
