@@ -28,6 +28,8 @@
   let pc, ws;
   let recentLive = [];
   let seekTimer = 0;
+  let wsReconnectTimer = 0;
+  let connectionSeq = 0;
   let nowTimer = 0;
   let _prevMode = 'live';
   // Wall-clock at t=0 of the loaded fMP4 stream. mediamtx /get?start=T
@@ -120,11 +122,50 @@
   const OVERLAY_MAX_AGE_MS = 1500;
   const BOX_RGB = [0, 255, 136];
   const BOX_STROKE = `rgb(${BOX_RGB.join(',')})`;
+  const IGNORE_STROKE = '#ff6b6b';
+  const IGNORE_FILL = 'rgba(255,107,107,0.14)';
+  const IGNORE_TEXT = '#ff8f8f';
+  const FOOD_STROKE = '#c084fc';
+  const FOOD_FILL = 'rgba(192,132,252,0.13)';
+  const FOOD_TEXT = '#ddd6fe';
+  const DETECT_STROKE = '#5ec8ff';
+  const DECISION_STROKE = '#ffd454';
   const BOX_SHADOW = (() => {
     const [r, g, b] = BOX_RGB;
     const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
     return lum > 0.5 ? 'rgba(0,0,0,0.85)' : 'rgba(255,255,255,0.85)';
   })();
+
+  function syncCanvasSize() {
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth || canvas.width || 1;
+    const height = canvas.clientHeight || canvas.height || 1;
+    const pxW = Math.max(1, Math.round(width * dpr));
+    const pxH = Math.max(1, Math.round(height * dpr));
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    return { ctx, width, height };
+  }
+
+  function videoContentRect(video, width, height) {
+    const vw = video?.videoWidth || 0;
+    const vh = video?.videoHeight || 0;
+    if (!vw || !vh) return { x: 0, y: 0, w: width, h: height };
+    const scale = Math.min(width / vw, height / vh);
+    const w = vw * scale;
+    const h = vh * scale;
+    return {
+      x: (width - w) / 2,
+      y: (height - h) / 2,
+      w,
+      h,
+    };
+  }
 
   function isSoftFoodRegionName(name) {
     const tokens = String(name || '').toLowerCase().replaceAll('-', '_').replaceAll(' ', '_').split('_');
@@ -174,12 +215,8 @@
     if (!canvas) return;
     const v = mode === 'live' ? liveVideo : historyVideo;
     if (!v) return;
-    const vw = v.videoWidth, vh = v.videoHeight;
-    if (vw && (canvas.width !== vw || canvas.height !== vh)) {
-      canvas.width = vw; canvas.height = vh;
-    }
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const { ctx, width, height } = syncCanvasSize();
+    const frameRect = videoContentRect(v, width, height);
 
     // ROI overlays (drawn first so detection boxes sit on top). Only render
     // when the region is a sub-region of the frame; full-frame ROIs would just
@@ -189,7 +226,7 @@
       && p[0][0] === 0 && p[0][1] === 0 && p[1][0] === 1 && p[1][1] === 0
       && p[2][0] === 1 && p[2][1] === 1 && p[3][0] === 0 && p[3][1] === 1;
 
-    const drawPolygonRegion = (region, label = 'IGNORE', stroke = '#ff6b6b', fill = 'rgba(255,107,107,0.14)', text = '#ff8f8f') => {
+    const drawPolygonRegion = (region, label = 'IGNORE', stroke = IGNORE_STROKE, fill = IGNORE_FILL, text = IGNORE_TEXT) => {
       const pts = Array.isArray(region?.points) ? region.points : region;
       if (!Array.isArray(pts) || pts.length < 3) return;
       let minX = Infinity, minY = Infinity;
@@ -200,7 +237,8 @@
       ctx.fillStyle = fill;
       ctx.beginPath();
       pts.forEach(([x, y], i) => {
-        const px = x * canvas.width, py = y * canvas.height;
+        const px = frameRect.x + x * frameRect.w;
+        const py = frameRect.y + y * frameRect.h;
         if (px < minX) minX = px;
         if (py < minY) minY = py;
         if (i === 0) ctx.moveTo(px, py);
@@ -236,24 +274,27 @@
       drawPolygonRegion(
         { name: foodRegionName, points: foodRegion },
         'FOOD',
-        '#34d399',
-        'rgba(52,211,153,0.12)',
-        '#86efac',
+        FOOD_STROKE,
+        FOOD_FILL,
+        FOOD_TEXT,
       );
     }
     if (detectRoi && !FULL_RECT(detectRoi)) {
       const [x0, y0, x1, y1] = detectRoi;
-      const rx = x0 * canvas.width, ry = y0 * canvas.height;
-      const rw = (x1 - x0) * canvas.width, rh = (y1 - y0) * canvas.height;
-      drawPath('#5ec8ff', 'DETECT',
+      const rx = frameRect.x + x0 * frameRect.w;
+      const ry = frameRect.y + y0 * frameRect.h;
+      const rw = (x1 - x0) * frameRect.w;
+      const rh = (y1 - y0) * frameRect.h;
+      drawPath(DETECT_STROKE, 'DETECT',
         () => ctx.rect(rx, ry, rw, rh),
         [rx, ry]);
     }
     if (actionPolygon && !FULL_POLY(actionPolygon)) {
       let minX = Infinity, minY = Infinity;
-      drawPath('#ffd454', 'DECISION', () => {
+      drawPath(DECISION_STROKE, 'DECISION', () => {
         actionPolygon.forEach(([x, y], i) => {
-          const px = x * canvas.width, py = y * canvas.height;
+          const px = frameRect.x + x * frameRect.w;
+          const py = frameRect.y + y * frameRect.h;
           if (px < minX) minX = px;
           if (py < minY) minY = py;
           if (i === 0) ctx.moveTo(px, py);
@@ -281,7 +322,8 @@
 
     const ageMs = Math.max(0, referenceMs - ev.wall_ms);
     if (ageMs > OVERLAY_MAX_AGE_MS) return;
-    const sx = canvas.width / ev.w, sy = canvas.height / ev.h;
+    const sx = frameRect.w / ev.w;
+    const sy = frameRect.h / ev.h;
     const dashFactor = 1 - ageMs / OVERLAY_MAX_AGE_MS;
     const segLen = 14;
     ctx.setLineDash(segLen * (1 - dashFactor) > 0.5 ? [segLen * dashFactor, segLen - segLen * dashFactor] : []);
@@ -292,14 +334,14 @@
     ctx.shadowColor = BOX_SHADOW;
     ctx.shadowBlur = 6;
     for (const b of ev.boxes) {
-      ctx.fillRect(b.x * sx, b.y * sy, b.w * sx, b.h * sy);
-      ctx.strokeRect(b.x * sx, b.y * sy, b.w * sx, b.h * sy);
+      ctx.fillRect(frameRect.x + b.x * sx, frameRect.y + b.y * sy, b.w * sx, b.h * sy);
+      ctx.strokeRect(frameRect.x + b.x * sx, frameRect.y + b.y * sy, b.w * sx, b.h * sy);
     }
     ctx.setLineDash([]);
     ctx.fillStyle = BOX_STROKE;
     for (const b of ev.boxes) {
       ctx.fillText(`${ev.cat || 'blob'}  age ${ageMs.toFixed(0)}ms`,
-                   b.x * sx + 4, b.y * sy - 6);
+                   frameRect.x + b.x * sx + 4, frameRect.y + b.y * sy - 6);
     }
     ctx.shadowColor = 'transparent';
     ctx.shadowBlur = 0;
@@ -312,28 +354,42 @@
 
   // ---- WebRTC (WHEP) ----
   // mediamtx exposes WHEP at /<path>/whep — standard SDP offer/answer over HTTP.
-  async function startWebRTC() {
-    pc = new RTCPeerConnection({ iceServers: [] });
-    pc.addTransceiver('video', { direction: 'recvonly' });
-    pc.ontrack = (e) => {
+  async function startWebRTC(seq = connectionSeq) {
+    const id = cameraId;
+    if (!id) return;
+    const nextPc = new RTCPeerConnection({ iceServers: [] });
+    pc = nextPc;
+    nextPc.addTransceiver('video', { direction: 'recvonly' });
+    nextPc.ontrack = (e) => {
+      if (seq !== connectionSeq || nextPc !== pc) return;
       if (e.track.kind !== 'video') return;
       if (!liveVideo.srcObject) liveVideo.srcObject = new MediaStream();
       liveVideo.srcObject.addTrack(e.track);
       liveVideo.play().catch(() => {});
     };
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    const resp = await fetch(`/whep/${cameraId}/whep`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/sdp' },
-      body: offer.sdp,
-    });
-    if (!resp.ok) {
-      console.error('[webrtc] WHEP signalling failed', resp.status, await resp.text());
-      return;
+    try {
+      const offer = await nextPc.createOffer();
+      if (seq !== connectionSeq || nextPc !== pc) return nextPc.close();
+      await nextPc.setLocalDescription(offer);
+      const resp = await fetch(`/whep/${id}/whep`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/sdp' },
+        body: offer.sdp,
+      });
+      if (seq !== connectionSeq || nextPc !== pc) return nextPc.close();
+      if (!resp.ok) {
+        console.error('[webrtc] WHEP signalling failed', resp.status, await resp.text());
+        return;
+      }
+      const answerSdp = await resp.text();
+      if (seq !== connectionSeq || nextPc !== pc) return nextPc.close();
+      await nextPc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    } catch (e) {
+      if (seq === connectionSeq && nextPc === pc) {
+        console.warn('[webrtc] start failed', e);
+      }
+      try { nextPc.close(); } catch {}
     }
-    const answerSdp = await resp.text();
-    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
   }
 
   // ---- History playback (via mediamtx /recordings/get) ----
@@ -470,11 +526,15 @@
   }
 
   // ---- WS live event stream ----
-  function startWS() {
-    if (!cameraId) return;
+  function startWS(seq = connectionSeq) {
+    const id = cameraId;
+    if (!id) return;
+    clearTimeout(wsReconnectTimer);
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/detector/${cameraId}/ws`);
-    ws.onmessage = (m) => {
+    const nextWs = new WebSocket(`${proto}//${location.host}/detector/${id}/ws`);
+    ws = nextWs;
+    nextWs.onmessage = (m) => {
+      if (seq !== connectionSeq || nextWs !== ws) return;
       const ev = JSON.parse(m.data);
       if (ev.kind === 'stats') {
         stats = ev;
@@ -488,7 +548,10 @@
       recentLive.push(ev);
       if (recentLive.length > 40) recentLive.shift();
     };
-    ws.onclose = () => setTimeout(startWS, 1000);
+    nextWs.onclose = () => {
+      if (seq !== connectionSeq || nextWs !== ws) return;
+      wsReconnectTimer = setTimeout(() => startWS(seq), 1000);
+    };
   }
 
   async function loadModels() {
@@ -610,12 +673,19 @@
 
   // Switch to a different camera at runtime. Tears down per-camera state
   // (WS, WebRTC, history events, ranges) and re-bootstraps for the new id.
-  async function switchCamera(newId) {
+  function switchCamera(newId) {
     if (newId === cameraId) return;
+    const seq = ++connectionSeq;
     cameraId = newId;
+    clearTimeout(wsReconnectTimer);
     try { ws && ws.close(); } catch {}
+    ws = null;
     try { pc && pc.close(); } catch {}
     pc = null;
+    if (liveVideo?.srcObject) {
+      for (const track of liveVideo.srcObject.getTracks()) track.stop();
+      liveVideo.srcObject = null;
+    }
     allEvents = [];
     recentLive = [];
     hlsRanges = [];
@@ -624,18 +694,22 @@
     availableModels = [];
     selectedModel = '';
     // Reset playback so a stale historyVideo.src can't fight us.
-    if (historyVideo) historyVideo.removeAttribute('src');
+    if (historyVideo) {
+      historyVideo.pause();
+      historyVideo.removeAttribute('src');
+      historyVideo.load();
+    }
     playbackWindowStartMs = 0;
     playbackWindowEndMs   = 0;
     // Persist in URL hash without disturbing other keys.
     const params = new URLSearchParams(location.hash.slice(1));
     params.set('camera', newId);
     history.replaceState(null, '', '#' + params.toString());
-    startWS();
+    startWS(seq);
     loadModels();
     loadHistory();
     refreshRecordingsList();
-    await startWebRTC();
+    startWebRTC(seq);
   }
 
   onMount(async () => {
@@ -647,7 +721,7 @@
     refreshRecordingsList();
     // Don't pre-load playback — wait until the user actually enters
     // history mode. Saves a 15-min fetch on every page load.
-    await startWebRTC();
+    startWebRTC(connectionSeq);
     nowTimer = setInterval(tickNow, 1000);
     rangesTimer = setInterval(refreshRecordingsList, 30_000);
     modelsTimer = setInterval(loadModels, 60_000);
@@ -657,6 +731,7 @@
     clearInterval(nowTimer);
     clearInterval(rangesTimer);
     clearInterval(modelsTimer);
+    clearTimeout(wsReconnectTimer);
     try { ws && ws.close(); } catch {}
     try { pc && pc.close(); } catch {}
   });
@@ -736,6 +811,13 @@
                onpause={() => historyPaused = true}
                hidden={mode !== 'history'}></video>
         <canvas bind:this={canvas} ondblclick={toggleVideoFullscreen}></canvas>
+        <div class="overlay-legend" aria-label="Overlay legend">
+          <div class="legend-row"><span class="legend-swatch cat"></span><span>cat</span></div>
+          <div class="legend-row"><span class="legend-swatch decision"></span><span>decision</span></div>
+          <div class="legend-row"><span class="legend-swatch detect"></span><span>detect</span></div>
+          <div class="legend-row"><span class="legend-swatch food"></span><span>food</span></div>
+          <div class="legend-row"><span class="legend-swatch ignore"></span><span>ignore</span></div>
+        </div>
         {#if mode === 'history' && inGap}
           <div class="history-overlay">
             <div>no recording at this time</div>
@@ -824,6 +906,42 @@
     pointer-events: none;
     background: transparent;
   }
+  .overlay-legend {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 5;
+    gap: 0.35rem;
+    padding: 0.55rem 0.65rem;
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 4px;
+    background: rgba(12,14,18,0.72);
+    color: #e5e7eb;
+    font: 600 0.78rem/1.1 system-ui, sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    pointer-events: none;
+    backdrop-filter: blur(6px);
+  }
+  .legend-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    white-space: nowrap;
+  }
+  .legend-swatch {
+    width: 0.9rem;
+    height: 0.9rem;
+    border: 2px solid currentColor;
+    background: rgba(255,255,255,0.08);
+    flex: 0 0 auto;
+  }
+  .legend-swatch.cat { color: rgb(0,255,136); }
+  .legend-swatch.decision { color: #ffd454; border-style: dashed; }
+  .legend-swatch.detect { color: #5ec8ff; border-style: dashed; }
+  .legend-swatch.food { color: #c084fc; border-style: dashed; background: rgba(192,132,252,0.13); }
+  .legend-swatch.ignore { color: #ff6b6b; border-style: dashed; background: rgba(255,107,107,0.14); }
   .history-overlay {
     position: absolute; inset: 0;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -889,4 +1007,5 @@
     object-fit: contain;
   }
   .app:fullscreen .wrap canvas { position: absolute; inset: 0; }
+  .app:fullscreen .overlay-legend { display: grid; }
 </style>
