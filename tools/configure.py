@@ -38,6 +38,11 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def _flat_points(raw) -> list[float]:
+    if isinstance(raw, dict):
+        coords = raw.get("rect", raw.get("points", raw.get("polygon")))
+        if coords is None:
+            raise ValueError("region dict must define rect, points, or polygon")
+        return _flat_points(coords)
     if isinstance(raw, str):
         return [float(v.strip()) for v in raw.split(",") if v.strip()]
     if isinstance(raw, (list, tuple)):
@@ -91,7 +96,10 @@ def _food_region_value(cam: dict):
 
 
 def _food_region_name(cam: dict) -> str:
-    if cam.get("food_region") is not None:
+    explicit = cam.get("food_region")
+    if isinstance(explicit, dict):
+        return str(explicit.get("name") or "bowl")
+    if explicit is not None:
         return "bowl"
     for i, raw in enumerate(cam.get("ignore_regions", []) or []):
         if _is_soft_food_region_name(_region_name(cam, raw, i)):
