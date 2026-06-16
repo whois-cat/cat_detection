@@ -81,6 +81,19 @@ CLASSIFIER_MIN_CONF    = float(os.environ.get("CLASSIFIER_MIN_CONF", "0.9"))
 OPEN_DEBOUNCE_SEC      = float(os.environ.get("OPEN_DEBOUNCE_SEC", "3"))
 MULTI_DEBOUNCE_SEC     = float(os.environ.get("MULTI_DEBOUNCE_SEC", "2"))
 DISPLAY_TEXT_INTERVAL  = max(1, int(os.environ.get("DISPLAY_TEXT_INTERVAL", "2")))
+# Show the open-cat name ONCE on open with a long interval that covers the whole
+# expected meal, instead of re-pushing it every ~1.5s (that display spam flooded
+# the bridge and starved door commands). If the hardware caps the interval and
+# lets the name fade, fall back to a slow refresh no more than once per
+# DISPLAY_REFRESH_MIN_SEC — and never on an event that also issues a door command
+# (the door always has priority over the display bridge).
+DISPLAY_OPEN_INTERVAL   = max(DISPLAY_TEXT_INTERVAL, int(DOOR_CLOSE_TIMEOUT_SEC))
+DISPLAY_REFRESH_MIN_SEC = float(os.environ.get("DISPLAY_REFRESH_MIN_SEC", "25"))
+# Backstop against a permanent clamp: if door/close keeps failing for one open
+# episode (this many attempts in a row OR this many seconds), assume the actuator
+# has physically closed and disarm the FSM so the next cat can be served.
+CLOSE_BACKSTOP_MAX_ATTEMPTS = max(1, int(os.environ.get("CLOSE_BACKSTOP_MAX_ATTEMPTS", "3")))
+CLOSE_BACKSTOP_MAX_SEC      = float(os.environ.get("CLOSE_BACKSTOP_MAX_SEC", "30"))
 
 WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 
@@ -92,25 +105,72 @@ _last_event_monotonic: float | None = None
 _last_event_wall_t: float | None = None
 _last_display_monotonic: float | None = None
 _last_display_cat: str | None = None
+# Backstop bookkeeping for the currently-open episode.
+_close_fail_count: int = 0
+_close_fail_since: float | None = None
 
 
-def _refresh_display_text(client: FeederClient, cat: str | None, *, force: bool = False) -> None:
-    """Keep the feeder display showing the cat the door is open for."""
+def _set_display_for_open(client: FeederClient, cat: str | None) -> None:
+    """Set the open-cat name ONCE on open, with a long interval covering the
+    meal — so it does not need per-event refreshing (which flooded the bridge)."""
+    global _last_display_monotonic, _last_display_cat
+    if not cat:
+        return
+    if client.set_display_text(cat, DISPLAY_OPEN_INTERVAL):
+        _last_display_cat = cat
+        _last_display_monotonic = time.monotonic()
+
+
+def _maybe_slow_refresh_display(client: FeederClient, cat: str | None) -> None:
+    """Fallback for hardware that caps the display interval and lets the name
+    fade: re-push it at most once per DISPLAY_REFRESH_MIN_SEC. Only called on
+    events that issue no door command, so the door always wins the bridge."""
     global _last_display_monotonic, _last_display_cat
     if not cat:
         return
     now = time.monotonic()
-    refresh_after = max(1.0, DISPLAY_TEXT_INTERVAL * 0.75)
     if (
-        not force
-        and _last_display_cat == cat
+        _last_display_cat == cat
         and _last_display_monotonic is not None
-        and now - _last_display_monotonic < refresh_after
+        and now - _last_display_monotonic < DISPLAY_REFRESH_MIN_SEC
     ):
         return
-    if client.set_display_text(cat, DISPLAY_TEXT_INTERVAL):
+    if client.set_display_text(cat, DISPLAY_OPEN_INTERVAL):
         _last_display_cat = cat
         _last_display_monotonic = now
+
+
+def _reset_close_backstop() -> None:
+    global _close_fail_count, _close_fail_since
+    _close_fail_count = 0
+    _close_fail_since = None
+
+
+def _close_backstop_after_failure(
+    cooldown: CooldownState, cat: str | None, meal_sec: float
+) -> None:
+    """Called when a door/close command failed. Counts consecutive failures for
+    this open episode; once they exceed the attempt/time budget, log loudly and
+    force the FSM closed (confirm_close) so it can disarm and serve the next cat.
+    Better to risk a re-open than to stay latched open on one cat forever."""
+    global _close_fail_count, _close_fail_since
+    now = time.monotonic()
+    if _close_fail_since is None:
+        _close_fail_since = now
+    _close_fail_count += 1
+    stuck_sec = now - _close_fail_since
+    if _close_fail_count < CLOSE_BACKSTOP_MAX_ATTEMPTS and stuck_sec < CLOSE_BACKSTOP_MAX_SEC:
+        return
+    print(
+        f"[feeder={FEEDER_ID}] WARNING: door close failed {_close_fail_count}x"
+        f" over {stuck_sec:.0f}s for cat={cat}; assuming physically closed and"
+        f" disarming FSM (backstop) so the next cat can be served",
+        flush=True,
+    )
+    if cat and meal_sec >= MIN_MEAL_SEC:
+        cooldown.record_meal_end(cat)
+    _fsm.confirm_close()
+    _reset_close_backstop()
 
 
 def _handle_event(
@@ -146,7 +206,10 @@ def _handle_event(
     if cmd.kind == "open":
         if client.set_door("open", cmd.reason):
             _fsm.confirm_open(cmd.cat, wall_t)
-            _refresh_display_text(client, cmd.cat, force=True)
+            # Fresh episode: clear any stale close-failure bookkeeping and set
+            # the display name once (long interval) — never refreshed per-event.
+            _reset_close_backstop()
+            _set_display_for_open(client, cmd.cat)
             print(f"[feeder={FEEDER_ID}] door opened: cat={cmd.cat}", flush=True)
 
     elif cmd.kind == "close":
@@ -161,10 +224,18 @@ def _handle_event(
             if cmd.cat and snap.meal_sec >= MIN_MEAL_SEC:
                 cooldown.record_meal_end(cmd.cat)
             _fsm.confirm_close()
+            _reset_close_backstop()
+        else:
+            # Close failed (commonly a ReadTimeout to the bridge). Count it and,
+            # if it keeps failing for this episode, force the FSM closed so it
+            # can't latch open forever on one cat.
+            _close_backstop_after_failure(cooldown, cmd.cat, snap.meal_sec)
 
     # cmd.kind is None: arming / latch hold / closing debounce — no door change.
-    if _fsm.state in {"open", "closing"}:
-        _refresh_display_text(client, _fsm.door_cat)
+    # Only on these no-door-command events do we consider a slow display refresh,
+    # so a door command always takes priority over the display bridge.
+    elif _fsm.state in {"open", "closing"}:
+        _maybe_slow_refresh_display(client, _fsm.door_cat)
 
 
 def _fail_safe_close(client: FeederClient, cooldown: CooldownState, reason: str) -> None:
