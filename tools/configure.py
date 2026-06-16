@@ -55,6 +55,10 @@ def _decision_region_value(cam: dict):
     return cam.get("decision_polygon", cam.get("action_polygon", "0,0,1,1"))
 
 
+def _food_region_value(cam: dict):
+    return cam.get("food_region")
+
+
 def _detect_roi_value(cam: dict):
     return cam.get("detect_roi", "0,0,1,1")
 
@@ -216,6 +220,7 @@ def render_compose(cfg: dict) -> str:
 
     for cam in cfg["cameras"]:
         cid = cam["id"]
+        food_region = _food_region_value(cam)
         env = {
             "CAMERA_ID":           cid,
             "RTSP_SOURCE":         f"rtsp://host.docker.internal:8554/{cid}",
@@ -234,6 +239,13 @@ def render_compose(cfg: dict) -> str:
             "IGNORE_REGIONS":      json.dumps(cam.get("ignore_regions", [])),
             "IGNORE_REGION_MIN_COVERAGE": cam.get("ignore_region_min_coverage", 0.8),
             "ACTION_POLYGON":      _polygon_env_value(_decision_region_value(cam)),
+            "FOOD_REGION":         _polygon_env_value(food_region) if food_region is not None else "",
+            "FOOD_TILES":          cam.get("food_tiles", 8),
+            "FOOD_TEX_THRESH":     cam.get("food_tex_thresh", 12.0),
+            "FOOD_EMPTY_BELOW":    cam.get("food_empty_below", 0.20),
+            "FOOD_FULL_ABOVE":     cam.get("food_full_above", 0.40),
+            "FOOD_CHECK_INTERVAL_SEC": cam.get("food_check_interval_sec", 5),
+            "FOOD_MEDIAN_WINDOW":  cam.get("food_median_window", 10),
             "FRAME_ROTATE_DEG":    cam.get("rotate_deg", 0),
             "EVENTS_DB":           "/data/events/events.db",
             "WS_PORT":             "8091",

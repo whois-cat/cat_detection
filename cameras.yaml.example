@@ -69,6 +69,13 @@
 #                         - [0.85, 0.20]
 #                         - [0.85, 0.95]
 #                         - [0.10, 0.95]
+#   food_region    — optional bowl/food texture monitor region in the same
+#                    camera/UI coordinate convention. No food_region means the
+#                    food-level monitor is disabled for this camera. Rect or
+#                    polygon are accepted.
+#   food_tiles, food_tex_thresh, food_empty_below, food_full_above,
+#   food_check_interval_sec, food_median_window — optional texture monitor
+#                    knobs. Defaults: 8, 12.0, 0.20, 0.40, 5, 10.
 #   blob_bright_threshold, blob_min_area — for DETECTOR_TYPE=blob.
 #   artificial_delay_ms — initial value for the UI delay slider.
 #
@@ -122,6 +129,17 @@ cameras:
       - [0.85, 0.20]
       - [0.85, 0.95]
       - [0.10, 0.95]
+    food_region:
+      - [0.64, 0.30]
+      - [0.94, 0.30]
+      - [0.94, 0.78]
+      - [0.64, 0.78]
+    food_tiles: 8
+    food_tex_thresh: 12.0
+    food_empty_below: 0.20
+    food_full_above: 0.40
+    food_check_interval_sec: 5
+    food_median_window: 10
     feeder:
       id: feeder1
       api_base_url: http://192.168.0.100

@@ -91,6 +91,15 @@ The detector is swappable via `DETECTOR_TYPE`:
 
 To train your own model on the recorded data, see [`training/`](training/).
 
+### Bowl Food Texture Monitor
+
+Each camera can optionally define `food_region` in `cameras.yaml`. It uses the
+same camera/UI-normalized coordinates as `ignore_regions` and
+`decision_polygon`, and only reports `food_state` / `food_level` over WebSocket
+(no events.db migration). Calibrate it by checking one definitely full bowl
+frame and one definitely empty bowl frame, then set `food_empty_below` and
+`food_full_above` between those observed texture fractions.
+
 ## Layout
 
 ```
