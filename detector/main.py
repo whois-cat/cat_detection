@@ -25,6 +25,7 @@ Also broadcast on the same WS, identified by `kind` field:
    "detect_roi": [x0,y0,x1,y1],
    "action_polygon": [[x,y], ...],
    "decision_polygon": [[x,y], ...],  # alias of action_polygon
+   "food_region": [[x,y], ...] | null,
    "ignore_regions": [{"name": str, "points": [[x,y], ...]}]}
 
 Storage: SQLite at /data/events/events.db (one row per detection box).
@@ -428,10 +429,12 @@ def detector_loop():
             "camera_id": CAMERA_ID,
             "model": detector.model_name,
         }
+        food_state, food_level = _maybe_update_food_monitor(img_cam, boxes, cam_W, cam_H)
 
         if not boxes:
             if prev_had_detections:
                 clear_ev = {**base, "cat": None, "boxes": []}
+                _attach_food_fields(clear_ev, food_state, food_level)
                 try:
                     pending_q.put_nowait((wall_ms + artificial_delay_ms, clear_ev))
                 except queue.Full:
@@ -440,7 +443,6 @@ def detector_loop():
             continue
 
         prev_had_detections = True
-        food_state, food_level = _maybe_update_food_monitor(img_cam, boxes, cam_W, cam_H)
 
         for b in boxes:
             # ACTION gate operates in camera coords on camera box centers.
@@ -454,6 +456,7 @@ def detector_loop():
                 "boxes": [{"x": b["x"], "y": b["y"], "w": b["w"], "h": b["h"],
                            "score": b["score"], "in_action": in_action}],
             }
+            _attach_food_fields(ev, food_state, food_level)
             try:
                 pending_q.put_nowait((wall_ms + artificial_delay_ms, ev))
             except queue.Full:
@@ -557,8 +560,7 @@ async def fanout_task():
         # Persist only events with boxes (clears are transient signals).
         if ev.get("boxes"):
             for b in ev["boxes"]:
-            _attach_food_fields(ev, food_state, food_level)
-            insert_event(
+                insert_event(
                     db_conn,
                     camera_id=ev["camera_id"], model=ev["model"], wall_ms=ev["wall_ms"],
                     pts=ev.get("pts"), tb_num=ev.get("tb_num"), tb_den=ev.get("tb_den"),
@@ -605,6 +607,11 @@ async def stats_task():
             "detect_roi":     list(DETECT_ROI),
             "action_polygon": [[x, y] for x, y in ACTION_POLYGON],
             "decision_polygon": [[x, y] for x, y in ACTION_POLYGON],
+            "food_region": (
+                [[x, y] for x, y in FOOD_REGION]
+                if FOOD_REGION is not None
+                else None
+            ),
             "ignore_regions": [
                 {
                     "name": region["name"],

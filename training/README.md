@@ -222,9 +222,13 @@ nearly identical feeder frames. Use `--max-cluster-size 0` only when you really
 want every crop in the review UI.
 
 Static false positives can be masked before review. Add tight
-`ignore_regions` to `cameras.yaml` for objects like a feeder or bowl; detections
-whose box is mostly covered by those camera-normalized regions are dropped by
-the detector and by `build_cluster_manifest`. For one-off experiments, pass
+`ignore_regions` to `cameras.yaml` only for hard false-positive objects such as
+the feeder body/lid: detections whose box is mostly covered by those
+camera-normalized regions are dropped by the detector and by
+`build_cluster_manifest`. Do not put the bowl/food area into `ignore_regions`,
+because that can remove real cat detections and future review crops. Use
+`food_region` for the bowl-level monitor instead; it is a soft observation zone
+and is not used by review/training filters. For one-off experiments, pass
 `--ignore-region grey:0.35,0.02,0.68,0.34`. Use tight regions so real cats next
 to or above the feeder are not removed. Tune the cutoff with
 `--ignore-region-min-coverage` (default `0.8`).

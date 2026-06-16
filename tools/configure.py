@@ -401,18 +401,25 @@ def render_secrets_env(cfg: dict) -> str:
 # ---- cameras.json (UI consumes) ---------------------------------------------
 
 def render_cameras_json(cfg: dict) -> str:
-    cams = [
-        {
-            "id":    cam["id"],
-            "label": cam.get("label", cam["id"].replace("-", " ").title()),
-            "detect_roi": _rect_from_value(_detect_roi_value(cam)),
-            "action_polygon": _polygon_from_value(_decision_region_value(cam)),
-            "decision_polygon": _polygon_from_value(_decision_region_value(cam)),
-            "ignore_regions": _ignore_regions_for_ui(cam),
-            "ignore_region_min_coverage": cam.get("ignore_region_min_coverage", 0.8),
-        }
-        for cam in cfg["cameras"]
-    ]
+    cams = []
+    for cam in cfg["cameras"]:
+        food_region = _food_region_value(cam)
+        cams.append(
+            {
+                "id":    cam["id"],
+                "label": cam.get("label", cam["id"].replace("-", " ").title()),
+                "detect_roi": _rect_from_value(_detect_roi_value(cam)),
+                "action_polygon": _polygon_from_value(_decision_region_value(cam)),
+                "decision_polygon": _polygon_from_value(_decision_region_value(cam)),
+                "food_region": (
+                    _polygon_from_value(food_region)
+                    if food_region is not None
+                    else None
+                ),
+                "ignore_regions": _ignore_regions_for_ui(cam),
+                "ignore_region_min_coverage": cam.get("ignore_region_min_coverage", 0.8),
+            }
+        )
     return json.dumps({"cameras": cams}, indent=2) + "\n"
 
 

@@ -46,13 +46,14 @@
 #                     Detections are dropped before events/review/training only
 #                     when most of the detection box is covered by one of these
 #                     regions. Use for static objects YOLO confuses for cats,
-#                     such as a feeder or bowl. Keep regions tight so real cats
-#                     beside or above the bowl stay.
+#                     such as the feeder body/lid. Do NOT put the bowl/food
+#                     area here: that would remove real cat detections and
+#                     review crops. Use food_region for the bowl instead.
 #   ignore_region_min_coverage — fraction of a box that must be inside an
 #                     ignore region before it is dropped (default 0.8).
 #                     Shapes can be:
 #                       ignore_regions:
-#                         - name: feeder_bowl
+#                         - name: feeder_body
 #                           rect: [0.35, 0.02, 0.68, 0.34]
 #                         - name: left_fixture
 #                           points: [[0.0,0.4], [0.1,0.4], [0.1,0.8], [0.0,0.8]]
@@ -72,7 +73,9 @@
 #   food_region    — optional bowl/food texture monitor region in the same
 #                    camera/UI coordinate convention. No food_region means the
 #                    food-level monitor is disabled for this camera. Rect or
-#                    polygon are accepted.
+#                    polygon are accepted. This is a soft observation zone:
+#                    it is shown separately in the UI and never filters cat
+#                    detections, feeder decisions, or future review crops.
 #   food_tiles, food_tex_thresh, food_empty_below, food_full_above,
 #   food_check_interval_sec, food_median_window — optional texture monitor
 #                    knobs. Defaults: 8, 12.0, 0.20, 0.40, 5, 10.

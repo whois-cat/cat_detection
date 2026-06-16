@@ -96,9 +96,13 @@ To train your own model on the recorded data, see [`training/`](training/).
 Each camera can optionally define `food_region` in `cameras.yaml`. It uses the
 same camera/UI-normalized coordinates as `ignore_regions` and
 `decision_polygon`, and only reports `food_state` / `food_level` over WebSocket
-(no events.db migration). Calibrate it by checking one definitely full bowl
-frame and one definitely empty bowl frame, then set `food_empty_below` and
-`food_full_above` between those observed texture fractions.
+(no events.db migration). The UI draws it as a separate FOOD overlay. Keep the
+bowl out of `ignore_regions`: hard ignore regions drop detections before
+review/training, while `food_region` only measures bowl texture and never
+filters cat recognition, feeder decisions, or future review crops. Calibrate it by
+checking one definitely full bowl frame and one definitely empty bowl frame,
+then set `food_empty_below` and `food_full_above` between those observed texture
+fractions.
 
 ## Layout
 
