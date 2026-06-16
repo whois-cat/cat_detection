@@ -56,6 +56,10 @@
   let historyPaused    = $state(true);
   let userWantsPlaying = $state(true);
   let follow           = $state(true);
+  // Overlay zones (ignore/food/decision regions + detection boxes) are hidden
+  // by default so the video opens clean; toggled by the in-player "зоны"
+  // checkbox in both normal and fullscreen modes.
+  let showZones        = $state(false);
   // Latest stats frame from the detector ({fps_in, fps_processed, active_tracks, model, camera_id})
   let stats            = $state(null);
   // detectRoi: axis-aligned rect [x0,y0,x1,y1] in [0..1], CAMERA coords.
@@ -128,7 +132,6 @@
   const FOOD_STROKE = '#c084fc';
   const FOOD_FILL = 'rgba(192,132,252,0.13)';
   const FOOD_TEXT = '#ddd6fe';
-  const DETECT_STROKE = '#5ec8ff';
   const DECISION_STROKE = '#ffd454';
   const BOX_SHADOW = (() => {
     const [r, g, b] = BOX_RGB;
@@ -213,6 +216,13 @@
 
   function drawOverlay() {
     if (!canvas) return;
+    // Zones hidden: wipe the whole canvas and draw nothing (no regions, no boxes).
+    if (!showZones) {
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
     const v = mode === 'live' ? liveVideo : historyVideo;
     if (!v) return;
     const { ctx, width, height } = syncCanvasSize();
@@ -221,7 +231,6 @@
     // ROI overlays (drawn first so detection boxes sit on top). Only render
     // when the region is a sub-region of the frame; full-frame ROIs would just
     // be a border. The feeder decision zone may be an arbitrary polygon.
-    const FULL_RECT = (r) => r && r[0] === 0 && r[1] === 0 && r[2] === 1 && r[3] === 1;
     const FULL_POLY = (p) => p && p.length === 4
       && p[0][0] === 0 && p[0][1] === 0 && p[1][0] === 1 && p[1][1] === 0
       && p[2][0] === 1 && p[2][1] === 1 && p[3][0] === 0 && p[3][1] === 1;
@@ -278,16 +287,6 @@
         FOOD_FILL,
         FOOD_TEXT,
       );
-    }
-    if (detectRoi && !FULL_RECT(detectRoi)) {
-      const [x0, y0, x1, y1] = detectRoi;
-      const rx = frameRect.x + x0 * frameRect.w;
-      const ry = frameRect.y + y0 * frameRect.h;
-      const rw = (x1 - x0) * frameRect.w;
-      const rh = (y1 - y0) * frameRect.h;
-      drawPath(DETECT_STROKE, 'DETECT',
-        () => ctx.rect(rx, ry, rw, rh),
-        [rx, ry]);
     }
     if (actionPolygon && !FULL_POLY(actionPolygon)) {
       let minX = Infinity, minY = Infinity;
@@ -811,13 +810,18 @@
                onpause={() => historyPaused = true}
                hidden={mode !== 'history'}></video>
         <canvas bind:this={canvas} ondblclick={toggleVideoFullscreen}></canvas>
-        <div class="overlay-legend" aria-label="Overlay legend">
-          <div class="legend-row"><span class="legend-swatch cat"></span><span>cat</span></div>
-          <div class="legend-row"><span class="legend-swatch decision"></span><span>decision</span></div>
-          <div class="legend-row"><span class="legend-swatch detect"></span><span>detect</span></div>
-          <div class="legend-row"><span class="legend-swatch food"></span><span>food</span></div>
-          <div class="legend-row"><span class="legend-swatch ignore"></span><span>ignore</span></div>
-        </div>
+        <label class="zones-toggle" title="Show overlay zones">
+          <input type="checkbox" bind:checked={showZones} />
+          зоны
+        </label>
+        {#if showZones}
+          <div class="overlay-legend" aria-label="Overlay legend">
+            <div class="legend-row"><span class="legend-swatch cat"></span><span>cat</span></div>
+            <div class="legend-row"><span class="legend-swatch decision"></span><span>decision</span></div>
+            <div class="legend-row"><span class="legend-swatch food"></span><span>food</span></div>
+            <div class="legend-row"><span class="legend-swatch ignore"></span><span>ignore</span></div>
+          </div>
+        {/if}
         {#if mode === 'history' && inGap}
           <div class="history-overlay">
             <div>no recording at this time</div>
@@ -907,18 +911,18 @@
     background: transparent;
   }
   .overlay-legend {
-    display: none;
+    display: grid;
     position: absolute;
-    top: 10px;
-    right: 10px;
+    top: 6px;
+    right: 6px;
     z-index: 5;
-    gap: 0.35rem;
-    padding: 0.55rem 0.65rem;
+    gap: 0.3rem;
+    padding: 0.35rem 0.45rem;
     border: 1px solid rgba(255,255,255,0.18);
     border-radius: 4px;
     background: rgba(12,14,18,0.72);
     color: #e5e7eb;
-    font: 600 0.78rem/1.1 system-ui, sans-serif;
+    font: 600 0.62rem/1.1 system-ui, sans-serif;
     text-transform: uppercase;
     letter-spacing: 0.02em;
     pointer-events: none;
@@ -931,15 +935,14 @@
     white-space: nowrap;
   }
   .legend-swatch {
-    width: 0.9rem;
-    height: 0.9rem;
+    width: 0.7rem;
+    height: 0.7rem;
     border: 2px solid currentColor;
     background: rgba(255,255,255,0.08);
     flex: 0 0 auto;
   }
   .legend-swatch.cat { color: rgb(0,255,136); }
   .legend-swatch.decision { color: #ffd454; border-style: dashed; }
-  .legend-swatch.detect { color: #5ec8ff; border-style: dashed; }
   .legend-swatch.food { color: #c084fc; border-style: dashed; background: rgba(192,132,252,0.13); }
   .legend-swatch.ignore { color: #ff6b6b; border-style: dashed; background: rgba(255,107,107,0.14); }
   .history-overlay {
@@ -962,6 +965,14 @@
     line-height: 1;
   }
   .play-pause:hover { background: rgba(0,0,0,0.8); }
+  .zones-toggle {
+    position: absolute; left: 8px; top: 8px; z-index: 6;
+    display: flex; align-items: center; gap: 0.25rem;
+    background: rgba(0,0,0,0.55); color: #fff; border: 1px solid #555;
+    font-size: 0.72rem; padding: 0.12rem 0.4rem; border-radius: 3px; cursor: pointer;
+    user-select: none;
+  }
+  .zones-toggle input { margin: 0; cursor: pointer; }
   .wrap:fullscreen { width: 100vw; height: 100vh; background: #000; display: flex; align-items: center; justify-content: center; }
   .wrap:fullscreen video,
   .wrap:fullscreen canvas { width: 100%; height: 100%; max-width: none; object-fit: contain; }
@@ -1007,5 +1018,4 @@
     object-fit: contain;
   }
   .app:fullscreen .wrap canvas { position: absolute; inset: 0; }
-  .app:fullscreen .overlay-legend { display: grid; }
 </style>

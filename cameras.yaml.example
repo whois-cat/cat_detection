@@ -78,9 +78,26 @@
 #                    polygon are accepted. This is a soft observation zone:
 #                    it is shown separately in the UI and never filters cat
 #                    detections, feeder decisions, or future review crops.
-#   food_tiles, food_tex_thresh, food_empty_below, food_full_above,
-#   food_check_interval_sec, food_median_window — optional texture monitor
-#                    knobs. Defaults: 8, 12.0, 0.20, 0.40, 5, 10.
+#   food_empty_level, food_full_level — optional per-camera calibration for the
+#                    contrast detector. The monitor's primary signal is how much
+#                    DARKER the bowl is than its surrounding ring (food is dark,
+#                    an empty tray is bright/glossy). These two numbers are the
+#                    raw contrast you observe on this camera when the bowl is
+#                    empty vs. full. To get them: leave both unset, watch the
+#                    detector log lines "food calib <camera>: raw_contrast=<N>"
+#                    (emitted ~every 30s while uncalibrated), and record the
+#                    typical value for an empty bowl and a full bowl on THIS
+#                    camera. Until both are set, food_state stays "unknown".
+#   food_margin_frac — ring width as a fraction of the bowl bbox min side for the
+#                    contrast reference (default 0.35).
+#   food_texture_weight — blend weight (0..1) for the legacy texture signal on top
+#                    of the contrast fill (default 0.0 = contrast only). The
+#                    texture knobs below apply only when this is > 0.
+#   food_tiles, food_tex_thresh — texture knobs. Defaults: 8, 12.0.
+#   food_empty_below, food_full_above — hysteresis on the normalized 0..1 fill
+#                    level. Defaults: 0.30, 0.55.
+#   food_check_interval_sec, food_median_window — sampling cadence and smoothing
+#                    window. Defaults: 5, 10.
 #   blob_bright_threshold, blob_min_area — for DETECTOR_TYPE=blob.
 #   artificial_delay_ms — initial value for the UI delay slider.
 #
@@ -139,10 +156,14 @@ cameras:
       - [0.94, 0.30]
       - [0.94, 0.78]
       - [0.64, 0.78]
-    food_tiles: 8
-    food_tex_thresh: 12.0
-    food_empty_below: 0.20
-    food_full_above: 0.40
+    # Contrast calibration: снять по кадрам полно/пусто этой камеры
+    # (watch the "food calib living: raw_contrast=..." log lines first).
+    food_empty_level: 4.0     # raw contrast with an empty bowl
+    food_full_level: 26.0     # raw contrast with a full bowl
+    food_margin_frac: 0.35
+    food_texture_weight: 0.0
+    food_empty_below: 0.30
+    food_full_above: 0.55
     food_check_interval_sec: 5
     food_median_window: 10
     feeder:

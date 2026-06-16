@@ -285,10 +285,12 @@ def render_compose(cfg: dict) -> str:
             "IGNORE_REGION_MIN_COVERAGE": cam.get("ignore_region_min_coverage", 0.8),
             "ACTION_POLYGON":      _polygon_env_value(_decision_region_value(cam)),
             "FOOD_REGION":         _polygon_env_value(food_region) if food_region is not None else "",
+            "FOOD_MARGIN_FRAC":    cam.get("food_margin_frac", 0.35),
+            "FOOD_TEXTURE_WEIGHT": cam.get("food_texture_weight", 0.0),
             "FOOD_TILES":          cam.get("food_tiles", 8),
             "FOOD_TEX_THRESH":     cam.get("food_tex_thresh", 12.0),
-            "FOOD_EMPTY_BELOW":    cam.get("food_empty_below", 0.20),
-            "FOOD_FULL_ABOVE":     cam.get("food_full_above", 0.40),
+            "FOOD_EMPTY_BELOW":    cam.get("food_empty_below", 0.30),
+            "FOOD_FULL_ABOVE":     cam.get("food_full_above", 0.55),
             "FOOD_CHECK_INTERVAL_SEC": cam.get("food_check_interval_sec", 5),
             "FOOD_MEDIAN_WINDOW":  cam.get("food_median_window", 10),
             "FRAME_ROTATE_DEG":    cam.get("rotate_deg", 0),
@@ -297,6 +299,13 @@ def render_compose(cfg: dict) -> str:
             "CONTROL_PORT":        "8092",
             "ARTIFICIAL_DELAY_MS": cam.get("artificial_delay_ms", 0),
         }
+        # Per-camera contrast calibration is optional: only emit the env vars
+        # when present, so an uncalibrated camera leaves them unset and the
+        # detector runs in calibration mode.
+        if cam.get("food_empty_level") is not None:
+            env["FOOD_EMPTY_LEVEL"] = cam["food_empty_level"]
+        if cam.get("food_full_level") is not None:
+            env["FOOD_FULL_LEVEL"] = cam["food_full_level"]
         env_lines = "\n".join(f"      {k}: {json.dumps(v)}" for k, v in env.items())
         services.append(f"""\
   detector-{cid}:

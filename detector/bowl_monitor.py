@@ -1,7 +1,13 @@
 """Lightweight food-level monitor for a fixed bowl region.
 
-This is intentionally not ML. It estimates how much of a camera-normalized ROI
-looks textured by splitting it into tiles and measuring mean gradient magnitude.
+This is intentionally not ML. The primary signal is RELATIVE darkness: how much
+darker the bowl is than the ring of frame around it (food is dark, an empty tray
+is glossy/bright). Using a contrast against the local surroundings — rather than
+absolute brightness — keeps the measure stable across cameras and day/night IR.
+Medians are used everywhere so a glare spot or a paw barely moves the number.
+
+Texture (`food_fill_fraction`) is kept as an optional secondary signal, blended
+in only when `texture_weight > 0`.
 """
 from __future__ import annotations
 
@@ -40,6 +46,100 @@ def _point_in_polygon(x: float, y: float, poly: list[tuple[float, float]]) -> bo
                 inside = not inside
         j = i
     return inside
+
+
+def _bbox_px(poly: list[tuple[float, float]], w: int, h: int) -> tuple[int, int, int, int]:
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    x0 = max(0, min(w, int(np.floor(min(xs) * w))))
+    y0 = max(0, min(h, int(np.floor(min(ys) * h))))
+    x1 = max(0, min(w, int(np.ceil(max(xs) * w))))
+    y1 = max(0, min(h, int(np.ceil(max(ys) * h))))
+    return x0, y0, x1, y1
+
+
+def _polygon_mask_px(
+    poly: list[tuple[float, float]],
+    w: int,
+    h: int,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+) -> np.ndarray | None:
+    """Boolean mask over the bbox [y0:y1, x0:x1] for pixels whose center lies
+    inside `poly`. `poly` is normalized; the grid is in absolute pixels.
+
+    Vectorized even/odd ray-cast: each polygon edge toggles the inside flag for
+    pixels whose horizontal ray to the left crosses it (parity via XOR)."""
+    bw = x1 - x0
+    bh = y1 - y0
+    if bw <= 0 or bh <= 0:
+        return None
+    px = [(x * w, y * h) for x, y in poly]
+    ys = (np.arange(y0, y1) + 0.5)[:, None]   # (bh, 1)
+    xs = (np.arange(x0, x1) + 0.5)[None, :]   # (1, bw)
+    inside = np.zeros((bh, bw), dtype=bool)
+    n = len(px)
+    j = n - 1
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for i in range(n):
+            xi, yi = px[i]
+            xj, yj = px[j]
+            cond_y = (yi > ys) != (yj > ys)                  # (bh, 1)
+            xint = (xj - xi) * (ys - yi) / (yj - yi) + xi     # (bh, 1)
+            inside ^= cond_y & (xs < xint)
+            j = i
+    return inside
+
+
+def bowl_contrast(frame_gray: np.ndarray, roi, margin_frac: float) -> float | None:
+    """Relative darkness of the bowl vs. its surrounding ring.
+
+    Returns (ref_val - bowl_val), where both are MEDIAN brightness — of the
+    pixels inside the ROI polygon, and of a ring of width
+    `margin_frac * min(bbox_w, bbox_h)` around the ROI bbox, respectively.
+    Positive when the bowl is darker than its surroundings (= food present).
+    numpy-only; medians keep glare and a stray paw from dominating.
+    """
+    if frame_gray is None or frame_gray.size == 0:
+        return None
+    if frame_gray.ndim == 3:
+        frame_gray = frame_gray.mean(axis=2)
+
+    poly = _polygon_from_roi(roi)
+    if len(poly) < 3:
+        return None
+
+    h, w = frame_gray.shape[:2]
+    x0, y0, x1, y1 = _bbox_px(poly, w, h)
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    mask = _polygon_mask_px(poly, w, h, x0, y0, x1, y1)
+    if mask is None or not mask.any():
+        return None
+    bowl_region = frame_gray[y0:y1, x0:x1]
+    bowl_val = float(np.median(bowl_region[mask]))
+
+    bw = x1 - x0
+    bh = y1 - y0
+    margin = int(round(max(0.0, margin_frac) * min(bw, bh)))
+    if margin <= 0:
+        return None
+    ex0 = max(0, x0 - margin)
+    ey0 = max(0, y0 - margin)
+    ex1 = min(w, x1 + margin)
+    ey1 = min(h, y1 + margin)
+    ring_region = frame_gray[ey0:ey1, ex0:ex1]
+    ring_mask = np.ones(ring_region.shape, dtype=bool)
+    # Punch out the original bbox; the ring is the expanded box minus it.
+    ring_mask[y0 - ey0:y1 - ey0, x0 - ex0:x1 - ex0] = False
+    ring_pixels = ring_region[ring_mask]
+    if ring_pixels.size == 0:
+        return None
+    ref_val = float(np.median(ring_pixels))
+    return ref_val - bowl_val
 
 
 def food_fill_fraction(
@@ -104,39 +204,65 @@ class BowlMonitor:
     def __init__(
         self,
         roi,
+        empty_level: float | None,
+        full_level: float | None,
         empty_below: float,
         full_above: float,
         window: int,
         *,
+        margin_frac: float = 0.35,
+        texture_weight: float = 0.0,
         tiles: int = 8,
         tex_thresh: float = 12.0,
     ) -> None:
         self.roi = roi
+        # Per-camera calibration anchors for raw contrast. When either is unset
+        # the monitor runs in calibration mode (state stays "unknown").
+        self.empty_level = None if empty_level is None else float(empty_level)
+        self.full_level = None if full_level is None else float(full_level)
         self.empty_below = float(empty_below)
         self.full_above = float(full_above)
         self.window = max(1, int(window))
+        self.margin_frac = float(margin_frac)
+        self.texture_weight = float(texture_weight)
         self.tiles = max(1, int(tiles))
         self.tex_thresh = float(tex_thresh)
         self.state = "unknown"
         self._recent: deque[float] = deque(maxlen=self.window)
 
-    def update(self, frame_gray: np.ndarray, cat_in_region: bool) -> tuple[str, float | None]:
+    def update(
+        self, frame_gray: np.ndarray, cat_in_region: bool
+    ) -> tuple[str, float | None, float | None]:
+        # Don't measure through a cat sitting in/over the bowl.
         if cat_in_region:
-            return self.state, None
+            return self.state, None, None
 
-        fraction = food_fill_fraction(
-            frame_gray,
-            self.roi,
-            self.tiles,
-            self.tex_thresh,
-        )
-        if fraction is None:
-            return self.state, None
+        raw = bowl_contrast(frame_gray, self.roi, self.margin_frac)
+        if raw is None:
+            return self.state, None, None
 
-        self._recent.append(float(fraction))
+        if self.empty_level is None or self.full_level is None:
+            # Not calibrated yet: surface raw so the operator can record the
+            # empty/full reference numbers for this camera.
+            return "unknown", None, raw
+
+        span = self.full_level - self.empty_level
+        if span == 0:
+            return self.state, None, raw
+        fill_b = (raw - self.empty_level) / span
+        fill_b = min(1.0, max(0.0, fill_b))
+
+        if self.texture_weight > 0:
+            tex = food_fill_fraction(frame_gray, self.roi, self.tiles, self.tex_thresh)
+            w = self.texture_weight
+            fill = fill_b if tex is None else (1.0 - w) * fill_b + w * float(tex)
+        else:
+            fill = fill_b
+
+        self._recent.append(float(fill))
         smoothed = float(median(self._recent))
         if smoothed <= self.empty_below:
             self.state = "empty"
         elif smoothed >= self.full_above:
             self.state = "has_food"
-        return self.state, smoothed
+        return self.state, smoothed, raw

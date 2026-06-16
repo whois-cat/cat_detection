@@ -133,18 +133,36 @@ ACTION_POLYGON = _parse_polygon("ACTION_POLYGON")   # camera-frame fractions
 FOOD_REGION    = _parse_optional_polygon("FOOD_REGION")  # camera-frame fractions
 DETECT_ROI_IS_FULL = DETECT_ROI == (0.0, 0.0, 1.0, 1.0)
 ACTION_ROI_IS_FULL = ACTION_POLYGON == [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+def _optional_float_env(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    return float(raw) if raw else None
+
+
+# Per-camera calibration anchors for the contrast-based food detector. When
+# unset, the monitor runs in calibration mode (food_state="unknown") and the
+# detector periodically logs the raw contrast so these numbers can be measured.
+FOOD_EMPTY_LEVEL = _optional_float_env("FOOD_EMPTY_LEVEL")
+FOOD_FULL_LEVEL = _optional_float_env("FOOD_FULL_LEVEL")
+FOOD_MARGIN_FRAC = float(os.environ.get("FOOD_MARGIN_FRAC", "0.35"))
+FOOD_TEXTURE_WEIGHT = float(os.environ.get("FOOD_TEXTURE_WEIGHT", "0.0"))
+# Texture is now only a secondary signal (used when FOOD_TEXTURE_WEIGHT>0).
 FOOD_TILES = int(os.environ.get("FOOD_TILES", "8"))
 FOOD_TEX_THRESH = float(os.environ.get("FOOD_TEX_THRESH", "12.0"))
-FOOD_EMPTY_BELOW = float(os.environ.get("FOOD_EMPTY_BELOW", "0.20"))
-FOOD_FULL_ABOVE = float(os.environ.get("FOOD_FULL_ABOVE", "0.40"))
+# Hysteresis thresholds now operate on a normalized 0..1 fill level.
+FOOD_EMPTY_BELOW = float(os.environ.get("FOOD_EMPTY_BELOW", "0.30"))
+FOOD_FULL_ABOVE = float(os.environ.get("FOOD_FULL_ABOVE", "0.55"))
 FOOD_CHECK_INTERVAL_SEC = float(os.environ.get("FOOD_CHECK_INTERVAL_SEC", "5"))
 FOOD_MEDIAN_WINDOW = int(os.environ.get("FOOD_MEDIAN_WINDOW", "10"))
 FOOD_MONITOR = (
     BowlMonitor(
         FOOD_REGION,
+        empty_level=FOOD_EMPTY_LEVEL,
+        full_level=FOOD_FULL_LEVEL,
         empty_below=FOOD_EMPTY_BELOW,
         full_above=FOOD_FULL_ABOVE,
         window=FOOD_MEDIAN_WINDOW,
+        margin_frac=FOOD_MARGIN_FRAC,
+        texture_weight=FOOD_TEXTURE_WEIGHT,
         tiles=FOOD_TILES,
         tex_thresh=FOOD_TEX_THRESH,
     )
@@ -152,8 +170,10 @@ FOOD_MONITOR = (
     else None
 )
 _last_food_check_monotonic = 0.0
+_last_food_calib_log_monotonic = 0.0
 _food_state = "unknown"
 _food_level: float | None = None
+FOOD_CALIB_LOG_INTERVAL_SEC = 30.0
 
 
 def _parse_ignore_regions() -> list[dict]:
@@ -203,7 +223,8 @@ def _maybe_update_food_monitor(
     frame_w: int,
     frame_h: int,
 ) -> tuple[str, float | None]:
-    global _last_food_check_monotonic, _food_state, _food_level
+    global _last_food_check_monotonic, _last_food_calib_log_monotonic
+    global _food_state, _food_level
     if FOOD_MONITOR is None or FOOD_REGION is None:
         return "unknown", None
 
@@ -225,9 +246,16 @@ def _maybe_update_food_monitor(
         + 0.587 * frame_bgr[..., 1]
         + 0.299 * frame_bgr[..., 2]
     ).astype(np.float32)
-    _food_state, fraction = FOOD_MONITOR.update(frame_gray, cat_in_region)
-    if fraction is not None:
-        _food_level = fraction
+    _food_state, fill, raw = FOOD_MONITOR.update(frame_gray, cat_in_region)
+    if fill is not None:
+        _food_level = fill
+    # Calibration mode: raw is available but no normalized fill yet. Surface the
+    # raw contrast at most every ~30s so the operator can record empty/full
+    # reference numbers for this camera. This is the only new log line.
+    if raw is not None and fill is None:
+        if now - _last_food_calib_log_monotonic >= FOOD_CALIB_LOG_INTERVAL_SEC:
+            _last_food_calib_log_monotonic = now
+            print(f"food calib {CAMERA_ID}: raw_contrast={raw:.2f}", flush=True)
     return _food_state, _food_level
 
 
