@@ -1,9 +1,11 @@
 """Ignore-region helpers for detector false-positive cleanup.
 
 Regions are expressed in camera-normalized coordinates [0..1]. A detection is
-ignored when most of its box area is covered by a configured region for its
-camera or a global "*" region. Using box coverage instead of box center keeps a
-real cat that extends outside a feeder/bowl mask from being dropped.
+ignored when most of its box area is covered by a configured hard-ignore
+region for its camera or a global "*" region. Using box coverage instead of box
+center keeps a real cat that extends outside a feeder mask from being dropped.
+Regions named "bowl" or "food" are treated as soft food-monitor zones, not
+hard-ignore masks.
 """
 from __future__ import annotations
 
@@ -18,6 +20,11 @@ from .db import Box
 class IgnoreRegion:
     name: str
     points: tuple[tuple[float, float], ...]
+
+
+def is_soft_food_region_name(name: str) -> bool:
+    tokens = str(name).lower().replace("-", "_").replace(" ", "_").split("_")
+    return "bowl" in tokens or "food" in tokens
 
 
 def _point_in_polygon(x: float, y: float, poly: Iterable[tuple[float, float]]) -> bool:
@@ -115,7 +122,10 @@ def load_ignore_regions_from_camera_config(path: Path) -> dict[str, list[IgnoreR
             continue
         regions = []
         for i, raw in enumerate(cam.get("ignore_regions", []) or []):
-            regions.append(region_from_value(raw, default_name=f"{cid}-ignore-{i}"))
+            region = region_from_value(raw, default_name=f"{cid}-ignore-{i}")
+            if is_soft_food_region_name(region.name):
+                continue
+            regions.append(region)
         if regions:
             out[cid] = regions
     return out

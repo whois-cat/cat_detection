@@ -110,6 +110,11 @@ def _point_in_polygon(x: float, y: float, poly: list[tuple[float, float]]) -> bo
     return inside
 
 
+def _is_soft_food_region_name(name: str) -> bool:
+    tokens = str(name).lower().replace("-", "_").replace(" ", "_").split("_")
+    return "bowl" in tokens or "food" in tokens
+
+
 # Frame rotation. 0/90/180/270 (clockwise degrees). Camera mounted sideways
 # with no firmware rotate option → we rotate the model's input only. Camera
 # frame stays the source of truth everywhere else: env-var ROIs are camera
@@ -163,6 +168,8 @@ def _parse_ignore_regions() -> list[dict]:
         if isinstance(region, dict):
             name = str(region.get("name") or name)
             coords = region.get("rect", region.get("points", region.get("polygon")))
+        if _is_soft_food_region_name(name):
+            continue
         if isinstance(coords, str):
             vals = [float(v.strip()) for v in coords.split(",") if v.strip()]
         elif coords and all(isinstance(v, (list, tuple)) for v in coords):

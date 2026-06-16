@@ -34,6 +34,6 @@ RUN python export_classifier.py \
     --pt /app/models/cat_classifier.pt \
     --out /opt/models/cat_classifier_openvino/
 
-COPY storage.py detectors.py main.py ./
+COPY storage.py detectors.py bowl_monitor.py main.py ./
 
 CMD ["python", "-u", "main.py"]

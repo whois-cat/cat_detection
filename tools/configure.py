@@ -55,8 +55,48 @@ def _decision_region_value(cam: dict):
     return cam.get("decision_polygon", cam.get("action_polygon", "0,0,1,1"))
 
 
+def _region_coords(raw):
+    if isinstance(raw, dict):
+        return raw.get("rect", raw.get("points", raw.get("polygon")))
+    return raw
+
+
+def _region_name(cam: dict, raw, index: int) -> str:
+    if isinstance(raw, dict):
+        return str(raw.get("name") or f"{cam['id']}-ignore-{index}")
+    return f"{cam['id']}-ignore-{index}"
+
+
+def _is_soft_food_region_name(name: str) -> bool:
+    tokens = str(name).lower().replace("-", "_").replace(" ", "_").split("_")
+    return "bowl" in tokens or "food" in tokens
+
+
+def _hard_ignore_region_values(cam: dict) -> list:
+    return [
+        raw
+        for i, raw in enumerate(cam.get("ignore_regions", []) or [])
+        if not _is_soft_food_region_name(_region_name(cam, raw, i))
+    ]
+
+
 def _food_region_value(cam: dict):
-    return cam.get("food_region")
+    explicit = cam.get("food_region")
+    if explicit is not None:
+        return explicit
+    for i, raw in enumerate(cam.get("ignore_regions", []) or []):
+        if _is_soft_food_region_name(_region_name(cam, raw, i)):
+            return _region_coords(raw)
+    return None
+
+
+def _food_region_name(cam: dict) -> str:
+    if cam.get("food_region") is not None:
+        return "bowl"
+    for i, raw in enumerate(cam.get("ignore_regions", []) or []):
+        if _is_soft_food_region_name(_region_name(cam, raw, i)):
+            return _region_name(cam, raw, i)
+    return "bowl"
 
 
 def _detect_roi_value(cam: dict):
@@ -94,12 +134,9 @@ def _rect_from_value(raw) -> list[float]:
 
 def _ignore_regions_for_ui(cam: dict) -> list[dict]:
     out = []
-    for i, raw in enumerate(cam.get("ignore_regions", []) or []):
-        name = f"{cam['id']}-ignore-{i}"
-        coords = raw
-        if isinstance(raw, dict):
-            name = str(raw.get("name") or name)
-            coords = raw.get("rect", raw.get("points", raw.get("polygon")))
+    for i, raw in enumerate(_hard_ignore_region_values(cam)):
+        name = _region_name(cam, raw, i)
+        coords = _region_coords(raw)
         out.append({"name": name, "points": _polygon_from_value(coords)})
     return out
 
@@ -236,7 +273,7 @@ def render_compose(cfg: dict) -> str:
             ),
             "CLASSIFIER_PAD_FRAC": cam.get("classifier_pad_frac", 0.15),
             "DETECT_ROI":          _csv_coords(_rect_from_value(_detect_roi_value(cam))),
-            "IGNORE_REGIONS":      json.dumps(cam.get("ignore_regions", [])),
+            "IGNORE_REGIONS":      json.dumps(_hard_ignore_region_values(cam)),
             "IGNORE_REGION_MIN_COVERAGE": cam.get("ignore_region_min_coverage", 0.8),
             "ACTION_POLYGON":      _polygon_env_value(_decision_region_value(cam)),
             "FOOD_REGION":         _polygon_env_value(food_region) if food_region is not None else "",
@@ -412,7 +449,10 @@ def render_cameras_json(cfg: dict) -> str:
                 "action_polygon": _polygon_from_value(_decision_region_value(cam)),
                 "decision_polygon": _polygon_from_value(_decision_region_value(cam)),
                 "food_region": (
-                    _polygon_from_value(food_region)
+                    {
+                        "name": _food_region_name(cam),
+                        "points": _polygon_from_value(food_region),
+                    }
                     if food_region is not None
                     else None
                 ),

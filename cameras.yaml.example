@@ -49,6 +49,8 @@
 #                     such as the feeder body/lid. Do NOT put the bowl/food
 #                     area here: that would remove real cat detections and
 #                     review crops. Use food_region for the bowl instead.
+#                     Backward-compatibility: regions named bowl/food are
+#                     automatically treated as soft food_region, not hard ignore.
 #   ignore_region_min_coverage — fraction of a box that must be inside an
 #                     ignore region before it is dropped (default 0.8).
 #                     Shapes can be:
