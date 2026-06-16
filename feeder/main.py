@@ -108,6 +108,10 @@ _last_display_cat: str | None = None
 # Backstop bookkeeping for the currently-open episode.
 _close_fail_count: int = 0
 _close_fail_since: float | None = None
+# Throttle for the "not opening" diagnostic so a present-but-rejected cat
+# doesn't spam the log every event.
+_last_not_opening_log_monotonic: float | None = None
+NOT_OPENING_LOG_INTERVAL_SEC = 5.0
 
 
 def _set_display_for_open(client: FeederClient, cat: str | None) -> None:
@@ -201,6 +205,23 @@ def _handle_event(
 
     snap = _zone.snapshot(wall_t)
     action, reason = decide(snap, ALLOWED_CATS, cooldown, COOLDOWN_HOURS)
+
+    # Diagnostic: a cat is present but the door isn't being opened (cooldown /
+    # no_identity / not_allowed / multi_cat). Throttle so it can't flood the log.
+    if snap.present and action != "open":
+        global _last_not_opening_log_monotonic
+        now_mono = time.monotonic()
+        if (
+            _last_not_opening_log_monotonic is None
+            or now_mono - _last_not_opening_log_monotonic >= NOT_OPENING_LOG_INTERVAL_SEC
+        ):
+            _last_not_opening_log_monotonic = now_mono
+            print(
+                f"[feeder={FEEDER_ID}] not opening: action={action} reason={reason}"
+                f" identity={snap.identity} n_cats={snap.n_cats}",
+                flush=True,
+            )
+
     cmd = _fsm.step(wall_t, snap, action, reason)
 
     if cmd.kind == "open":
