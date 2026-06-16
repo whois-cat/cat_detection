@@ -791,6 +791,11 @@
       </span>
     {/if}
 
+    <label class="zones-toggle" title="Show overlay zones">
+      <input type="checkbox" bind:checked={showZones} />
+      zones
+    </label>
+
     <span class="spacer"></span>
     <button class="fs-app" onclick={toggleAppFullscreen} title="Fullscreen the whole app">⛶ app</button>
   </header>
@@ -810,10 +815,6 @@
                onpause={() => historyPaused = true}
                hidden={mode !== 'history'}></video>
         <canvas bind:this={canvas} ondblclick={toggleVideoFullscreen}></canvas>
-        <label class="zones-toggle" title="Show overlay zones">
-          <input type="checkbox" bind:checked={showZones} />
-          зоны
-        </label>
         {#if showZones}
           <div class="overlay-legend" aria-label="Overlay legend">
             <div class="legend-row"><span class="legend-swatch cat"></span><span>cat</span></div>
@@ -966,13 +967,10 @@
   }
   .play-pause:hover { background: rgba(0,0,0,0.8); }
   .zones-toggle {
-    position: absolute; left: 8px; top: 8px; z-index: 6;
-    display: flex; align-items: center; gap: 0.25rem;
-    background: rgba(0,0,0,0.55); color: #fff; border: 1px solid #555;
-    font-size: 0.72rem; padding: 0.12rem 0.4rem; border-radius: 3px; cursor: pointer;
-    user-select: none;
+    display: flex; align-items: center; gap: 0.3rem;
+    color: #aaa; font-size: 0.85rem; cursor: pointer; user-select: none;
   }
-  .zones-toggle input { margin: 0; cursor: pointer; }
+  .zones-toggle input { cursor: pointer; }
   .wrap:fullscreen { width: 100vw; height: 100vh; background: #000; display: flex; align-items: center; justify-content: center; }
   .wrap:fullscreen video,
   .wrap:fullscreen canvas { width: 100%; height: 100%; max-width: none; object-fit: contain; }
