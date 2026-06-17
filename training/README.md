@@ -311,17 +311,18 @@ corrections and writes the **best-by-val** model to a NEW path. It does **not**
 touch the runtime model — swapping is a later, separate step.
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-python -m training.train_classifier \
-    --db data/events/events.db \
-    --recordings data/recordings \
-    --reviews-db data/review/reviews.db \
+just training-setup
+just train-classifier \
     --confuse alisa,felisis \
     --pad-frac 0.15 \
     --min-recall 0.9
 # heavier pass when you have more data: add --full-finetune
 # later active-learning pass only: add --trust-classifier --trust-conf 0.9
 ```
+
+`just train-classifier` runs through the training uv project with the classifier
+extra, so `numpy`, `av`, `torch`, and `torchvision` are installed by uv instead
+of being manually added to the system Python.
 
 What it does, and why each part:
 

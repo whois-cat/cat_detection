@@ -5,6 +5,8 @@ set dotenv-load := true
 COMPOSE := "docker compose -f docker-compose.yml -f docker-compose.cameras.yml"
 DEV_COMPOSE := COMPOSE + " -f docker-compose.dev.yml -f docker-compose.cameras.dev.yml"
 CLUSTER_SERVICE := env_var_or_default("CLUSTER_SERVICE", "detector-grey")
+TRAINING_RUN := "uv run --project training"
+CLASSIFIER_RUN := TRAINING_RUN + " --extra classifier"
 
 default:
     @just --list
@@ -69,6 +71,10 @@ label-stats *ARGS:
         --labels "${REVIEW_LABELS:-alisa,chuzh,ellie,felisis}" \
         {{ARGS}}
 
+# One-time dependency check/warmup for training commands. Uses uv.
+training-setup:
+    {{CLASSIFIER_RUN}} python -c "import av, cv2, numpy, torch, torchvision; print('training deps ok')"
+
 # Rebuild detector events from recordings with offline YOLO. Useful when live
 # detector events are polluted by static false positives.
 rescan-recordings *ARGS:
@@ -82,7 +88,7 @@ rescan-recordings *ARGS:
 
 # Train the identity classifier from reviewed labels. Args pass through.
 train-classifier *ARGS:
-    uv run python -m training.train_classifier \
+    {{CLASSIFIER_RUN}} python -m training.train_classifier \
         --db "${EVENTS_DB:-data/events/events.db}" \
         --recordings "${RECORDINGS_ROOT:-data/recordings}" \
         --reviews-db "${REVIEW_DB:-data/review/reviews.db}" \
@@ -90,7 +96,7 @@ train-classifier *ARGS:
 
 # Build/update compact replay memory from human-reviewed crops.
 build-replay-set *ARGS:
-    uv run python -m training.build_replay_set \
+    {{CLASSIFIER_RUN}} python -m training.build_replay_set \
         --db "${EVENTS_DB:-data/events/events.db}" \
         --recordings "${RECORDINGS_ROOT:-data/recordings}" \
         --reviews-db "${REVIEW_DB:-data/review/reviews.db}" \
@@ -99,7 +105,7 @@ build-replay-set *ARGS:
 
 # Compare candidate classifiers on the same human-reviewed crops.
 compare-classifiers *ARGS:
-    uv run python -m training.compare_classifiers \
+    {{CLASSIFIER_RUN}} python -m training.compare_classifiers \
         --db "${EVENTS_DB:-data/events/events.db}" \
         --recordings "${RECORDINGS_ROOT:-data/recordings}" \
         --reviews-db "${REVIEW_DB:-data/review/reviews.db}" \
