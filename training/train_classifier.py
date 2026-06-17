@@ -173,6 +173,32 @@ def split_episodes(episodes: list[list[int]], metas: list[Meta], *,
     return train_idx, val_idx, test_idx
 
 
+def check_split_leakage(episodes: list[list[int]],
+                        train_idx: list[int], val_idx: list[int],
+                        test_idx: list[int]) -> None:
+    """Fail loudly if the train/val/test split leaks.
+
+    Two independent guarantees: (1) the three index sets are pairwise disjoint —
+    no crop is in two splits; (2) every episode (a whole visit's worth of
+    near-duplicate neighbours) lands entirely in ONE split, so adjacent frames
+    of the same visit can't straddle the boundary. Raises AssertionError on any
+    violation; cheap enough to run unconditionally after every split."""
+    train_s, val_s, test_s = set(train_idx), set(val_idx), set(test_idx)
+    assert not (train_s & val_s), f"train∩val leak: {sorted(train_s & val_s)[:5]}"
+    assert not (train_s & test_s), f"train∩test leak: {sorted(train_s & test_s)[:5]}"
+    assert not (val_s & test_s), f"val∩test leak: {sorted(val_s & test_s)[:5]}"
+    owner: dict[int, str] = {}
+    for name, s in (("train", train_s), ("val", val_s), ("test", test_s)):
+        for idx in s:
+            owner[idx] = name
+    for ep_n, episode in enumerate(episodes):
+        homes = {owner[i] for i in episode if i in owner}
+        assert len(homes) <= 1, (
+            f"episode {ep_n} leaks across splits {sorted(homes)} "
+            f"(crops {episode[:5]})"
+        )
+
+
 # ----------------------------------------------------------------- metrics ----
 
 def confusion(y_true: list[int], y_pred: list[int], n: int) -> np.ndarray:
@@ -526,6 +552,7 @@ def main() -> None:
         val_frac=args.val_frac, test_frac=args.test_frac,
         required={m.label for m in fresh_metas}, seed=args.seed,
     )
+    check_split_leakage(episodes, train_idx, val_idx, test_idx)
     items = fresh_items + replay_items
     metas = fresh_metas + replay_metas
     if replay_metas:

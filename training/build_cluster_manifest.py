@@ -254,22 +254,48 @@ def compact_items_to_clusters(
     return compacted_items, compacted_clusters
 
 
-def kmeans(x: np.ndarray, k: int, *, seed: int, max_iter: int) -> tuple[np.ndarray, np.ndarray]:
+def assign_chunked(x: np.ndarray, centers: np.ndarray, *, chunk: int
+                   ) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest-center labels + squared distances in row chunks.
+
+    Never materializes the full N×K distance matrix — only `chunk`×K at a time —
+    so memory stays flat as N grows. float32 throughout; temporaries freed each
+    chunk. Results are identical to the dense computation (chunking only changes
+    *when* rows are processed, not the argmin)."""
+    n = x.shape[0]
+    step = max(1, int(chunk))
+    labels = np.empty(n, dtype=np.int32)
+    dists = np.empty(n, dtype=np.float32)
+    c_norm = np.sum(centers * centers, axis=1, dtype=np.float32)   # (K,)
+    # float32 SIMD matmul can raise spurious FP-exception warnings; the values
+    # are fine (argmin is unaffected).
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        for s in range(0, n, step):
+            xb = x[s:s + step]
+            x_norm = np.sum(xb * xb, axis=1, dtype=np.float32)[:, None]  # (b,1)
+            d = x_norm + c_norm[None, :] - 2.0 * (xb @ centers.T)        # (b,K)
+            lb = np.argmin(d, axis=1).astype(np.int32)
+            labels[s:s + step] = lb
+            dists[s:s + step] = d[np.arange(lb.shape[0]), lb]
+            del d, x_norm, lb
+    np.maximum(dists, 0.0, out=dists)   # float round-off can dip below 0
+    return labels, dists
+
+
+def kmeans(x: np.ndarray, k: int, *, seed: int, max_iter: int,
+           chunk: int = 4096) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
+    x = np.ascontiguousarray(x, dtype=np.float32)
     n = x.shape[0]
     k = max(1, min(k, n))
     centers = x[rng.choice(n, size=k, replace=False)].copy()
     labels = np.full(n, -1, dtype=np.int32)
 
-    x_norm = np.sum(x * x, axis=1, keepdims=True)
     for _ in range(max_iter):
-        c_norm = np.sum(centers * centers, axis=1, keepdims=True).T
-        dist = x_norm + c_norm - 2.0 * (x @ centers.T)
-        new_labels = np.argmin(dist, axis=1).astype(np.int32)
+        new_labels, _ = assign_chunked(x, centers, chunk=chunk)
         if np.array_equal(new_labels, labels):
             break
         labels = new_labels
-
         sums = np.zeros_like(centers)
         counts = np.bincount(labels, minlength=k).astype(np.float32)
         np.add.at(sums, labels, x)
@@ -277,10 +303,9 @@ def kmeans(x: np.ndarray, k: int, *, seed: int, max_iter: int) -> tuple[np.ndarr
         centers = sums / np.maximum(counts[:, None], 1.0)
         if np.any(empty):
             centers[empty] = x[rng.choice(n, size=int(empty.sum()), replace=False)]
+        del sums
 
-    c_norm = np.sum(centers * centers, axis=1, keepdims=True).T
-    dist = x_norm + c_norm - 2.0 * (x @ centers.T)
-    assigned_dist = dist[np.arange(n), labels]
+    labels, assigned_dist = assign_chunked(x, centers, chunk=chunk)
     return labels, assigned_dist.astype(np.float32)
 
 
@@ -306,6 +331,9 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--clusters", type=int, default=None)
     ap.add_argument("--max-iter", type=int, default=30)
+    ap.add_argument("--chunk-size", type=int, default=4096,
+                    help="rows per chunk for k-means assignment; bounds peak RAM "
+                         "(never builds the full N×K distance matrix)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--embedding", choices=("auto", "visual", "efficientnet"),
                     default="auto",
@@ -448,7 +476,9 @@ def main() -> None:
         print(f"[cluster] dropped {ignored_by_region} crops inside ignore region(s)")
 
     k = args.clusters or default_cluster_count(len(items))
-    labels, distances = kmeans(x, k, seed=args.seed, max_iter=args.max_iter)
+    labels, distances = kmeans(
+        x, k, seed=args.seed, max_iter=args.max_iter, chunk=args.chunk_size,
+    )
 
     cluster_members: dict[int, list[int]] = {}
     for i, (cluster, dist) in enumerate(zip(labels.tolist(), distances.tolist())):

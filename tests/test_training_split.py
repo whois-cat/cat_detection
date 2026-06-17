@@ -1,8 +1,10 @@
 import numpy as np
+import pytest
 
 from training.train_classifier import (
     Meta,
     build_episodes,
+    check_split_leakage,
     split_episodes,
     supported_macro_recall,
 )
@@ -37,6 +39,21 @@ def test_episode_split_keeps_neighbours_together():
 
     for episode in episodes:
         assert len({owners[idx] for idx in episode}) == 1
+
+    # The real split must pass the leakage guard.
+    check_split_leakage(episodes, train, val, test)
+
+
+def test_leakage_check_catches_split_violations():
+    episodes = [[0, 1], [2, 3]]
+    # crop 1 placed in both train and val → must raise.
+    with pytest.raises(AssertionError):
+        check_split_leakage(episodes, train_idx=[0, 1], val_idx=[1], test_idx=[2, 3])
+    # episode [0,1] split across train/val → must raise.
+    with pytest.raises(AssertionError):
+        check_split_leakage(episodes, train_idx=[0], val_idx=[1], test_idx=[2, 3])
+    # clean split → no raise.
+    check_split_leakage(episodes, train_idx=[0, 1], val_idx=[2, 3], test_idx=[])
 
 
 def test_macro_recall_ignores_classes_absent_from_eval_split():
