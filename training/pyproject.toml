@@ -2,7 +2,10 @@
 name = "live2-training"
 version = "0.1.0"
 description = "Training-data extraction + boilerplate for live2 detection pipeline."
-requires-python = ">=3.10"
+# Cap below 3.13: the pinned torch 2.5.1 only ships cp310–cp312 wheels, and the
+# project's runtime venv is 3.10. Without the cap uv picks the newest managed
+# Python (3.13) and the torch install fails for lack of a cp313 wheel.
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "av",
     "numpy",
@@ -16,7 +19,14 @@ yolo       = ["ultralytics"]
 # train_classifier.py needs only torch + torchvision. On Linux, uv is configured
 # below to resolve both from PyTorch's CPU-only wheel index so it does not pull
 # nvidia-* CUDA runtime wheels on machines without a GPU.
-classifier = ["torch", "torchvision", "scikit-learn"]
+#
+# Pin a KNOWN-GOOD compatible pair (matches the project's main .venv). Without a
+# pin, uv grabs the latest torch; during a release window the matching
+# torchvision macOS/arm64 wheel may not be on PyPI yet, so uv falls back to the
+# Linux-only CPU-index build (e.g. torchvision==X+<hash>) which has no macOS
+# wheel and the install fails. torch 2.5.1 / torchvision 0.20.1 ship both
+# macOS-arm64 (PyPI) and Linux CPU-index wheels.
+classifier = ["torch==2.5.1", "torchvision==0.20.1", "scikit-learn"]
 # Stage B label-review web app (see ../review/requirements.txt). Decode-only —
 # deliberately no openvino/torch; av+numpy come from the base deps above.
 review     = ["fastapi", "uvicorn", "Pillow"]
