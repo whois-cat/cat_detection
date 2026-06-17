@@ -20,9 +20,22 @@
   // what's actually playable.
   import { onMount, onDestroy, untrack } from 'svelte';
   import Timeline from './Timeline.svelte';
+  import { planSeek, sameWindowLoaded } from './seek.js';
 
   // ---- DOM refs (plain let) ----
   let liveVideo, historyVideo, canvas, wrap, appRoot;
+
+  // ---- Canvas / RAF lifecycle (non-reactive) ----
+  // Cap device pixel ratio: overlay strokes don't need >1.5x, and high-DPR
+  // canvases quadruple per-frame fill cost on retina displays.
+  const MAX_DPR = 1.5;
+  let ctx2d = null;            // cached 2D context (getContext is not free)
+  let cssW = 0, cssH = 0;     // CSS px size, updated by ResizeObserver (not per-frame)
+  let canvasResized = true;   // set when ResizeObserver fires; drives a one-off resize
+  let rafId = 0;              // current requestAnimationFrame / rVFC handle
+  let rafIsVFC = false;       // whether rafId came from requestVideoFrameCallback
+  let resizeObserver = null;
+  let drawLoopRunning = false;
 
   // ---- Non-reactive (imperative state used only in handlers / draw) ----
   let pc, ws;
@@ -139,17 +152,28 @@
     return lum > 0.5 ? 'rgba(0,0,0,0.85)' : 'rgba(255,255,255,0.85)';
   })();
 
+  function ensureCtx() {
+    if (!ctx2d && canvas) ctx2d = canvas.getContext('2d');
+    return ctx2d;
+  }
+
   function syncCanvasSize() {
-    const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth || canvas.width || 1;
-    const height = canvas.clientHeight || canvas.height || 1;
-    const pxW = Math.max(1, Math.round(width * dpr));
-    const pxH = Math.max(1, Math.round(height * dpr));
-    if (canvas.width !== pxW || canvas.height !== pxH) {
-      canvas.width = pxW;
-      canvas.height = pxH;
+    const ctx = ensureCtx();
+    // Use the ResizeObserver-cached CSS size; reading clientWidth/Height every
+    // frame forces a synchronous layout. Only touch canvas.width/height (which
+    // also clears it) when the element actually resized.
+    const width = cssW || canvas.clientWidth || canvas.width || 1;
+    const height = cssH || canvas.clientHeight || canvas.height || 1;
+    const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+    if (canvasResized) {
+      const pxW = Math.max(1, Math.round(width * dpr));
+      const pxH = Math.max(1, Math.round(height * dpr));
+      if (canvas.width !== pxW || canvas.height !== pxH) {
+        canvas.width = pxW;
+        canvas.height = pxH;
+      }
+      canvasResized = false;
     }
-    const ctx = canvas.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
     return { ctx, width, height };
@@ -214,13 +238,18 @@
     return best;
   }
 
+  function clearCanvas() {
+    const ctx = ensureCtx();
+    if (!ctx || !canvas) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+
   function drawOverlay() {
     if (!canvas) return;
-    // Zones hidden: wipe the whole canvas and draw nothing (no regions, no boxes).
+    // Zones hidden: wipe once and draw nothing (the loop is also stopped).
     if (!showZones) {
-      const ctx = canvas.getContext('2d');
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      clearCanvas();
       return;
     }
     const v = mode === 'live' ? liveVideo : historyVideo;
@@ -346,9 +375,47 @@
     ctx.shadowBlur = 0;
   }
 
-  function drawLoop() {
+  // ---- Draw loop lifecycle ----
+  // The loop only runs while zones are shown (nothing to draw otherwise), and a
+  // single guarded handle prevents two loops after a remount. Prefers
+  // requestVideoFrameCallback in live mode so we redraw per decoded frame, not
+  // per display refresh.
+  function cancelDrawFrame() {
+    if (!rafId) return;
+    if (rafIsVFC && liveVideo && typeof liveVideo.cancelVideoFrameCallback === 'function') {
+      liveVideo.cancelVideoFrameCallback(rafId);
+    } else {
+      cancelAnimationFrame(rafId);
+    }
+    rafId = 0;
+  }
+
+  function scheduleNextFrame() {
+    if (!drawLoopRunning) return;
+    const v = mode === 'live' ? liveVideo : null;
+    if (v && typeof v.requestVideoFrameCallback === 'function') {
+      rafIsVFC = true;
+      rafId = v.requestVideoFrameCallback(drawFrame);
+    } else {
+      rafIsVFC = false;
+      rafId = requestAnimationFrame(drawFrame);
+    }
+  }
+
+  function drawFrame() {
     drawOverlay();
-    requestAnimationFrame(drawLoop);
+    scheduleNextFrame();
+  }
+
+  function startDrawLoop() {
+    if (drawLoopRunning) return;
+    drawLoopRunning = true;
+    scheduleNextFrame();
+  }
+
+  function stopDrawLoop() {
+    drawLoopRunning = false;
+    cancelDrawFrame();
   }
 
   // ---- WebRTC (WHEP) ----
@@ -440,6 +507,11 @@
   // so we can only play forward from whatever first bytes the server sends.
   function loadPlaybackWindowAt(startMs) {
     if (!historyVideo) return;
+    // Don't refetch a range we already have loaded.
+    if (sameWindowLoaded(startMs, playbackWindowStartMs, !!historyVideo.src)) {
+      playbackTargetMs = startMs;
+      return;
+    }
     playbackTargetMs       = startMs;             // where the user clicked
     playbackWindowStartMs  = startMs;             // pre-load guess (corrected on loadedmetadata)
     playbackWindowEndMs    = startMs + PLAYBACK_WINDOW_SEC * 1000;
@@ -497,6 +569,18 @@
   // snappy scrubs — we accept the per-seek HTTP request cost.
   function seekHistory(targetMs) {
     if (!historyVideo) return;
+    // In-window seek: move currentTime only, never touch video.src (no fetch).
+    const plan = planSeek({
+      targetMs,
+      windowStartMs: playbackWindowStartMs || null,
+      windowEndMs: playbackWindowEndMs || null,
+      hasWindow: !!playbackWindowStartMs && !!historyVideo.src,
+    });
+    if (plan.mode === 'currentTime') {
+      playbackTargetMs = targetMs;
+      historyVideo.currentTime = plan.currentTime;
+      return;
+    }
     loadPlaybackWindowAt(targetMs);
   }
 
@@ -724,15 +808,41 @@
     nowTimer = setInterval(tickNow, 1000);
     rangesTimer = setInterval(refreshRecordingsList, 30_000);
     modelsTimer = setInterval(loadModels, 60_000);
-    requestAnimationFrame(drawLoop);
+    // Track CSS size via ResizeObserver instead of reading layout each frame.
+    if (canvas) {
+      cssW = canvas.clientWidth;
+      cssH = canvas.clientHeight;
+      ensureCtx();
+      resizeObserver = new ResizeObserver((entries) => {
+        for (const e of entries) {
+          cssW = e.contentRect.width;
+          cssH = e.contentRect.height;
+        }
+        canvasResized = true;
+      });
+      resizeObserver.observe(canvas);
+    }
+    // The draw loop is started/stopped by the showZones effect below; nothing
+    // to draw until zones are shown.
   });
   onDestroy(() => {
     clearInterval(nowTimer);
     clearInterval(rangesTimer);
     clearInterval(modelsTimer);
     clearTimeout(wsReconnectTimer);
+    stopDrawLoop();
+    try { resizeObserver && resizeObserver.disconnect(); } catch {}
     try { ws && ws.close(); } catch {}
     try { pc && pc.close(); } catch {}
+  });
+
+  // ---- Effect: run the overlay draw loop only while zones are visible ----
+  $effect(() => {
+    const show = showZones;
+    untrack(() => {
+      if (show) startDrawLoop();
+      else { stopDrawLoop(); clearCanvas(); }
+    });
   });
 
   // ---- Effect: mode transitions only ----
