@@ -270,6 +270,16 @@ Corrections are **non-destructive**: they go to a *separate* writable
 `events.db` are never touched and the database can stay read-only. Progress
 survives restart.
 
+Check label balance before training:
+
+```bash
+just label-stats
+```
+
+The report shows trainable cat labels separately from dropped labels such as
+`discard` / `unknown`, includes zero-count expected cats from `REVIEW_LABELS`,
+and prints a simple `max/min` balance ratio.
+
 **Feeding corrections back into training.** `CropSource` carries each box's
 `events` rowid (`box.rowid` / `Sample.src_box.rowid`) and accepts a `reviews`
 map (`training.load_reviews("data/review/reviews.db")`): human labels are the

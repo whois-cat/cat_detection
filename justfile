@@ -62,6 +62,13 @@ cluster-review PORT="8095":
     uv run --with-requirements review/requirements.txt \
         python -m uvicorn review.cluster_app:app --host 0.0.0.0 --port {{PORT}}
 
+# Show reviewed label counts and class balance without training.
+label-stats *ARGS:
+    uv run python -m training.label_stats \
+        --reviews-db "${REVIEW_DB:-data/review/reviews.db}" \
+        --labels "${REVIEW_LABELS:-alisa,chuzh,ellie,felisis}" \
+        {{ARGS}}
+
 # Rebuild detector events from recordings with offline YOLO. Useful when live
 # detector events are polluted by static false positives.
 rescan-recordings *ARGS:
