@@ -322,7 +322,9 @@ just train-classifier \
 
 `just train-classifier` runs through the training uv project with the classifier
 extra, so `numpy`, `av`, `torch`, and `torchvision` are installed by uv instead
-of being manually added to the system Python.
+of being manually added to the system Python. On Linux, `torch` and
+`torchvision` are resolved from PyTorch's CPU-only wheel index; CUDA /
+`nvidia-*` wheels are not needed for this project.
 
 What it does, and why each part:
 
