@@ -326,6 +326,24 @@ of being manually added to the system Python. On Linux, `torch` and
 `torchvision` are resolved from PyTorch's CPU-only wheel index; CUDA /
 `nvidia-*` wheels are not needed for this project.
 
+The trainer is CPU/server friendly by default: cold-start training indexes only
+human-reviewed trainable crop refs, not the whole detector pool, and decodes
+pixels only for the current in-RAM batch. Crops are copied out of their decoded
+frame (contiguous), so a crop never keeps a full frame alive in RAM. Train batch
+crops are capped with `--batch-max-side 384`; val/test still use the
+runtime-identical preprocessing. `--batch-size` defaults to `8` (conservative for
+CPU); raise it when you have RAM headroom. If the machine is still tight, lower
+both:
+
+```bash
+just train-classifier --min-recall 0.85 --batch-size 4 --batch-max-side 320
+```
+
+RSS is logged before the dataset, after the first batch, and after each epoch.
+The optional `TorchLazyCachedDataset` (training/torch_dataset.py) keeps a
+byte-bounded LRU of resized crops instead of materialising everything; cap it
+with `TRAINING_CACHE_MAX_MB` (0 disables caching).
+
 What it does, and why each part:
 
 - **Labels (human-only by default).** Cold start trains ONLY on human-reviewed
@@ -344,8 +362,8 @@ What it does, and why each part:
   thresholds, such as opening the feeder only at `cat_score >= 0.9`, should be
   chosen from val behavior and then verified once on test. The split is nudged
   so val/test contain every class when possible.
-- **No JPEGs.** Crops are decoded from the recordings into RAM
-  (`CropSource` → `TorchCachedDataset.materialise()`), trained on, discarded.
+- **No JPEGs and no full crop cache.** Crops are decoded from recordings only
+  for the current batch, trained/evaluated, and discarded.
 - **Rotation, per-event.** Each crop is rotated by its own recorded `rotate_deg`
   (the shared `training.sources.rotate_crop`, same convention as the detector), so
   data captured under different — or later-changed — camera rotations trains
