@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Mapping
@@ -297,7 +298,10 @@ def _pad_crop(img: np.ndarray, box: Box, pad_frac: float):
     y1 = min(H, box.y + box.h + pad)
     if x1 <= x0 or y1 <= y0:
         return None, None
-    crop = img[y0:y1, x0:x1]
+    # Copy out of the frame: a bare slice is a VIEW that keeps the entire decoded
+    # frame alive for the crop's lifetime — the dominant training RAM leak. The
+    # contiguous copy owns its (small) buffer, so the frame can be freed.
+    crop = np.ascontiguousarray(img[y0:y1, x0:x1])
     local = Box(
         x=box.x - x0, y=box.y - y0, w=box.w, h=box.h,
         cat=box.cat, score=box.score, track_id=box.track_id,
@@ -358,3 +362,41 @@ def decode_one_crop(ref: CropRef, recordings_root, *, pad_frac: float = 0.15,
     raise CropUnavailable(
         f"seek produced no frame in {seg.path} at media_t={media_t:.3f}s"
     )
+
+
+def decode_crop_batch(refs: Iterable[CropRef], recordings_root, *,
+                      pad_frac: float = 0.15,
+                      indices: dict[str, SegmentIndex] | None = None) -> list[np.ndarray | None]:
+    """Decode a batch of crop refs, holding only this batch in RAM.
+
+    Refs are grouped by camera segment so each recording segment is opened once
+    per batch. Missing/pruned refs return None at their original positions.
+    """
+    refs_list = list(refs)
+    out: list[np.ndarray | None] = [None] * len(refs_list)
+    segment_indices = indices if indices is not None else {}
+    by_segment: dict[Path, list[tuple[int, float, CropRef]]] = defaultdict(list)
+
+    for pos, ref in enumerate(refs_list):
+        index = segment_indices.get(ref.camera_id)
+        if index is None:
+            index = SegmentIndex.from_dir(Path(recordings_root) / ref.camera_id)
+            segment_indices[ref.camera_id] = index
+        hit = index.locate(ref.wall_ms)
+        if hit is None:
+            continue
+        seg, media_t = hit
+        by_segment[seg.path].append((pos, media_t, ref))
+
+    for seg_path, entries in by_segment.items():
+        by_offset: dict[float, list[tuple[int, CropRef]]] = defaultdict(list)
+        for pos, media_t, ref in entries:
+            by_offset[media_t].append((pos, ref))
+        for off, img in _decode_frames_at(seg_path, sorted(by_offset)):
+            for pos, ref in by_offset[off]:
+                crop, _local = _pad_crop(img, ref.box, pad_frac)
+                if crop is None:
+                    continue
+                out[pos] = rotate_crop(crop, ref.rotate_deg)
+
+    return out

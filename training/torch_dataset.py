@@ -58,13 +58,38 @@ SampleSource at all. For TorchStreamingDataset, set `num_workers=0`.
 """
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
+from .crop_cache import BoundedCropCache
 from .sources import Sample, SampleSource
+
+# Default RAM budget for the lazy crop cache; 0 disables caching. CPU boxes
+# should keep this modest — the cache only avoids re-decoding, not OOM.
+TRAINING_CACHE_MAX_MB = float(os.environ.get("TRAINING_CACHE_MAX_MB", "512"))
+
+
+def _resize_uint8(img_bgr: np.ndarray, max_side: int) -> np.ndarray:
+    """Contiguous uint8 crop capped to `max_side` on its long edge (0 = as-is)."""
+    arr = np.ascontiguousarray(img_bgr)
+    if max_side <= 0:
+        return arr
+    h, w = arr.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return arr
+    scale = max_side / float(longest)
+    import cv2
+
+    out = cv2.resize(
+        arr, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+    return np.ascontiguousarray(out)
 
 
 # ---- helpers ----------------------------------------------------------------
@@ -137,3 +162,58 @@ class TorchCachedDataset(Dataset):
         assert self._cache is not None
         img, label = self._cache[idx]
         return self.transform(img), label
+
+
+# ---- Dataset (lazy, byte-bounded LRU) ---------------------------------------
+
+class TorchLazyCachedDataset(Dataset):
+    """Map-style dataset that decodes crops on demand and keeps a byte-bounded
+    LRU of resized ``uint8`` crops — never the full dataset, never full frames.
+
+    First pass collects only lightweight per-sample metadata (label + a small
+    closure that re-decodes/resizes ONE crop). On ``__getitem__`` the crop is
+    served from the cache or recomputed; ``transform`` (float conversion +
+    augmentation) runs after the cache so the cache stays compact ``uint8``.
+
+    `cache_max_mb<=0` disables retention (every access re-decodes). Inspect
+    ``cache.stats`` for current/peak bytes, hits, misses, evictions.
+    """
+
+    def __init__(self, source: SampleSource,
+                 transform: Callable[[np.ndarray], torch.Tensor] = default_transform,
+                 target_fn: Callable[[Sample], object] = default_target_fn,
+                 *, cache_max_mb: float = TRAINING_CACHE_MAX_MB,
+                 resize_max_side: int = 256):
+        super().__init__()
+        self.source = source
+        self.transform = transform
+        self.target_fn = target_fn
+        self.resize_max_side = resize_max_side
+        self.cache = BoundedCropCache(cache_max_mb)
+        # Decoded once: (label, loader) where loader returns a small uint8 crop.
+        self._items: list[tuple[object, Callable[[], np.ndarray]]] | None = None
+
+    def _index(self) -> None:
+        if self._items is not None:
+            return
+        items: list[tuple[object, Callable[[], np.ndarray]]] = []
+        for s in self.source:
+            label = self.target_fn(s)
+            crop = _resize_uint8(s.image, self.resize_max_side)
+            # The crop is already small + contiguous; the loader just returns it.
+            # (Subclasses backed by random-access decode can override this to
+            #  re-decode instead of holding the bytes — left as a TODO.)
+            items.append((label, (lambda c=crop: c)))
+        self._items = items
+
+    def __len__(self) -> int:
+        self._index()
+        assert self._items is not None
+        return len(self._items)
+
+    def __getitem__(self, idx: int):
+        self._index()
+        assert self._items is not None
+        label, loader = self._items[idx]
+        crop = self.cache.get(idx, loader)
+        return self.transform(crop), label

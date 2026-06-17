@@ -6,10 +6,9 @@ the BEST-by-val model to a NEW path. The runtime is NOT touched — swapping the
 model into production is a separate, later step.
 
 Pipeline (all reused from this package):
-  - training.CropSource            — decode crops from recordings by events coords
+  - training.db.iter_frames        — collect reviewed crop refs/metadata
   - training.reviews.load_reviews  — human corrections {rowid: label}
-  - training.torch_dataset.TorchCachedDataset — decode-once RAM cache (fork-safe:
-    materialise() before any DataLoader workers; we default num_workers=0 anyway)
+  - training.sources.decode_crop_batch — decode only the current batch in RAM
   - detector/classifier.py::_preprocess — the EXACT runtime eval transform
 
 Label policy (flags; safe defaults):
@@ -34,11 +33,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import sys
 from collections import defaultdict, namedtuple
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
@@ -52,6 +53,8 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 DROP_LABELS = {"discard", "unknown"}
 
 Meta = namedtuple("Meta", ["label", "camera", "wall_ms"])
+CropRefLite = namedtuple("CropRefLite", ["camera_id", "wall_ms", "box", "rotate_deg"])
+TrainItem = namedtuple("TrainItem", ["meta", "ref", "image"])
 
 
 # --------------------------------------------------------------- label policy --
@@ -258,6 +261,36 @@ def confuse_cross_errors(cm: np.ndarray, classes: list[str], confuse: set[str]) 
     return int(cm[a, b] + cm[b, a])
 
 
+def shrink_bgr_for_batch(img: np.ndarray, max_side: int) -> np.ndarray:
+    """Cap a decoded crop before turning the current batch into tensors.
+
+    Runtime preprocessing ultimately resizes classifier crops to 224px input.
+    Keeping very large raw crops inside a batch only burns memory; a 384-512px
+    cap preserves useful detail while making CPU training much harder to OOM.
+    """
+    if max_side <= 0:
+        return img
+    h, w = img.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return img
+    scale = max_side / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    import cv2
+
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def index_batches(indices: list[int], batch_size: int, *,
+                  rng: random.Random | None = None) -> Iterator[list[int]]:
+    order = list(indices)
+    if rng is not None:
+        rng.shuffle(order)
+    for start in range(0, len(order), max(1, batch_size)):
+        yield order[start:start + max(1, batch_size)]
+
+
 def load_checkpoint_remapped(model, checkpoint: dict, classes: list[str]) -> dict:
     """Load a previous classifier, remapping the head by class name.
 
@@ -342,83 +375,142 @@ def main() -> None:
     ap.add_argument("--test-frac", type=float, default=0.1)
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--patience", type=int, default=6, help="early stop on val macro-recall")
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--batch-size", type=int, default=8,
+                    help="conservative CPU default; raise if you have RAM headroom")
+    ap.add_argument("--batch-max-side", type=int, default=384,
+                    help="resize decoded crops to at most this many pixels on the "
+                         "long side while building an in-RAM batch; 0 disables")
+    ap.add_argument("--cache-max-side", type=int, default=None,
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--torch-threads", type=int, default=min(4, os.cpu_count() or 1),
+                    help="limit PyTorch CPU worker threads; set 0 to leave default")
     ap.add_argument("--lr", type=float, default=None, help="default 1e-3 head / 1e-4 full")
     ap.add_argument("--init-from", type=Path, default=None,
                     help="optional previous cat_classifier.pt checkpoint to fine-tune from")
     ap.add_argument("--full-finetune", action="store_true",
                     help="train the whole backbone (low LR) instead of head + last block")
-    ap.add_argument("--num-workers", type=int, default=0, help="keep 0 on CPU (fork-safe)")
+    ap.add_argument("--num-workers", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--min-recall", type=float, default=0.9,
                     help="PASS/FAIL gate: every class (incl. confuse) needs val recall >= this")
     ap.add_argument("--out-root", type=Path, default=ROOT / "models/trained")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    if args.cache_max_side is not None:
+        args.batch_max_side = args.cache_max_side
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset
     from torchvision import models, transforms as T
+
+    if args.torch_threads > 0:
+        torch.set_num_threads(args.torch_threads)
 
     try:
         from classifier import _preprocess  # exact runtime eval preprocessing
     except ImportError:
         sys.path.insert(0, str(ROOT / "detector"))
         from classifier import _preprocess
-    from training import CropSource, load_reviews
+    from training import load_reviews
+    from training.ram import log_rss
+    from training.db import iter_frames, open_db_ro
     from training.replay import load_replay_set
-    from training.torch_dataset import TorchCachedDataset
+    from training.segments import SegmentIndex
+    from training.sources import decode_crop_batch
 
     # Determinism.
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    g = torch.Generator().manual_seed(args.seed)
 
     confuse = {c.strip() for c in args.confuse.split(",") if c.strip()}
 
-    # --- decode crops once into RAM, deciding the final label per crop ---
+    # --- collect crop refs/metadata only; pixels are decoded per batch later ---
     reviews = load_reviews(args.reviews_db) if args.reviews_db else {}
     log.info("loaded %d human corrections", len(reviews))
 
-    def meta_fn(sample) -> Meta:
-        sb = sample.src_box
-        human = reviews.get(sb.rowid) if sb and sb.rowid is not None else None
-        label = decide_label(sb.cat if sb else None,
-                             sb.cat_score if sb else None,
-                             human, args.trust_classifier, args.trust_conf)
-        return Meta(label=label, camera=sample.camera_id, wall_ms=sample.wall_ms)
+    segment_indices: dict[str, SegmentIndex] = {}
 
-    # CropSource WITHOUT reviews= (we need raw classifier labels/conf for policy).
-    # default_rotate_deg only affects pre-migration events with NULL rotate_deg.
-    src = CropSource(db_path=args.db, recordings_root=args.recordings,
-                     camera_id=args.camera, model=args.model,
-                     min_score=args.min_score, pad_frac=args.pad_frac,
-                     default_rotate_deg=args.default_rotate_deg)
-    cache = TorchCachedDataset(src, transform=lambda x: x, target_fn=meta_fn)
-    cache.materialise()   # decode pass in the MAIN process (CropSource isn't fork-safe)
+    def segment_index(camera_id: str) -> SegmentIndex:
+        index = segment_indices.get(camera_id)
+        if index is None:
+            index = SegmentIndex.from_dir(args.recordings / camera_id)
+            segment_indices[camera_id] = index
+        return index
 
-    items = [cache[i] for i in range(len(cache))]          # (img_bgr, Meta)
-    kept = [(img, m) for (img, m) in items if m.label is not None]
-    if not kept:
+    log_rss(log, "before-dataset")
+    fresh_items: list[TrainItem] = []
+    scanned = 0
+    unavailable = 0
+    warned_missing_rotate = False
+    conn = open_db_ro(args.db)
+    try:
+        frames = iter_frames(
+            conn,
+            camera_id=args.camera,
+            model=args.model,
+            min_score=args.min_score,
+        )
+        for frame in frames:
+            rot = frame.rotate_deg
+            if rot is None:
+                rot = args.default_rotate_deg
+                if not warned_missing_rotate:
+                    log.warning(
+                        "event(s) without recorded rotate_deg — assuming %d°. "
+                        "Set --default-rotate-deg to the camera's rotation at "
+                        "capture time for pre-migration data.", rot,
+                    )
+                    warned_missing_rotate = True
+            hit = segment_index(frame.camera_id).locate(frame.wall_ms)
+            for box in frame.boxes:
+                scanned += 1
+                human = reviews.get(box.rowid) if box.rowid is not None else None
+                label = decide_label(
+                    box.cat, box.cat_score, human,
+                    args.trust_classifier, args.trust_conf,
+                )
+                if label is None:
+                    continue
+                if hit is None:
+                    unavailable += 1
+                    continue
+                meta = Meta(label=label, camera=frame.camera_id, wall_ms=frame.wall_ms)
+                ref = CropRefLite(frame.camera_id, frame.wall_ms, box, int(rot or 0))
+                fresh_items.append(TrainItem(meta=meta, ref=ref, image=None))
+    finally:
+        conn.close()
+
+    if not fresh_items:
         raise SystemExit("no usable crops after the label policy — loosen "
                          "--trust-classifier or add human reviews")
-    fresh_images = [img for img, _ in kept]
-    fresh_metas = [m for _, m in kept]
-    log.info("kept %d / %d crops after label policy", len(kept), len(items))
+    if unavailable:
+        log.warning("skipped %d reviewed crops whose recordings are unavailable", unavailable)
+    log.info(
+        "kept %d / %d event boxes after label policy; pixels will decode per batch",
+        len(fresh_items), scanned,
+    )
 
-    replay_items = []
+    fresh_metas = [item.meta for item in fresh_items]
+
+    replay_loaded = []
     for replay_path in args.replay_set:
-        replay_items.extend(load_replay_set(replay_path))
-    if replay_items:
+        replay_loaded.extend(load_replay_set(replay_path))
+    if replay_loaded:
         log.info("loaded %d replay crops from %d replay set(s)",
-                 len(replay_items), len(args.replay_set))
-    replay_images = [img for img, _ in replay_items]
-    replay_metas = [m for _, m in replay_items]
+                 len(replay_loaded), len(args.replay_set))
+    replay_items = [
+        TrainItem(
+            meta=Meta(label=m.label, camera=m.camera, wall_ms=m.wall_ms),
+            ref=None,
+            image=shrink_bgr_for_batch(img, args.batch_max_side),
+        )
+        for img, m in replay_loaded
+    ]
+    replay_metas = [item.meta for item in replay_items]
 
     classes = sorted({m.label for m in [*fresh_metas, *replay_metas]})
     cls_to_idx = {c: i for i, c in enumerate(classes)}
@@ -434,7 +526,7 @@ def main() -> None:
         val_frac=args.val_frac, test_frac=args.test_frac,
         required={m.label for m in fresh_metas}, seed=args.seed,
     )
-    images = fresh_images + replay_images
+    items = fresh_items + replay_items
     metas = fresh_metas + replay_metas
     if replay_metas:
         train_idx.extend(range(len(fresh_metas), len(metas)))
@@ -470,24 +562,53 @@ def main() -> None:
         rgb = np.ascontiguousarray(img_bgr[..., ::-1])
         return torch.from_numpy(_preprocess(rgb)[0]).float()  # == runtime preprocessing
 
-    class Crops(Dataset):
-        def __init__(self, idxs, tf):
-            self.idxs, self.tf = idxs, tf
-        def __len__(self):
-            return len(self.idxs)
-        def __getitem__(self, k):
-            j = self.idxs[k]
-            return self.tf(images[j]), cls_to_idx[metas[j].label]
+    def make_batch(batch_indices: list[int], tf, *, max_side: int = 0):
+        refs = []
+        ref_slots = []
+        batch_images: list[np.ndarray | None] = [None] * len(batch_indices)
+        for slot, item_index in enumerate(batch_indices):
+            item = items[item_index]
+            if item.image is not None:
+                batch_images[slot] = item.image
+            else:
+                refs.append(item.ref)
+                ref_slots.append(slot)
 
-    train_ds = Crops(train_idx, train_tf)
-    val_ds = Crops(val_idx, eval_tf)
-    test_ds = Crops(test_idx, eval_tf)
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, generator=g)
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers)
-    test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                         num_workers=args.num_workers)
+        if refs:
+            decoded = decode_crop_batch(
+                refs,
+                args.recordings,
+                pad_frac=args.pad_frac,
+                indices=segment_indices,
+            )
+            for slot, img in zip(ref_slots, decoded):
+                if img is not None:
+                    batch_images[slot] = shrink_bgr_for_batch(img, max_side)
+
+        xs = []
+        ys = []
+        for item_index, img in zip(batch_indices, batch_images):
+            if img is None:
+                continue
+            xs.append(tf(img))
+            ys.append(cls_to_idx[metas[item_index].label])
+        if not xs:
+            return None
+        return torch.stack(xs), torch.tensor(ys, dtype=torch.long)
+
+    def predict_indices(indices: list[int]):
+        y_true: list[int] = []
+        y_pred: list[int] = []
+        with torch.no_grad():
+            for batch_indices in index_batches(indices, args.batch_size):
+                batch = make_batch(batch_indices, eval_tf)
+                if batch is None:
+                    continue
+                x, y = batch
+                pred = model(x).argmax(1)
+                y_true.extend(y.tolist())
+                y_pred.extend(pred.tolist())
+        return y_true, y_pred
 
     # --- class-imbalance weighting (inverse frequency on TRAIN) ---
     counts = np.bincount([cls_to_idx[metas[j].label] for j in train_idx],
@@ -541,26 +662,33 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
-        for x, y in train_dl:
+        seen = 0
+        batch_rng = random.Random(args.seed + epoch)
+        first_batch = epoch == 1
+        for batch_indices in index_batches(train_idx, args.batch_size, rng=batch_rng):
+            batch = make_batch(batch_indices, train_tf, max_side=args.batch_max_side)
+            if batch is None:
+                continue
+            x, y = batch
             optim.zero_grad()
             loss = criterion(model(x), y)
             loss.backward()
             optim.step()
             running += loss.item() * x.size(0)
+            seen += x.size(0)
+            if first_batch:
+                log_rss(log, "after-first-batch")
+                first_batch = False
         sched.step()
+        log_rss(log, "after-epoch", epoch=epoch)
 
         model.eval()
-        y_true, y_pred = [], []
-        with torch.no_grad():
-            for x, y in val_dl:
-                pred = model(x).argmax(1)
-                y_true.extend(y.tolist())
-                y_pred.extend(pred.tolist())
+        y_true, y_pred = predict_indices(val_idx)
         cm = confusion(y_true, y_pred, len(classes))
         macro = supported_macro_recall(cm)
         cross = confuse_cross_errors(cm, classes, confuse)
         log.info("epoch %02d  train_loss=%.4f  val_macro_recall=%.3f  confuse_cross=%d",
-                 epoch, running / max(1, len(train_idx)), macro, cross)
+                 epoch, running / max(1, seen), macro, cross)
 
         improved = (macro > best["macro_recall"] + 1e-6 or
                     (abs(macro - best["macro_recall"]) <= 1e-6 and cross < best["cross"]))
@@ -579,21 +707,13 @@ def main() -> None:
     assert best["state"] is not None
     model.load_state_dict(best["state"])
     model.eval()
-    y_true, y_pred = [], []
-    with torch.no_grad():
-        for x, y in val_dl:
-            y_true.extend(y.tolist())
-            y_pred.extend(model(x).argmax(1).tolist())
+    y_true, y_pred = predict_indices(val_idx)
     cm = confusion(y_true, y_pred, len(classes))
     print(f"\n===== BEST model (epoch {best['epoch']}) on val =====")
     metrics = print_report(cm, classes, confuse)
 
     if test_idx:
-        y_true, y_pred = [], []
-        with torch.no_grad():
-            for x, y in test_dl:
-                y_true.extend(y.tolist())
-                y_pred.extend(model(x).argmax(1).tolist())
+        y_true, y_pred = predict_indices(test_idx)
         test_cm = confusion(y_true, y_pred, len(classes))
         print("\n===== Held-out TEST set =====")
         test_metrics = print_report(test_cm, classes, confuse)
@@ -622,6 +742,7 @@ def main() -> None:
         "trust_conf": args.trust_conf, "confuse": sorted(confuse),
         "replay_sets": [str(p) for p in args.replay_set],
         "replay_count": len(replay_metas),
+        "batch_max_side": args.batch_max_side,
         "init_from": str(args.init_from) if args.init_from else None,
         "full_finetune": args.full_finetune, "best_epoch": best["epoch"],
         "val_metrics": metrics, "test_metrics": test_metrics,
