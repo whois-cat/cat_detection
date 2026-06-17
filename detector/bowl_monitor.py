@@ -142,6 +142,53 @@ def bowl_contrast(frame_gray: np.ndarray, roi, margin_frac: float) -> float | No
     return ref_val - bowl_val
 
 
+def _luma(bgr: np.ndarray) -> np.ndarray:
+    if bgr.ndim != 3:
+        return bgr.astype(np.float32)
+    return (0.114 * bgr[..., 0] + 0.587 * bgr[..., 1]
+            + 0.299 * bgr[..., 2]).astype(np.float32)
+
+
+def bowl_contrast_bgr(frame_bgr: np.ndarray, roi, margin_frac: float) -> float | None:
+    """ROI-only equivalent of bowl_contrast: converts ONLY the expanded ROI
+    rectangle to grayscale, never the whole frame. Numerically identical to
+    bowl_contrast(luma(frame_bgr), ...) but allocates O(ROI) instead of O(frame).
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return None
+    poly = _polygon_from_roi(roi)
+    if len(poly) < 3:
+        return None
+    h, w = frame_bgr.shape[:2]
+    x0, y0, x1, y1 = _bbox_px(poly, w, h)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    bw = x1 - x0
+    bh = y1 - y0
+    margin = int(round(max(0.0, margin_frac) * min(bw, bh)))
+    if margin <= 0:
+        return None
+    ex0 = max(0, x0 - margin)
+    ey0 = max(0, y0 - margin)
+    ex1 = min(w, x1 + margin)
+    ey1 = min(h, y1 + margin)
+    sub_gray = _luma(frame_bgr[ey0:ey1, ex0:ex1])   # grayscale of ROI only
+
+    mask = _polygon_mask_px(poly, w, h, x0, y0, x1, y1)
+    if mask is None or not mask.any():
+        return None
+    bowl_local = sub_gray[y0 - ey0:y1 - ey0, x0 - ex0:x1 - ex0]
+    bowl_val = float(np.median(bowl_local[mask]))
+
+    ring_mask = np.ones(sub_gray.shape, dtype=bool)
+    ring_mask[y0 - ey0:y1 - ey0, x0 - ex0:x1 - ex0] = False
+    ring_pixels = sub_gray[ring_mask]
+    if ring_pixels.size == 0:
+        return None
+    ref_val = float(np.median(ring_pixels))
+    return ref_val - bowl_val
+
+
 def food_fill_fraction(
     frame_gray: np.ndarray,
     roi,
@@ -231,13 +278,14 @@ class BowlMonitor:
         self._recent: deque[float] = deque(maxlen=self.window)
 
     def update(
-        self, frame_gray: np.ndarray, cat_in_region: bool
+        self, frame_bgr: np.ndarray, cat_in_region: bool
     ) -> tuple[str, float | None, float | None]:
-        # Don't measure through a cat sitting in/over the bowl.
+        # Takes the BGR frame and converts ONLY the ROI to grayscale (no
+        # full-frame float32). Don't measure through a cat sitting over the bowl.
         if cat_in_region:
             return self.state, None, None
 
-        raw = bowl_contrast(frame_gray, self.roi, self.margin_frac)
+        raw = bowl_contrast_bgr(frame_bgr, self.roi, self.margin_frac)
         if raw is None:
             return self.state, None, None
 
@@ -253,7 +301,10 @@ class BowlMonitor:
         fill_b = min(1.0, max(0.0, fill_b))
 
         if self.texture_weight > 0:
-            tex = food_fill_fraction(frame_gray, self.roi, self.tiles, self.tex_thresh)
+            # Texture is an optional secondary signal; only here do we pay for a
+            # full-frame grayscale. TODO: remap the ROI to a sub-frame to keep
+            # this ROI-only as well when texture_weight is enabled.
+            tex = food_fill_fraction(_luma(frame_bgr), self.roi, self.tiles, self.tex_thresh)
             w = self.texture_weight
             fill = fill_b if tex is None else (1.0 - w) * fill_b + w * float(tex)
         else:

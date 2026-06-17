@@ -64,20 +64,42 @@ class CatClassifier:
         )
 
     def _probs(self, crop_rgb: np.ndarray) -> np.ndarray:
-        """Softmax probability vector for one crop. The single preprocess +
-        inference path — classify() and classify_all() both go through here so
-        runtime and review/diagnostics use byte-identical pixels and math."""
+        """Softmax probability vector for one crop. classify_all() goes through
+        here so review/diagnostics use byte-identical pixels and math."""
         inp = _preprocess(crop_rgb)
         logits = self._compiled(inp)[0]  # (1, num_classes)
         z = logits[0].astype(np.float64)
         e = np.exp(z - z.max())
         return e / e.sum()
 
+    def _probs_batch(self, crops_rgb: list[np.ndarray]) -> np.ndarray:
+        """Softmax matrix (N, num_classes) for N crops in ONE inference call.
+
+        Crops are preprocessed and stacked so the compiled model runs once per
+        batch instead of once per crop — the CPU win on multi-cat frames. Row
+        order matches the input order."""
+        if not crops_rgb:
+            return np.empty((0, len(self.class_names)), dtype=np.float64)
+        inp = np.concatenate([_preprocess(c) for c in crops_rgb], axis=0)
+        logits = self._compiled(inp)[0]  # (N, num_classes)
+        z = np.asarray(logits, dtype=np.float64)
+        e = np.exp(z - z.max(axis=1, keepdims=True))
+        return e / e.sum(axis=1, keepdims=True)
+
+    def classify_batch(self, crops_rgb: list[np.ndarray]) -> list[tuple[str, float]]:
+        """Classify many crops at once. Returns [(cat_name, confidence), ...] in
+        the SAME order as the input list (element type matches classify())."""
+        probs = self._probs_batch(crops_rgb)
+        out: list[tuple[str, float]] = []
+        for row in probs:
+            idx = int(np.argmax(row))
+            out.append((self.class_names[idx], float(row[idx])))
+        return out
+
     def classify(self, crop_rgb: np.ndarray) -> tuple[str, float]:
-        """Return (cat_name, confidence). crop_rgb is HWC uint8 RGB."""
-        probs = self._probs(crop_rgb)
-        idx = int(np.argmax(probs))
-        return self.class_names[idx], float(probs[idx])
+        """Return (cat_name, confidence). crop_rgb is HWC uint8 RGB.
+        Thin wrapper over classify_batch for a single crop."""
+        return self.classify_batch([crop_rgb])[0]
 
     def classify_all(self, crop_rgb: np.ndarray) -> list[tuple[str, float]]:
         """Return [(cat_name, prob), ...] over ALL classes in class_names order.

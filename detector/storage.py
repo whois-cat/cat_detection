@@ -39,6 +39,9 @@ def init_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Wait up to 5s on a locked DB instead of raising immediately, so concurrent
+    # readers (UI/pruner) don't make the detector's writes fail under contention.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn

@@ -241,12 +241,8 @@ def _maybe_update_food_monitor(
             cat_in_region = True
             break
 
-    frame_gray = (
-        0.114 * frame_bgr[..., 0]
-        + 0.587 * frame_bgr[..., 1]
-        + 0.299 * frame_bgr[..., 2]
-    ).astype(np.float32)
-    _food_state, fill, raw = FOOD_MONITOR.update(frame_gray, cat_in_region)
+    # BowlMonitor converts only the ROI to grayscale — no full-frame float32.
+    _food_state, fill, raw = FOOD_MONITOR.update(frame_bgr, cat_in_region)
     if fill is not None:
         _food_level = fill
     # Calibration mode: raw is available but no normalized fill yet. Surface the
@@ -329,6 +325,21 @@ artificial_delay_ms = int(os.environ.get("ARTIFICIAL_DELAY_MS", "0"))
 event_q:   "queue.Queue[dict]"       = queue.Queue(maxsize=200)
 pending_q: "queue.Queue[tuple[int, dict]]" = queue.Queue(maxsize=400)
 
+# Drop accounting — overflow used to be silently swallowed (`except Full: pass`).
+_events_dropped = 0      # pending/event queue overflow
+_ws_send_dropped = 0     # per-client send timeouts/failures (a slow client)
+# Per-client send timeout so one slow/stalled WebSocket can't block the others.
+WS_SEND_TIMEOUT_SEC = float(os.environ.get("WS_SEND_TIMEOUT_SEC", "2.0"))
+
+
+def _enqueue_pending(item: "tuple[int, dict]") -> None:
+    """Enqueue for the delay/fanout stage, counting drops instead of hiding them."""
+    global _events_dropped
+    try:
+        pending_q.put_nowait(item)
+    except queue.Full:
+        _events_dropped += 1
+
 # FPS counters — incremented by the decoder/detector threads, read+reset by the
 # stats broadcaster. Single writer per counter; plain ints are fine in CPython.
 _fps_in_count = 0          # frames decoded from RTSP
@@ -355,10 +366,11 @@ def delay_worker():
         wait = release_ms - int(time.time() * 1000)
         if wait > 0:
             time.sleep(wait / 1000)
+        global _events_dropped
         try:
             event_q.put_nowait(ev)
         except queue.Full:
-            pass
+            _events_dropped += 1
 
 
 def decoder_loop():
@@ -470,10 +482,7 @@ def detector_loop():
             if prev_had_detections:
                 clear_ev = {**base, "cat": None, "boxes": []}
                 _attach_food_fields(clear_ev, food_state, food_level)
-                try:
-                    pending_q.put_nowait((wall_ms + artificial_delay_ms, clear_ev))
-                except queue.Full:
-                    pass
+                _enqueue_pending((wall_ms + artificial_delay_ms, clear_ev))
             prev_had_detections = False
             continue
 
@@ -492,10 +501,7 @@ def detector_loop():
                            "score": b["score"], "in_action": in_action}],
             }
             _attach_food_fields(ev, food_state, food_level)
-            try:
-                pending_q.put_nowait((wall_ms + artificial_delay_ms, ev))
-            except queue.Full:
-                pass
+            _enqueue_pending((wall_ms + artificial_delay_ms, ev))
 
 
 # ---- aiohttp ----
@@ -574,12 +580,19 @@ async def set_delay(request: web.Request) -> web.Response:
 # ---- fanout: persist + broadcast ----
 
 async def broadcast_str(line: str) -> None:
+    global _ws_send_dropped
     dead = []
     for ws in clients:
         if ws.closed:
             dead.append(ws); continue
         try:
-            await ws.send_str(line)
+            # Bound each send: a slow/stalled client is dropped (and counted)
+            # rather than blocking the broadcast for everyone else. It will
+            # reconnect on its own.
+            await asyncio.wait_for(ws.send_str(line), WS_SEND_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            _ws_send_dropped += 1
+            dead.append(ws)
         except Exception:
             dead.append(ws)
     for ws in dead:
@@ -592,22 +605,28 @@ async def fanout_task():
     loop = asyncio.get_running_loop()
     while True:
         ev = await loop.run_in_executor(None, event_q.get)
-        # Persist only events with boxes (clears are transient signals).
+        # Persist only events with boxes (clears are transient signals). Run the
+        # disk write in a thread so SQLite I/O never blocks the event loop (and
+        # thus the WS broadcast) under load.
         if ev.get("boxes"):
-            for b in ev["boxes"]:
-                insert_event(
-                    db_conn,
-                    camera_id=ev["camera_id"], model=ev["model"], wall_ms=ev["wall_ms"],
-                    pts=ev.get("pts"), tb_num=ev.get("tb_num"), tb_den=ev.get("tb_den"),
-                    media_t=ev.get("media_t"),
-                    frame_w=ev["w"], frame_h=ev["h"], rotate_deg=ev.get("rotate_deg"),
-                    cat=ev.get("cat"), cat_score=ev.get("cat_score"),
-                    box_x=b["x"], box_y=b["y"], box_w=b["w"], box_h=b["h"],
-                    score=b.get("score", 0.0),
-                    track_id=ev.get("track_id"),
-                )
+            await loop.run_in_executor(None, _persist_event, ev)
         # Broadcast everything (clears included).
         await broadcast_str(json.dumps(ev, separators=(",", ":")))
+
+
+def _persist_event(ev: dict) -> None:
+    for b in ev["boxes"]:
+        insert_event(
+            db_conn,
+            camera_id=ev["camera_id"], model=ev["model"], wall_ms=ev["wall_ms"],
+            pts=ev.get("pts"), tb_num=ev.get("tb_num"), tb_den=ev.get("tb_den"),
+            media_t=ev.get("media_t"),
+            frame_w=ev["w"], frame_h=ev["h"], rotate_deg=ev.get("rotate_deg"),
+            cat=ev.get("cat"), cat_score=ev.get("cat_score"),
+            box_x=b["x"], box_y=b["y"], box_w=b["w"], box_h=b["h"],
+            score=b.get("score", 0.0),
+            track_id=ev.get("track_id"),
+        )
 
 
 async def stats_task():
@@ -655,6 +674,11 @@ async def stats_task():
                 for region in IGNORE_REGIONS
             ],
             "ignore_region_min_coverage": IGNORE_REGION_MIN_COVERAGE,
+            # Health/back-pressure metrics (were previously invisible).
+            "events_dropped": _events_dropped,
+            "ws_send_dropped": _ws_send_dropped,
+            "pending_q": pending_q.qsize(),
+            "event_q": event_q.qsize(),
         }
         _attach_food_fields(msg, _food_state, _food_level)
         await broadcast_str(json.dumps(msg, separators=(",", ":")))
