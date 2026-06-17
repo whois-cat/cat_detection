@@ -28,4 +28,14 @@ assert.equal(sameWindowLoaded(winStart, winStart, true), true);
 assert.equal(sameWindowLoaded(winStart, winStart + 1, true), false);
 assert.equal(sameWindowLoaded(winStart, winStart, false), false);
 
+// Short (~3-min) default window: a seek 1 min in is still served locally (no
+// src reload), but a seek past the short window triggers a reload — confirming
+// the smaller window keeps in-window scrubs cheap while bounding downloads.
+const shortEnd = winStart + 180 * 1000; // 3-min window
+let s = planSeek({ targetMs: winStart + 60_000, windowStartMs: winStart, windowEndMs: shortEnd, hasWindow: true });
+assert.equal(s.mode, 'currentTime');
+assert.equal(s.currentTime, 60);
+s = planSeek({ targetMs: winStart + 4 * 60_000, windowStartMs: winStart, windowEndMs: shortEnd, hasWindow: true });
+assert.equal(s.mode, 'reload');
+
 console.log('seek.test.mjs: all assertions passed');

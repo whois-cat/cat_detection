@@ -58,15 +58,27 @@ SampleSource at all. For TorchStreamingDataset, set `num_workers=0`.
 """
 from __future__ import annotations
 
+import logging
 import os
-from typing import Callable
+from pathlib import Path
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from .crop_cache import BoundedCropCache
-from .sources import Sample, SampleSource
+from .segments import SegmentIndex
+from .sources import (
+    CropRef,
+    CropSource,
+    CropUnavailable,
+    Sample,
+    SampleSource,
+    decode_one_crop,
+)
+
+log = logging.getLogger(__name__)
 
 # Default RAM budget for the lazy crop cache; 0 disables caching. CPU boxes
 # should keep this modest — the cache only avoids re-decoding, not OOM.
@@ -170,50 +182,130 @@ class TorchLazyCachedDataset(Dataset):
     """Map-style dataset that decodes crops on demand and keeps a byte-bounded
     LRU of resized ``uint8`` crops — never the full dataset, never full frames.
 
-    First pass collects only lightweight per-sample metadata (label + a small
-    closure that re-decodes/resizes ONE crop). On ``__getitem__`` the crop is
-    served from the cache or recomputed; ``transform`` (float conversion +
-    augmentation) runs after the cache so the cache stays compact ``uint8``.
+    Ownership/lifetime (the whole point of this class):
 
-    `cache_max_mb<=0` disables retention (every access re-decodes). Inspect
-    ``cache.stats`` for current/peak bytes, hits, misses, evictions.
+      - ``_labels`` holds plain Python labels.
+      - ``_refs`` holds only lightweight :class:`~training.sources.CropRef`
+        metadata (camera, wall_ms, box, rotate_deg). **No decoded image, and no
+        closure that captures one, is ever stored here.** Indexing decodes
+        nothing — it scans the DB via ``CropSource.iter_crop_refs``.
+      - ``__getitem__`` re-cuts exactly ONE crop from the recordings (or via the
+        injected ``decode_fn``), resizes it to a small contiguous ``uint8``
+        array, and serves it through the bounded LRU ``cache``. Past-budget
+        entries are evicted and dropped; the dataset keeps no strong reference to
+        them, so RAM plateaus at ``cache_max_mb`` regardless of dataset size.
+
+    ``transform`` (float conversion + augmentation) runs AFTER the cache, so the
+    cache stays compact ``uint8``. ``cache_max_mb<=0`` disables retention (every
+    access re-decodes). Inspect ``cache.stats`` for bytes/hits/misses/evictions.
+
+    Construct from a :class:`~training.sources.CropSource` (production), or via
+    :meth:`from_refs` with an explicit ``decode_fn`` (tests / custom backends).
     """
 
     def __init__(self, source: SampleSource,
                  transform: Callable[[np.ndarray], torch.Tensor] = default_transform,
                  target_fn: Callable[[Sample], object] = default_target_fn,
                  *, cache_max_mb: float = TRAINING_CACHE_MAX_MB,
-                 resize_max_side: int = 256):
+                 resize_max_side: int = 256,
+                 decode_fn: Callable[[CropRef], np.ndarray] | None = None,
+                 skip_unavailable: bool = True):
         super().__init__()
         self.source = source
         self.transform = transform
         self.target_fn = target_fn
         self.resize_max_side = resize_max_side
         self.cache = BoundedCropCache(cache_max_mb)
-        # Decoded once: (label, loader) where loader returns a small uint8 crop.
-        self._items: list[tuple[object, Callable[[], np.ndarray]]] | None = None
+        self.skip_unavailable = skip_unavailable
+        self._decode_fn = decode_fn
+        self._labels: list[object] | None = None
+        self._refs: list[CropRef] | None = None
+        self._seg_indices: dict[str, SegmentIndex] = {}
+
+    # -- construction --------------------------------------------------------
+
+    @classmethod
+    def from_refs(cls, labels: Sequence[object], refs: Sequence[CropRef],
+                  decode_fn: Callable[[CropRef], np.ndarray],
+                  *, transform: Callable[[np.ndarray], torch.Tensor] = default_transform,
+                  cache_max_mb: float = TRAINING_CACHE_MAX_MB,
+                  resize_max_side: int = 256) -> "TorchLazyCachedDataset":
+        """Build directly from parallel ``labels``/``refs`` and a ``decode_fn``
+        that returns ONE BGR crop for a ref. No SampleSource / DB required."""
+        if len(labels) != len(refs):
+            raise ValueError("labels and refs must be the same length")
+        self = cls.__new__(cls)
+        Dataset.__init__(self)
+        self.source = None
+        self.transform = transform
+        self.target_fn = default_target_fn
+        self.resize_max_side = resize_max_side
+        self.cache = BoundedCropCache(cache_max_mb)
+        self.skip_unavailable = False
+        self._decode_fn = decode_fn
+        self._labels = list(labels)
+        self._refs = list(refs)
+        self._seg_indices = {}
+        return self
+
+    # -- indexing (NO decode) ------------------------------------------------
 
     def _index(self) -> None:
-        if self._items is not None:
+        if self._refs is not None:
             return
-        items: list[tuple[object, Callable[[], np.ndarray]]] = []
-        for s in self.source:
-            label = self.target_fn(s)
-            crop = _resize_uint8(s.image, self.resize_max_side)
-            # The crop is already small + contiguous; the loader just returns it.
-            # (Subclasses backed by random-access decode can override this to
-            #  re-decode instead of holding the bytes — left as a TODO.)
-            items.append((label, (lambda c=crop: c)))
-        self._items = items
+        if not isinstance(self.source, CropSource):
+            raise TypeError(
+                "TorchLazyCachedDataset needs a CropSource (for lazy crop refs) "
+                "or construction via from_refs(); got "
+                f"{type(self.source).__name__}"
+            )
+        labels: list[object] = []
+        refs: list[CropRef] = []
+        for stub, ref in self.source.iter_crop_refs():
+            labels.append(self.target_fn(stub))
+            refs.append(ref)               # lightweight metadata only
+        self._labels, self._refs = labels, refs
+        log.info("indexed %d lazy crop refs (no pixels decoded)", len(refs))
+
+    # -- decode (ONE crop, contiguous) --------------------------------------
+
+    def _segment_index(self, camera_id: str) -> SegmentIndex:
+        idx = self._seg_indices.get(camera_id)
+        if idx is None:
+            idx = SegmentIndex.from_dir(Path(self.source.recordings_root) / camera_id)
+            self._seg_indices[camera_id] = idx
+        return idx
+
+    def _decode(self, ref: CropRef) -> np.ndarray:
+        if self._decode_fn is not None:
+            crop = self._decode_fn(ref)
+        else:
+            crop = decode_one_crop(
+                ref, self.source.recordings_root,
+                pad_frac=getattr(self.source, "pad_frac", 0.15),
+                index=self._segment_index(ref.camera_id),
+            )
+        # Resize returns a fresh contiguous array; decode_one_crop / _pad_crop
+        # already copy the crop out of its frame, so nothing aliases a full frame.
+        return _resize_uint8(crop, self.resize_max_side)
 
     def __len__(self) -> int:
         self._index()
-        assert self._items is not None
-        return len(self._items)
+        assert self._refs is not None
+        return len(self._refs)
 
     def __getitem__(self, idx: int):
         self._index()
-        assert self._items is not None
-        label, loader = self._items[idx]
-        crop = self.cache.get(idx, loader)
-        return self.transform(crop), label
+        assert self._refs is not None and self._labels is not None
+        ref = self._refs[idx]
+        try:
+            crop = self.cache.get(idx, lambda: self._decode(ref))
+        except CropUnavailable:
+            if not self.skip_unavailable:
+                raise
+            # Recording pruned/gapped: surface a zero crop rather than crashing a
+            # DataLoader worker. Not cached (so a later availability change is
+            # picked up). Callers that care should pre-filter refs.
+            side = max(1, self.resize_max_side or 1)
+            crop = np.zeros((side, side, 3), dtype=np.uint8)
+        return self.transform(crop), self._labels[idx]

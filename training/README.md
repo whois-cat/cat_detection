@@ -320,6 +320,18 @@ just train-classifier \
 # later active-learning pass only: add --trust-classifier --trust-conf 0.9
 ```
 
+**Fine-tune modes** (mutually exclusive; the optimizer only ever receives
+trainable params, and trainable/frozen param counts are logged at startup):
+
+- default (no flag) — **partial**: head + the last two feature blocks.
+- `--head-only` — **CPU-friendly**: only the classifier head trains; the backbone
+  is a frozen feature extractor. Recommended low-RAM CPU combo:
+  ```bash
+  just train-classifier --head-only --batch-size 4 --batch-max-side 320 --num-workers 0
+  ```
+- `--full-finetune` — the whole backbone (low LR). Passing `--head-only` with
+  `--full-finetune` is rejected.
+
 `just train-classifier` runs through the training uv project with the classifier
 extra, so `numpy`, `av`, `torch`, and `torchvision` are installed by uv instead
 of being manually added to the system Python. On Linux, `torch` and
@@ -340,9 +352,24 @@ just train-classifier --min-recall 0.85 --batch-size 4 --batch-max-side 320
 ```
 
 RSS is logged before the dataset, after the first batch, and after each epoch.
-The optional `TorchLazyCachedDataset` (training/torch_dataset.py) keeps a
-byte-bounded LRU of resized crops instead of materialising everything; cap it
-with `TRAINING_CACHE_MAX_MB` (0 disables caching).
+The optional `TorchLazyCachedDataset` (training/torch_dataset.py) is **truly
+lazy**: it stores only lightweight `CropRef` metadata (camera, wall_ms, box,
+rotation) — never decoded images or closures over them — and decodes exactly one
+crop per `__getitem__`, serving it through a byte-bounded LRU of resized `uint8`
+crops. Cap the cache with `TRAINING_CACHE_MAX_MB` (`0` disables retention, every
+access re-decodes). RAM plateaus at the cache budget regardless of dataset size;
+see `tests/test_memory_smoke.py`.
+
+**Replay memory is also lazy.** `--replay-set` loads only manifest metadata
+(label, camera, `wall_ms`, `.npz` path) into RAM; replay pixels decode per batch
+from their `.npz`, so a large replay set no longer materialises in memory.
+`--replay-max-items N` caps the set (balanced across classes, deterministic with
+`--seed`). Because replay crops are old fresh crops, they are checked against the
+val/test split for **leakage** before being added to train: exact (`src_event_key`),
+same-frame, near-timestamp (same camera within `--replay-leak-window-sec`), and a
+perceptual-hash fallback. Default `--replay-leakage-policy error` fails closed;
+`drop-from-replay` drops the offending replay crops; `move-related-episode-to-train`
+moves the colliding eval episode into train.
 
 What it does, and why each part:
 

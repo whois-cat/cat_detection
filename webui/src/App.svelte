@@ -34,6 +34,7 @@
   let canvasResized = true;   // set when ResizeObserver fires; drives a one-off resize
   let rafId = 0;              // current requestAnimationFrame / rVFC handle
   let rafIsVFC = false;       // whether rafId came from requestVideoFrameCallback
+  let rafVideo = null;        // the <video> a rVFC handle is registered on (to cancel it)
   let resizeObserver = null;
   let drawLoopRunning = false;
 
@@ -55,7 +56,19 @@
   // Where the user actually clicked. We re-seek to this once we know the
   // true segment start (currentTime = playbackTargetMs - playbackWindowStartMs).
   let playbackTargetMs = 0;
-  const PLAYBACK_WINDOW_SEC = 15 * 60;
+  // History playback window. Kept SHORT by default (~3 min) so each seek fetches
+  // a small clip — mediamtx /get can't Range-serve a single fMP4, so the whole
+  // window downloads on every committed seek; 15 min was tens of MB per scrub.
+  // Override with #pw=<seconds> in the URL hash (clamped 30s–3600s).
+  const DEFAULT_PLAYBACK_WINDOW_SEC = 180;
+  function readPlaybackWindowSec() {
+    try {
+      const v = parseInt(new URLSearchParams(location.hash.slice(1)).get('pw'), 10);
+      if (!isNaN(v) && v >= 30 && v <= 3600) return v;
+    } catch {}
+    return DEFAULT_PLAYBACK_WINDOW_SEC;
+  }
+  let playbackWindowSec = readPlaybackWindowSec();
 
   // ---- Reactive state ----
   let nowMs        = $state(Date.now());
@@ -378,26 +391,30 @@
   // ---- Draw loop lifecycle ----
   // The loop only runs while zones are shown (nothing to draw otherwise), and a
   // single guarded handle prevents two loops after a remount. Prefers
-  // requestVideoFrameCallback in live mode so we redraw per decoded frame, not
-  // per display refresh.
+  // requestVideoFrameCallback for BOTH live and history video so we redraw per
+  // decoded frame (not per display refresh); falls back to RAF when unsupported.
+  // The cancel always targets the exact <video> the handle was registered on.
   function cancelDrawFrame() {
     if (!rafId) return;
-    if (rafIsVFC && liveVideo && typeof liveVideo.cancelVideoFrameCallback === 'function') {
-      liveVideo.cancelVideoFrameCallback(rafId);
+    if (rafIsVFC && rafVideo && typeof rafVideo.cancelVideoFrameCallback === 'function') {
+      rafVideo.cancelVideoFrameCallback(rafId);
     } else {
       cancelAnimationFrame(rafId);
     }
     rafId = 0;
+    rafVideo = null;
   }
 
   function scheduleNextFrame() {
     if (!drawLoopRunning) return;
-    const v = mode === 'live' ? liveVideo : null;
+    const v = mode === 'live' ? liveVideo : historyVideo;
     if (v && typeof v.requestVideoFrameCallback === 'function') {
       rafIsVFC = true;
+      rafVideo = v;
       rafId = v.requestVideoFrameCallback(drawFrame);
     } else {
       rafIsVFC = false;
+      rafVideo = null;
       rafId = requestAnimationFrame(drawFrame);
     }
   }
@@ -514,10 +531,10 @@
     }
     playbackTargetMs       = startMs;             // where the user clicked
     playbackWindowStartMs  = startMs;             // pre-load guess (corrected on loadedmetadata)
-    playbackWindowEndMs    = startMs + PLAYBACK_WINDOW_SEC * 1000;
+    playbackWindowEndMs    = startMs + playbackWindowSec * 1000;
     const startIso = new Date(startMs).toISOString();
     const url = `/recordings/get?path=${encodeURIComponent(cameraId)}&start=${encodeURIComponent(startIso)}`
-              + `&duration=${PLAYBACK_WINDOW_SEC}s&format=fmp4`;
+              + `&duration=${playbackWindowSec}s&format=fmp4`;
     historyVideo.src = url;
     hlsErrorText = '';
     historyVideo.onerror = () => {
@@ -539,7 +556,7 @@
         const diff = playbackTargetMs - actualStart;       // how much lead-in mediamtx gave us
         if (diff >= 0 && diff < 5 * 60_000) {
           playbackWindowStartMs = actualStart;
-          playbackWindowEndMs   = actualStart + PLAYBACK_WINDOW_SEC * 1000;
+          playbackWindowEndMs   = actualStart + playbackWindowSec * 1000;
           // Skip the lead-in: seek to the user's actual target moment.
           if (diff > 250) historyVideo.currentTime = diff / 1000;
           console.log('[playback] anchor corrected: target', new Date(playbackTargetMs).toISOString(),
@@ -860,6 +877,13 @@
       }
       if (m === 'live' && historyVideo && !historyVideo.paused) {
         historyVideo.pause();
+      }
+      // The active video element changed; if the overlay loop is running, cancel
+      // the frame callback on the OLD video and re-register on the new one so we
+      // never leave a stray rVFC callback firing on a hidden element.
+      if (_prevMode !== m && drawLoopRunning) {
+        cancelDrawFrame();
+        scheduleNextFrame();
       }
       _prevMode = m;
     });

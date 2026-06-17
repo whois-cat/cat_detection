@@ -54,7 +54,11 @@ DROP_LABELS = {"discard", "unknown"}
 
 Meta = namedtuple("Meta", ["label", "camera", "wall_ms"])
 CropRefLite = namedtuple("CropRefLite", ["camera_id", "wall_ms", "box", "rotate_deg"])
-TrainItem = namedtuple("TrainItem", ["meta", "ref", "image"])
+# A training item is decoded from exactly ONE of:
+#   ref     — a fresh CropRefLite, decoded from recordings per batch, OR
+#   replay  — a replay.ReplayItem, decoded from its .npz per batch, OR
+#   image   — an already-decoded crop (legacy / pre-shrunk path).
+TrainItem = namedtuple("TrainItem", ["meta", "ref", "image", "replay"])
 
 
 # --------------------------------------------------------------- label policy --
@@ -365,6 +369,46 @@ def load_checkpoint_remapped(model, checkpoint: dict, classes: list[str]) -> dic
     }
 
 
+def configure_finetune(model, *, head_only: bool, full_finetune: bool):
+    """Set ``requires_grad`` for the chosen fine-tune mode and return
+    ``(trainable_params, mode, n_trainable, n_frozen)``.
+
+    Modes (mutually exclusive):
+      - ``head``     — ONLY the classifier head trains (CPU-friendly; the backbone
+                       is a frozen feature extractor). ``--head-only``.
+      - ``partial``  — head + the last two feature blocks (the default).
+      - ``full``     — the whole backbone (low LR). ``--full-finetune``.
+
+    The optimizer must be built from the returned ``trainable_params`` so frozen
+    tensors never get gradients/updates.
+    """
+    if head_only and full_finetune:
+        raise ValueError("--head-only and --full-finetune are mutually exclusive")
+
+    if full_finetune:
+        for p in model.parameters():
+            p.requires_grad = True
+        mode = "full"
+    else:
+        # Both head-only and partial start from a fully frozen backbone.
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.classifier.parameters():
+            p.requires_grad = True
+        if head_only:
+            mode = "head"
+        else:
+            for blk in (model.features[-1], model.features[-2]):
+                for p in blk.parameters():
+                    p.requires_grad = True
+            mode = "partial"
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    n_trainable = int(sum(p.numel() for p in trainable))
+    n_frozen = int(sum(p.numel() for p in model.parameters() if not p.requires_grad))
+    return trainable, mode, n_trainable, n_frozen
+
+
 # ------------------------------------------------------------------- main -----
 
 def main() -> None:
@@ -389,6 +433,18 @@ def main() -> None:
                          "reuse an existing classifier label")
     ap.add_argument("--replay-set", type=Path, action="append", default=[],
                     help="compact replay set directory/manifest; added to train only")
+    ap.add_argument("--replay-max-items", type=int, default=None,
+                    help="cap total replay crops kept (balanced across classes); "
+                         "deterministic with --seed. Default: keep all")
+    ap.add_argument("--replay-leakage-policy",
+                    choices=("error", "drop-from-replay", "move-related-episode-to-train"),
+                    default="error",
+                    help="what to do when a replay crop duplicates a val/test "
+                         "sample: error (default, fail loudly), drop-from-replay, "
+                         "or move-related-episode-to-train")
+    ap.add_argument("--replay-leak-window-sec", type=float, default=2.0,
+                    help="same-camera timestamp window (s) for near-duplicate "
+                         "replay-vs-eval leakage detection")
     ap.add_argument("--pad-frac", type=float, default=0.15,
                     help="crop context padding — MUST match the detector "
                          "CLASSIFIER_PAD_FRAC and build_cluster_manifest --pad-frac")
@@ -415,6 +471,11 @@ def main() -> None:
                     help="optional previous cat_classifier.pt checkpoint to fine-tune from")
     ap.add_argument("--full-finetune", action="store_true",
                     help="train the whole backbone (low LR) instead of head + last block")
+    ap.add_argument("--head-only", action="store_true",
+                    help="CPU-friendly: train ONLY the classifier head; the backbone "
+                         "is a frozen feature extractor. Recommended CPU combo: "
+                         "--head-only --batch-size 4 --batch-max-side 320 --num-workers 0. "
+                         "Mutually exclusive with --full-finetune")
     ap.add_argument("--num-workers", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--min-recall", type=float, default=0.9,
                     help="PASS/FAIL gate: every class (incl. confuse) needs val recall >= this")
@@ -443,7 +504,14 @@ def main() -> None:
     from training import load_reviews
     from training.ram import log_rss
     from training.db import iter_frames, open_db_ro
-    from training.replay import load_replay_set
+    from training.replay import decode_replay_image, load_replay_items
+    from training.leakage import (
+        apply_leakage_policy,
+        build_eval_identities,
+        find_replay_leaks,
+        format_leak_report,
+        replay_identities,
+    )
     from training.segments import SegmentIndex
     from training.sources import decode_crop_batch
 
@@ -506,7 +574,7 @@ def main() -> None:
                     continue
                 meta = Meta(label=label, camera=frame.camera_id, wall_ms=frame.wall_ms)
                 ref = CropRefLite(frame.camera_id, frame.wall_ms, box, int(rot or 0))
-                fresh_items.append(TrainItem(meta=meta, ref=ref, image=None))
+                fresh_items.append(TrainItem(meta=meta, ref=ref, image=None, replay=None))
     finally:
         conn.close()
 
@@ -522,19 +590,27 @@ def main() -> None:
 
     fresh_metas = [item.meta for item in fresh_items]
 
+    # Replay: load METADATA only (paths, not pixels). Crops decode per batch from
+    # their .npz, so RAM stays flat no matter how big the replay set is.
     replay_loaded = []
     for replay_path in args.replay_set:
-        replay_loaded.extend(load_replay_set(replay_path))
-    if replay_loaded:
-        log.info("loaded %d replay crops from %d replay set(s)",
-                 len(replay_loaded), len(args.replay_set))
-    replay_items = [
-        TrainItem(
-            meta=Meta(label=m.label, camera=m.camera, wall_ms=m.wall_ms),
-            ref=None,
-            image=shrink_bgr_for_batch(img, args.batch_max_side),
+        replay_loaded.extend(
+            load_replay_items(replay_path,
+                              max_items=args.replay_max_items, seed=args.seed)
         )
-        for img, m in replay_loaded
+    if replay_loaded:
+        # ~ per-crop bytes are unknown until decode; report the cap and a rough
+        # per-crop estimate at the batch-shrink cap so the config is auditable.
+        side = args.batch_max_side if args.batch_max_side > 0 else 384
+        approx_mb_per_crop = side * side * 3 / (1024 * 1024)
+        log.info(
+            "replay: %d crops (metadata only) from %d set(s); pixels decode per "
+            "batch (≈%.2f MB/crop at <=%dpx, peak ≈ batch-size × that, not the set)",
+            len(replay_loaded), len(args.replay_set), approx_mb_per_crop, side,
+        )
+    replay_items = [
+        TrainItem(meta=it.meta, ref=None, image=None, replay=it)
+        for it in replay_loaded
     ]
     replay_metas = [item.meta for item in replay_items]
 
@@ -553,10 +629,61 @@ def main() -> None:
         required={m.label for m in fresh_metas}, seed=args.seed,
     )
     check_split_leakage(episodes, train_idx, val_idx, test_idx)
+
+    # --- cross-source leakage guard: replay crops must not duplicate val/test ---
+    # Replay memory is train-only, but a replay crop is an old fresh crop; if the
+    # same event (or a near-duplicate) is in val/test, training on it leaks. We
+    # check BEFORE appending replay to train, fail closed by default.
+    kept_replay = list(range(len(replay_items)))
+    if replay_items:
+        from training.leakage import Identity, LeakageError
+        fresh_index_to_episode = {
+            ci: ep for ep, crops in enumerate(episodes) for ci in crops
+        }
+        eval_entries = []
+        for split_name, idxs in (("val", val_idx), ("test", test_idx)):
+            for ci in idxs:
+                box = fresh_items[ci].ref.box
+                eval_entries.append((split_name, ci, Identity(
+                    rowid=box.rowid,
+                    camera=fresh_items[ci].meta.camera,
+                    wall_ms=fresh_items[ci].meta.wall_ms,
+                )))
+        eval_index = build_eval_identities(eval_entries)
+        replay_ids = replay_identities([it.replay for it in replay_items])
+        leaks = find_replay_leaks(
+            eval_index, replay_ids,
+            window_ms=int(args.replay_leak_window_sec * 1000),
+        )
+        if leaks:
+            print("\n" + format_leak_report(leaks))
+        try:
+            res = apply_leakage_policy(
+                args.replay_leakage_policy, leaks,
+                episodes=episodes, fresh_index_to_episode=fresh_index_to_episode,
+                train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
+                n_replay=len(replay_items),
+            )
+        except LeakageError as e:
+            raise SystemExit(
+                f"{e}\n\nReplay leakage is fatal by default. Rebuild the replay "
+                "set to exclude these events, or pass --replay-leakage-policy "
+                "drop-from-replay / move-related-episode-to-train."
+            )
+        train_idx, val_idx, test_idx = res.train_idx, res.val_idx, res.test_idx
+        kept_replay = res.kept_replay
+        if res.dropped_replay:
+            log.warning("dropped %d leaking replay crop(s) from train", res.dropped_replay)
+        if res.moved_eval_crops:
+            log.warning("moved %d eval crop(s) to train to resolve replay leakage",
+                        res.moved_eval_crops)
+        # Re-verify the fresh split is still internally consistent after any move.
+        check_split_leakage(episodes, train_idx, val_idx, test_idx)
+
     items = fresh_items + replay_items
     metas = fresh_metas + replay_metas
     if replay_metas:
-        train_idx.extend(range(len(fresh_metas), len(metas)))
+        train_idx.extend(len(fresh_metas) + ri for ri in kept_replay)
     log.info("%d episodes -> train %d crops / val %d crops / test %d crops",
              len(episodes), len(train_idx), len(val_idx), len(test_idx))
     train_classes = {metas[j].label for j in train_idx}
@@ -597,6 +724,10 @@ def main() -> None:
             item = items[item_index]
             if item.image is not None:
                 batch_images[slot] = item.image
+            elif item.replay is not None:
+                img = decode_replay_image(item.replay, missing_ok=True)
+                if img is not None:
+                    batch_images[slot] = shrink_bgr_for_batch(img, max_side)
             else:
                 refs.append(item.ref)
                 ref_slots.append(slot)
@@ -663,20 +794,18 @@ def main() -> None:
             init_report["dropped_checkpoint_classes"],
         )
 
-    if args.full_finetune:
-        lr = args.lr if args.lr is not None else 1e-4
-        params = model.parameters()
-    else:
-        # Freeze backbone; train head + last conv stage + final block.
-        for p in model.parameters():
-            p.requires_grad = False
-        for p in model.classifier.parameters():
-            p.requires_grad = True
-        for blk in (model.features[-1], model.features[-2]):
-            for p in blk.parameters():
-                p.requires_grad = True
-        lr = args.lr if args.lr is not None else 1e-3
-        params = [p for p in model.parameters() if p.requires_grad]
+    if args.head_only and args.full_finetune:
+        raise SystemExit("--head-only and --full-finetune are mutually exclusive")
+    params, finetune_mode, n_trainable, n_frozen = configure_finetune(
+        model, head_only=args.head_only, full_finetune=args.full_finetune,
+    )
+    # Full backbone wants a low LR; head/partial can use the higher default.
+    lr = args.lr if args.lr is not None else (1e-4 if finetune_mode == "full" else 1e-3)
+    log.info(
+        "finetune mode=%s  trainable params=%d (%.1f%%)  frozen=%d  lr=%g",
+        finetune_mode, n_trainable,
+        100.0 * n_trainable / max(1, n_trainable + n_frozen), n_frozen, lr,
+    )
 
     optim = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
@@ -771,7 +900,8 @@ def main() -> None:
         "replay_count": len(replay_metas),
         "batch_max_side": args.batch_max_side,
         "init_from": str(args.init_from) if args.init_from else None,
-        "full_finetune": args.full_finetune, "best_epoch": best["epoch"],
+        "full_finetune": args.full_finetune, "head_only": args.head_only,
+        "finetune_mode": finetune_mode, "best_epoch": best["epoch"],
         "val_metrics": metrics, "test_metrics": test_metrics,
         "counts_train": dict(zip(classes, counts.astype(int).tolist())),
     }

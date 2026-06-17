@@ -228,7 +228,7 @@ class CropSource(SampleSource):
         self.default_rotate_deg = default_rotate_deg
         self._warned_missing_rotate = False
 
-    def _emit(self, frame: FrameRecord, img: np.ndarray) -> Iterator[Sample]:
+    def _resolve_rotate(self, frame: FrameRecord) -> int:
         rot = frame.rotate_deg
         if rot is None:
             rot = self.default_rotate_deg
@@ -239,14 +239,76 @@ class CropSource(SampleSource):
                     "at capture time for pre-migration data.", rot,
                 )
                 self._warned_missing_rotate = True
+        return int(rot or 0)
+
+    def _resolve_label(self, box: Box) -> str | None:
+        """Final identity label for a box, applying human review corrections.
+        Returns None when the box should be dropped (reviewer marked
+        discard/unknown)."""
+        label = box.cat
+        if self.reviews and box.rowid is not None:
+            corrected = self.reviews.get(box.rowid)
+            if corrected is not None:
+                if corrected in self.drop_labels:
+                    return None
+                label = corrected
+        return label
+
+    def iter_crop_refs(self) -> Iterator[tuple[Sample, "CropRef"]]:
+        """Enumerate (label-carrying Sample STUB, CropRef) per box WITHOUT
+        decoding any video.
+
+        Same DB scan, label-correction and rotation logic as ``__iter__`` /
+        ``_emit``, but the pixel crop is never cut — the returned Sample has
+        ``image=None`` and ``boxes=[crop-local box]`` (geometry derived from the
+        recorded frame size, so a custom ``target_fn`` still works). The paired
+        ``CropRef`` carries the original CAMERA-coords box and rotation so a lazy
+        dataset can re-cut the one crop on demand via ``decode_one_crop``.
+
+        This is the metadata backbone of ``TorchLazyCachedDataset``: it lets the
+        dataset hold only refs, never decoded frames or crops.
+        """
+        conn = open_db_ro(self.db_path)
+        try:
+            frames = iter_frames(
+                conn,
+                camera_id=self.camera_id, model=self.model, cat=self.cat,
+                t_from=self.t_from, t_to=self.t_to, min_score=self.min_score,
+            )
+            for frame in frames:
+                if self.box_filter is not None:
+                    boxes = [b for b in frame.boxes if self.box_filter(frame, b)]
+                    if not boxes:
+                        continue
+                    frame = replace(frame, boxes=boxes)
+                rot = self._resolve_rotate(frame)
+                for box in frame.boxes:
+                    label = self._resolve_label(box)
+                    if label is None:
+                        continue
+                    local = _local_box(box, self.pad_frac,
+                                       frame.frame_w, frame.frame_h, label)
+                    if local is None:
+                        continue
+                    stub = Sample(
+                        image=None, boxes=[local], wall_ms=frame.wall_ms,
+                        camera_id=frame.camera_id, model=frame.model,
+                        src_box=replace(box, cat=label), rotate_deg=rot,
+                    )
+                    ref = CropRef(
+                        camera_id=frame.camera_id, wall_ms=frame.wall_ms,
+                        box=replace(box, cat=label), rotate_deg=rot,
+                    )
+                    yield stub, ref
+        finally:
+            conn.close()
+
+    def _emit(self, frame: FrameRecord, img: np.ndarray) -> Iterator[Sample]:
+        rot = self._resolve_rotate(frame)
         for box in frame.boxes:
-            label = box.cat
-            if self.reviews and box.rowid is not None:
-                corrected = self.reviews.get(box.rowid)
-                if corrected is not None:
-                    if corrected in self.drop_labels:
-                        continue            # reviewer marked discard/unknown
-                    label = corrected
+            label = self._resolve_label(box)
+            if label is None:
+                continue                    # reviewer marked discard/unknown
             crop, local = _pad_crop(img, box, self.pad_frac)
             if crop is None:
                 continue
@@ -280,6 +342,28 @@ def rotate_crop(crop: np.ndarray, rotate_deg: int | None) -> np.ndarray:
     if k == 0:
         return crop
     return np.ascontiguousarray(np.rot90(crop, k=k))
+
+
+def _local_box(box: Box, pad_frac: float, frame_w: int, frame_h: int,
+               label: str | None = None) -> Box | None:
+    """Crop-LOCAL box for the padded crop, computed from the recorded frame size
+    WITHOUT decoding pixels. Geometry matches ``_pad_crop``'s ``local`` exactly,
+    so ``iter_crop_refs`` can build label-carrying Sample stubs cheaply. Returns
+    None for a degenerate crop (off-frame / zero area)."""
+    W, H = int(frame_w), int(frame_h)
+    pad = int(pad_frac * max(box.w, box.h))
+    x0 = max(0, box.x - pad)
+    y0 = max(0, box.y - pad)
+    x1 = min(W, box.x + box.w + pad)
+    y1 = min(H, box.y + box.h + pad)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return Box(
+        x=box.x - x0, y=box.y - y0, w=box.w, h=box.h,
+        cat=label if label is not None else box.cat,
+        score=box.score, track_id=box.track_id,
+        rowid=box.rowid, cat_score=box.cat_score,
+    )
 
 
 def _pad_crop(img: np.ndarray, box: Box, pad_frac: float):
