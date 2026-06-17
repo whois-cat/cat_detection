@@ -3,7 +3,12 @@ import subprocess
 import sys
 from collections import Counter
 
-from training.label_stats import format_report, load_label_counts, summarize_counts
+from training.label_stats import (
+    format_report,
+    load_label_counts,
+    resolve_reviews_db,
+    summarize_counts,
+)
 
 
 def test_load_label_counts_from_review_db(tmp_path):
@@ -52,6 +57,28 @@ def test_summarize_counts_shows_missing_and_dropped_labels():
     report = format_report(summary)
     assert "ellie" in report
     assert "missing labels: ellie" in report
+
+
+def test_resolve_reviews_db_falls_back_to_root_reviews_db(tmp_path):
+    db = tmp_path / "reviews.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            """CREATE TABLE reviews (
+                   src_event_key INTEGER PRIMARY KEY,
+                   label TEXT NOT NULL
+               )"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    found = resolve_reviews_db(
+        tmp_path / "data/review/reviews.db",
+        search_roots=[tmp_path],
+    )
+
+    assert found == db
 
 
 def test_label_stats_import_does_not_require_av():

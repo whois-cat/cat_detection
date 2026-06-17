@@ -13,6 +13,50 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DROP_LABELS = ("discard", "unknown")
 
 
+def _has_reviews_table(path: Path) -> bool:
+    if not path.exists() or path.name.endswith(("-wal", "-shm")):
+        return False
+    conn = sqlite3.connect(str(path))
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reviews'"
+        ).fetchone()
+        return row is not None
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        conn.close()
+
+
+def resolve_reviews_db(requested: Path, *, search_roots: Iterable[Path] = ()) -> Path:
+    """Find the review DB, accepting both the canonical and old root location."""
+    candidates: list[Path] = []
+
+    def add(path: Path) -> None:
+        if path not in candidates:
+            candidates.append(path)
+
+    add(requested)
+    if not requested.is_absolute():
+        add(ROOT / requested)
+    for root in search_roots:
+        add(root / "reviews.db")
+        add(root / "data/review/reviews.db")
+    add(Path.cwd() / "reviews.db")
+    add(ROOT / "reviews.db")
+    add(ROOT / "data/review/reviews.db")
+
+    for candidate in candidates:
+        if _has_reviews_table(candidate):
+            return candidate
+
+    looked = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "reviews db not found. Looked for a SQLite DB with table 'reviews' in: "
+        f"{looked}"
+    )
+
+
 def parse_csv(raw: str | Iterable[str] | None) -> list[str]:
     if raw is None:
         return []
@@ -184,16 +228,18 @@ def main() -> None:
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = ap.parse_args()
 
-    counts = load_label_counts(args.reviews_db)
+    reviews_db = resolve_reviews_db(args.reviews_db)
+    counts = load_label_counts(reviews_db)
     summary = summarize_counts(
         counts,
         expected_labels=parse_csv(args.labels),
         drop_labels=parse_csv(args.drop_labels),
     )
+    summary["reviews_db"] = str(reviews_db)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
-        print(f"reviews db: {args.reviews_db}")
+        print(f"reviews db: {reviews_db}")
         print(format_report(summary))
 
 
