@@ -1,4 +1,6 @@
 import sqlite3
+import subprocess
+import sys
 from collections import Counter
 
 from training.label_stats import format_report, load_label_counts, summarize_counts
@@ -50,3 +52,26 @@ def test_summarize_counts_shows_missing_and_dropped_labels():
     report = format_report(summary)
     assert "ellie" in report
     assert "missing labels: ellie" in report
+
+
+def test_label_stats_import_does_not_require_av():
+    code = """
+import builtins
+orig_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == "av":
+        raise RuntimeError("label_stats should not import av")
+    return orig_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+import training.label_stats as label_stats
+assert label_stats.parse_csv("alisa,chuzh") == ["alisa", "chuzh"]
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
