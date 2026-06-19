@@ -44,6 +44,12 @@ Env vars (all from configure.py — nothing hardcoded):
                           long before an open door closes (default 2)
   DISPLAY_TEXT_INTERVAL   seconds the feeder display should keep each text update
                           visible; refreshed while the door is open (default 2)
+  FEED_ENABLED            "1" enables auto-refill on an empty bowl (default 0 = off)
+  FEED_GRAIN_NUM          portions to dispense per refill (default 1)
+  FOOD_EMPTY_CONSECUTIVE  consecutive "empty" food_state reads required (default 2)
+  FEED_MIN_INTERVAL_SEC   min seconds between refills (default 1800)
+  FEED_CONFIRM_TIMEOUT_SEC  seconds to wait for "has_food" after a refill before
+                          the next one is allowed (default 120)
 """
 from __future__ import annotations
 
@@ -57,7 +63,8 @@ import websockets
 
 from cooldown import CooldownState
 from decision import decide
-from door_fsm import DoorFSM
+from door_fsm import CLOSED, OPEN, DoorFSM
+from feed_control import FeedController
 from feeder_client import FeederClient
 from zone_state import ZoneState
 
@@ -95,12 +102,21 @@ DISPLAY_REFRESH_MIN_SEC = float(os.environ.get("DISPLAY_REFRESH_MIN_SEC", "25"))
 CLOSE_BACKSTOP_MAX_ATTEMPTS = max(1, int(os.environ.get("CLOSE_BACKSTOP_MAX_ATTEMPTS", "3")))
 CLOSE_BACKSTOP_MAX_SEC      = float(os.environ.get("CLOSE_BACKSTOP_MAX_SEC", "30"))
 
+# Auto-refill on an empty bowl (uses the detector's food_state). OFF by default;
+# set FEED_ENABLED=1 to enable. All anti-spam thresholds are env-driven.
+FEED_ENABLED             = os.environ.get("FEED_ENABLED", "0") == "1"
+FEED_GRAIN_NUM           = int(os.environ.get("FEED_GRAIN_NUM", "1"))
+FOOD_EMPTY_CONSECUTIVE   = max(1, int(os.environ.get("FOOD_EMPTY_CONSECUTIVE", "2")))
+FEED_MIN_INTERVAL_SEC    = float(os.environ.get("FEED_MIN_INTERVAL_SEC", "1800"))
+FEED_CONFIRM_TIMEOUT_SEC = float(os.environ.get("FEED_CONFIRM_TIMEOUT_SEC", "120"))
+
 WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 
 # ---- module state (initialised in main()) ----
 
 _zone: ZoneState
 _fsm: DoorFSM
+_feed: FeedController
 _last_event_monotonic: float | None = None
 _last_event_wall_t: float | None = None
 _last_display_monotonic: float | None = None
@@ -258,6 +274,28 @@ def _handle_event(
     elif _fsm.state in {"open", "closing"}:
         _maybe_slow_refresh_display(client, _fsm.door_cat)
 
+    # Auto-refill: act on the detector's bowl monitor (food_state). Evaluated
+    # AFTER door handling so it sees the door's settled state — we never refill
+    # mid-motion (only stable CLOSED/OPEN). All anti-spam lives in _feed.
+    _maybe_feed(ev, client)
+
+
+def _maybe_feed(ev: dict, client: FeederClient) -> None:
+    """Refill the bowl if food_state has been a sustained 'empty'. No-op unless
+    FEED_ENABLED; _feed enforces the consecutive / interval / confirm guards."""
+    door_stable = _fsm.state in (CLOSED, OPEN)
+    if not _feed.observe(ev.get("food_state"), door_stable=door_stable, now=time.monotonic()):
+        return
+    print(
+        f"[feeder={FEEDER_ID}] bowl empty (sustained) → refilling "
+        f"grain_num={_feed.grain_num}",
+        flush=True,
+    )
+    if client.feed(_feed.grain_num):
+        _feed.record_fed(time.monotonic())
+    else:
+        _feed.record_feed_failed()
+
 
 def _fail_safe_close(client: FeederClient, cooldown: CooldownState, reason: str) -> None:
     """Close the physical door immediately when detector liveness is unknown."""
@@ -328,7 +366,7 @@ async def _run(client: FeederClient, cooldown: CooldownState) -> None:
 
 
 def main() -> None:
-    global _zone, _fsm
+    global _zone, _fsm, _feed
     print(
         f"[feeder={FEEDER_ID}] starting — camera={CAMERA_ID} "
         f"api={FEEDER_API_BASE_URL} serial={FEEDER_SERIAL_NUMBER}",
@@ -342,6 +380,20 @@ def main() -> None:
     _fsm = DoorFSM(
         open_debounce_sec=OPEN_DEBOUNCE_SEC,
         multi_debounce_sec=MULTI_DEBOUNCE_SEC,
+    )
+    _feed = FeedController(
+        enabled=FEED_ENABLED,
+        grain_num=FEED_GRAIN_NUM,
+        empty_consecutive=FOOD_EMPTY_CONSECUTIVE,
+        min_interval_sec=FEED_MIN_INTERVAL_SEC,
+        confirm_timeout_sec=FEED_CONFIRM_TIMEOUT_SEC,
+    )
+    print(
+        f"[feeder={FEEDER_ID}] auto-refill "
+        f"{'ENABLED' if FEED_ENABLED else 'disabled'} "
+        f"(grain={FEED_GRAIN_NUM} empty_consecutive={FOOD_EMPTY_CONSECUTIVE} "
+        f"min_interval={FEED_MIN_INTERVAL_SEC}s confirm_timeout={FEED_CONFIRM_TIMEOUT_SEC}s)",
+        flush=True,
     )
     cooldown = CooldownState(COOLDOWN_DB)
     client = FeederClient(

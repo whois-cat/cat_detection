@@ -112,6 +112,22 @@ class FeederClient:
             )
         return ok
 
+    def feed(self, grain_num: int = 1) -> bool:
+        """Dispense `grain_num` portions of food. Transient errors get one retry
+        inside `_call`; a 4xx fails immediately without retry (server rejected the
+        request, e.g. bad grain_num)."""
+        ok = self._call(
+            self._api_path("/feed"),
+            json_body={"grain_num": grain_num},
+            timeout=_DOOR_TIMEOUT_SEC,
+        )
+        print(
+            f"[feeder={self._fid}] {'fed' if ok else 'feed FAILED'} "
+            f"grain_num={grain_num}",
+            flush=True,
+        )
+        return ok
+
     def set_display_text(self, text: str, interval: int = 1) -> bool:
         ok = self._call(
             self._api_path("/display/text"),
