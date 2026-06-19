@@ -134,6 +134,21 @@
 #                             door_close_timeout_sec with no extra delay.
 #     display_text_interval  — seconds for /api/{serial}/display/text updates when
 #                             the feeder opens for a recognised cat (default 2).
+#     ---- auto-refill (optional) — dispense food when the bowl reads empty ----
+#     Reads the detector's food_state, so it needs a calibrated food_region
+#     (food_empty_level / food_full_level above). OFF unless feed_enabled: true.
+#     feed_enabled           — true to enable auto-refill (default false = off; the
+#                             feeder behaves exactly as before).
+#     feed_grain_num         — portions dispensed per refill via /api/<serial>/feed
+#                             (default 1).
+#     food_empty_consecutive — consecutive "empty" food_state reads required before a
+#                             refill, so a single frame never triggers it (default 2).
+#     feed_min_interval_sec  — minimum seconds between refills (default 1800).
+#     feed_confirm_timeout_sec — after a refill, wait for food_state to return to
+#                             "has_food" (grain settling) before another refill is
+#                             allowed, or this many seconds, whichever comes first
+#                             (default 120). "unknown" readings are ignored, and no
+#                             refill happens while the door is in motion.
 #
 # Globals at the top apply to all cameras.
 
@@ -174,6 +189,13 @@ cameras:
       cooldown_hours:
         alisa: 4.0
         ellie: 2.0
+      # Auto-refill (optional; needs the calibrated food_region above). Off by
+      # default — uncomment to enable and tune the anti-spam guards.
+      # feed_enabled: true
+      # feed_grain_num: 1
+      # food_empty_consecutive: 2
+      # feed_min_interval_sec: 1800
+      # feed_confirm_timeout_sec: 120
 
   - id: kitchen
     label: Kitchen

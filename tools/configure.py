@@ -341,6 +341,13 @@ def render_compose(cfg: dict) -> str:
                 "OPEN_DEBOUNCE_SEC":       str(feeder.get("open_debounce_sec", 3)),
                 "MULTI_DEBOUNCE_SEC":      str(feeder.get("multi_debounce_sec", 2)),
                 "DISPLAY_TEXT_INTERVAL":   str(feeder.get("display_text_interval", 2)),
+                # Auto-refill on an empty bowl (uses the detector's food_state).
+                # OFF unless feed_enabled: true; needs a calibrated food_region.
+                "FEED_ENABLED":            "1" if feeder.get("feed_enabled", False) else "0",
+                "FEED_GRAIN_NUM":          str(feeder.get("feed_grain_num", 1)),
+                "FOOD_EMPTY_CONSECUTIVE":  str(feeder.get("food_empty_consecutive", 2)),
+                "FEED_MIN_INTERVAL_SEC":   str(feeder.get("feed_min_interval_sec", 1800)),
+                "FEED_CONFIRM_TIMEOUT_SEC": str(feeder.get("feed_confirm_timeout_sec", 120)),
             }
             feeder_env_lines = "\n".join(
                 f"      {k}: {json.dumps(v)}" for k, v in feeder_env.items()
