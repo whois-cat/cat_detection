@@ -64,6 +64,45 @@ cluster-review PORT="8095":
     uv run --with-requirements review/requirements.txt \
         python -m uvicorn review.cluster_app:app --host 0.0.0.0 --port {{PORT}}
 
+# Reset ONLY the human-review state: MOVE (never delete) reviews.db + clusters.json
+# into data/review/_backup_<ts>/ so a fresh review pass starts clean. WARNING: this
+# discards the active review labels/clusters from their working paths — but events.db
+# and recordings are NEVER touched, and nothing is rm'd (restore by moving files back).
+# Stop the review app first. Set CONFIRM=1 to skip the prompt.
+review-reset:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    review_db="${REVIEW_DB:-data/review/reviews.db}"
+    manifest="${CLUSTER_MANIFEST:-data/review/clusters.json}"
+    events_db="${EVENTS_DB:-data/events/events.db}"
+    # Hard safety: never let a misconfigured REVIEW_DB point at the events DB.
+    if [ "$review_db" = "$events_db" ]; then
+        echo "review-reset: refusing — REVIEW_DB resolves to EVENTS_DB ($events_db)." >&2
+        exit 1
+    fi
+    # Collect existing targets: reviews.db (+ its WAL/SHM sidecars) and the manifest.
+    targets=()
+    for f in "$review_db" "$review_db-wal" "$review_db-shm" "$manifest"; do
+        [ -e "$f" ] && targets+=("$f")
+    done
+    if [ "${#targets[@]}" -eq 0 ]; then
+        echo "review-reset: nothing to move (no reviews.db / clusters.json found)."
+        exit 0
+    fi
+    # Co-locate the backup with the review DB's dir (data/review by default), so a
+    # custom REVIEW_DB still backs up next to itself instead of into the repo.
+    backup="$(dirname "$review_db")/_backup_$(date +%Y%m%d-%H%M%S)"
+    echo "review-reset will MOVE (not delete) into ${backup}/:"
+    for f in "${targets[@]}"; do echo "  - $f"; done
+    echo "NEVER touched: events.db ($events_db) and recordings."
+    if [ "${CONFIRM:-0}" != "1" ]; then
+        read -r -p "Proceed? [y/N] " ans
+        case "$ans" in [yY]|[yY][eE][sS]) ;; *) echo "aborted."; exit 1 ;; esac
+    fi
+    mkdir -p "$backup"
+    for f in "${targets[@]}"; do mv -v "$f" "$backup"/; done
+    echo "review-reset: done -> ${backup}/"
+
 # Show reviewed label counts and class balance without training.
 label-stats *ARGS:
     uv run python -m training.label_stats \
