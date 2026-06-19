@@ -46,6 +46,17 @@
   .mixed { border-color:var(--warn); }
   .discard { color:var(--muted); }
   .meta { display:grid; gap:4px; color:var(--muted); }
+  .counts { display:flex; gap:10px; flex-wrap:wrap; }
+  .counts b { color:var(--fg); font-weight:600; }
+  .counts .c0 { color:var(--muted); }
+  .crop { cursor:pointer; }
+  .crop.selected { outline:2px solid var(--accent); outline-offset:1px; }
+  #cropbar { display:none; align-items:center; gap:8px; flex-wrap:wrap;
+             padding:8px 10px; margin-bottom:10px; border:1px solid var(--accent);
+             border-radius:7px; background:#16243a; }
+  #cropbar.show { display:flex; }
+  #cropbar .pill { color:var(--muted); }
+  #cropbar button { padding:6px 9px; }
 </style>
 </head>
 <body>
@@ -55,10 +66,18 @@
   <div class="grow"></div>
   <div id="bar"><i></i></div>
   <span id="progress" class="hint">0 / 0</span>
+  <span id="counts" class="hint counts"></span>
 </header>
 <main>
   <nav id="clusters"></nav>
-  <section id="stage"><div id="grid"></div></section>
+  <section id="stage">
+    <div id="cropbar">
+      <span class="pill"><b id="selCount">0</b> selected · label as:</span>
+      <span id="cropLabels"></span>
+      <button onclick="clearSelection()">clear</button>
+    </div>
+    <div id="grid"></div>
+  </section>
   <aside>
     <div class="meta">
       <b id="clusterName">cluster</b>
@@ -84,6 +103,7 @@ let idx = 0;
 let mode = 'representative';
 let ACTIONS = [];
 let renderSeq = 0;
+let selected = new Set();   // per-crop selection (crop_ids) within current cluster
 
 async function load() {
   M = await (await fetch('/api/clusters')).json();
@@ -91,7 +111,26 @@ async function load() {
   idx = Math.max(0, M.queue.findIndex(c => !c.status));
   if (idx < 0) idx = 0;
   renderButtons();
+  renderCropLabels();
   render();
+  loadCounts();
+}
+
+async function loadCounts() {
+  try {
+    const data = await (await fetch('/api/counts?t=' + Date.now())).json();
+    const el = document.getElementById('counts');
+    el.innerHTML = '';
+    const order = data.order && data.order.length
+        ? data.order : Object.keys(data.counts);
+    order.forEach(lab => {
+      const n = data.counts[lab] || 0;
+      const span = document.createElement('span');
+      span.className = n ? '' : 'c0';
+      span.innerHTML = `${lab} <b>${n}</b>`;
+      el.appendChild(span);
+    });
+  } catch (e) { /* counts are best-effort */ }
 }
 
 function curr() { return M.queue[idx]; }
@@ -124,8 +163,11 @@ function renderList() {
   });
 }
 
+let currentClusterId = null;
 function render() {
   const c = curr();
+  if (c.cluster_id !== currentClusterId) { selected.clear(); currentClusterId = c.cluster_id; }
+  renderCropbar();
   renderList();
   document.getElementById('progress').textContent =
       `${M.done_clusters} / ${M.total_clusters} clusters · ${M.reviewed_items} crops`;
@@ -162,7 +204,9 @@ async function renderGrid(c) {
   const frag = document.createDocumentFragment();
   data.items.forEach((item, i) => {
     const card = document.createElement('div');
-    card.className = 'crop';
+    card.className = 'crop' + (selected.has(item.crop_id) ? ' selected' : '');
+    card.dataset.cropId = item.crop_id;
+    card.onclick = () => toggleSelect(item.crop_id, card);
     const img = document.createElement('img');
     img.loading = 'lazy';
     img.decoding = 'async';
@@ -177,6 +221,47 @@ async function renderGrid(c) {
   });
   grid.appendChild(frag);
   grid.classList.remove('loading');
+}
+
+function renderCropLabels() {
+  const wrap = document.getElementById('cropLabels');
+  if (!wrap || !M) return;
+  wrap.innerHTML = '';
+  [...M.labels, ...M.extra_labels].forEach(lab => {
+    const b = document.createElement('button');
+    b.textContent = lab;
+    b.onclick = () => labelSelected(lab);
+    wrap.appendChild(b);
+  });
+}
+
+function toggleSelect(cropId, card) {
+  if (selected.has(cropId)) { selected.delete(cropId); card.classList.remove('selected'); }
+  else { selected.add(cropId); card.classList.add('selected'); }
+  renderCropbar();
+}
+
+function clearSelection() {
+  selected.clear();
+  document.querySelectorAll('.crop.selected').forEach(el => el.classList.remove('selected'));
+  renderCropbar();
+}
+
+function renderCropbar() {
+  document.getElementById('selCount').textContent = selected.size;
+  document.getElementById('cropbar').classList.toggle('show', selected.size > 0);
+}
+
+async function labelSelected(label) {
+  if (!selected.size) return;
+  const crop_ids = [...selected];
+  const r = await fetch('/api/crop_label', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({crop_ids, label})
+  });
+  if (!r.ok) { alert('per-crop label failed: ' + await r.text()); return; }
+  clearSelection();
+  await load();
 }
 
 	async function choose(label) {
@@ -211,11 +296,20 @@ function go(d) {
 document.addEventListener('keydown', e => {
 	  if (e.key === 'ArrowRight') return go(1);
 	  if (e.key === 'ArrowLeft') return go(-1);
+	  if (e.key === 'Escape') return clearSelection();
 	  if (e.key === 'x') return splitCluster(2);
 	  if (e.key === 'm') return choose('mixed');
   if (e.key === 's') return choose('skip');
   const n = parseInt(e.key, 10);
-  if (!Number.isNaN(n) && n >= 1 && n <= ACTIONS.length) choose(ACTIONS[n - 1]);
+  if (Number.isNaN(n)) return;
+  // With a per-crop selection active, number keys label the SELECTION (fallback
+  // for mixed clusters); otherwise they label the whole cluster.
+  if (selected.size > 0) {
+    const labelOnly = [...M.labels, ...M.extra_labels];
+    if (n >= 1 && n <= labelOnly.length) labelSelected(labelOnly[n - 1]);
+    return;
+  }
+  if (n >= 1 && n <= ACTIONS.length) choose(ACTIONS[n - 1]);
 });
 
 load();

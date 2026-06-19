@@ -112,6 +112,33 @@ def _split_rows() -> list[dict]:
     ]
 
 
+def _descendant_child_ids(conn: sqlite3.Connection, cluster_id: int) -> list[int]:
+    """All split-children of ``cluster_id``, recursively (children, grandchildren,
+    …). Used to wipe a previous partition before re-splitting. Caller holds the
+    DB lock."""
+    rows = conn.execute("SELECT child_id, parent_id FROM cluster_splits").fetchall()
+    by_parent: dict[int, list[int]] = {}
+    for child_id, parent_id in rows:
+        by_parent.setdefault(int(parent_id), []).append(int(child_id))
+    out: list[int] = []
+    stack = list(by_parent.get(int(cluster_id), []))
+    while stack:
+        cid = stack.pop()
+        out.append(cid)
+        stack.extend(by_parent.get(cid, []))
+    return out
+
+
+def _label_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Per-label crop counts. Every row in ``reviews`` is one concretely-labelled
+    crop (mixed/skip never insert here), so a plain GROUP BY is the live count of
+    labelled CROPS — not clusters. Caller holds the DB lock."""
+    rows = conn.execute(
+        "SELECT label, COUNT(*) FROM reviews GROUP BY label"
+    ).fetchall()
+    return {label: int(n) for label, n in rows}
+
+
 def _all_clusters() -> list[dict]:
     children: dict[int, list[dict]] = {}
     for row in _split_rows():
@@ -377,11 +404,22 @@ async def api_cluster_split(payload: dict) -> JSONResponse:
 
     now = datetime.now(timezone.utc).isoformat()
     with _db_lock:
-        existing = _conn.execute(
-            "SELECT child_id FROM cluster_splits WHERE parent_id=?", (cluster_id,)
-        ).fetchone()
-        if existing:
-            raise HTTPException(status_code=409, detail="cluster is already split")
+        # Re-split = REPLACE the previous partition (no 409). Drop any existing
+        # descendant children (recursively) and their cluster_reviews, then redo
+        # the split below. The per-crop `reviews` rows are cleared for all of this
+        # cluster's members further down — children only ever partition those, so
+        # that single delete also removes labels applied to old grandchildren.
+        replaced_children = _descendant_child_ids(_conn, cluster_id)
+        if replaced_children:
+            placeholders = ",".join("?" * len(replaced_children))
+            _conn.execute(
+                f"DELETE FROM cluster_splits WHERE child_id IN ({placeholders})",
+                replaced_children,
+            )
+            _conn.execute(
+                f"DELETE FROM cluster_reviews WHERE cluster_id IN ({placeholders})",
+                replaced_children,
+            )
         used_ids = [int(c["cluster_id"]) for c in BASE_CLUSTERS]
         used_ids.extend(
             int(r[0]) for r in _conn.execute("SELECT child_id FROM cluster_splits").fetchall()
@@ -415,7 +453,59 @@ async def api_cluster_split(payload: dict) -> JSONResponse:
             (cluster_id, "split", None, now),
         )
         _conn.commit()
-    return JSONResponse({"ok": True, "cluster_id": cluster_id, "children": children})
+    return JSONResponse({
+        "ok": True, "cluster_id": cluster_id, "children": children,
+        "replaced": len(replaced_children),
+    })
+
+
+@app.post("/api/crop_label")
+async def api_crop_label(payload: dict) -> JSONResponse:
+    """Label individual crops (fallback for hopelessly mixed clusters). Writes one
+    `reviews` row per crop — same per-crop grain as a cluster label, just scoped
+    to an explicit selection instead of the whole cluster."""
+    label = payload.get("label")
+    crop_ids = payload.get("crop_ids") or []
+    if label not in set(LABELS) | set(EXTRA_LABELS):
+        raise HTTPException(status_code=400, detail=f"invalid label {label!r}")
+    if not isinstance(crop_ids, list) or not crop_ids:
+        raise HTTPException(status_code=400, detail="no crops selected")
+    unknown = [cid for cid in crop_ids if cid not in BY_ID]
+    if unknown:
+        raise HTTPException(status_code=404, detail=f"unknown crop(s): {unknown[:5]}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _db_lock:
+        for cid in crop_ids:
+            item = BY_ID[cid]
+            _conn.execute(
+                """INSERT INTO reviews
+                       (src_event_key, crop_id, label, predicted, conf, camera, wall_ms, reviewed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(src_event_key) DO UPDATE SET
+                       label=excluded.label, crop_id=excluded.crop_id,
+                       predicted=excluded.predicted, conf=excluded.conf,
+                       camera=excluded.camera, wall_ms=excluded.wall_ms,
+                       reviewed_at=excluded.reviewed_at""",
+                (
+                    item["src_event_key"], cid, label, None,
+                    item.get("score"), item["camera"], item["wall_ms"], now,
+                ),
+            )
+        _conn.commit()
+    return JSONResponse({"ok": True, "labeled": len(crop_ids), "label": label})
+
+
+@app.get("/api/counts")
+def api_counts() -> JSONResponse:
+    """Live per-class crop counts (labelled crops, GROUP BY label)."""
+    with _db_lock:
+        counts = _label_counts(_conn)
+    return JSONResponse({
+        "counts": counts,
+        "total": sum(counts.values()),
+        "order": [*LABELS, *EXTRA_LABELS],
+    })
 
 
 @app.get("/healthz")
