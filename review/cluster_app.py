@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import random
 import sqlite3
 import threading
@@ -33,7 +34,27 @@ EXTRA_LABELS = ["unknown", "discard"]
 
 def _load_manifest() -> dict:
     if not MANIFEST.exists():
-        raise RuntimeError(f"cluster manifest not found: {MANIFEST}")
+        # Actionable failure instead of a bare traceback. The manifest is either
+        # not built yet, or was archived by `just review-reset` into a sibling
+        # _backup_<ts>/ dir — surface both fixes, and any backup we can see.
+        lines = [
+            f"cluster manifest not found: {MANIFEST}",
+            "",
+            "Build it first (writes data/review/clusters.json):",
+            "    just cluster-manifest",
+        ]
+        backups = sorted(MANIFEST.parent.glob("_backup_*/clusters.json"), reverse=True)
+        if backups:
+            lines += [
+                "",
+                "Or restore the most recent review-reset backup:",
+                f"    mv {backups[0]} {MANIFEST}",
+            ]
+        msg = "\n".join(lines)
+        # Print to stderr too so the guidance is visible even when the import
+        # error is wrapped (e.g. by uvicorn's app loader).
+        print(f"\n[cluster-review] {msg}\n", file=sys.stderr, flush=True)
+        raise SystemExit(msg)
     return json.loads(MANIFEST.read_text(encoding="utf-8"))
 
 
