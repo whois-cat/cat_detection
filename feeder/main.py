@@ -44,6 +44,10 @@ Env vars (all from configure.py — nothing hardcoded):
                           long before an open door closes (default 2)
   DISPLAY_TEXT_INTERVAL   seconds the feeder display should keep each text update
                           visible; refreshed while the door is open (default 2)
+  STREAM_BLIP_GRACE_SEC   while the door is open, hold it through detector silence
+                          (watchdog/WS-disconnect) this long before closing as a
+                          lost stream ("stream_lost"); a live n_cats=0 still closes
+                          via DOOR_CLOSE_TIMEOUT_SEC (default 25)
   FEED_ENABLED            "1" enables auto-refill on an empty bowl (default 0 = off)
   FEED_GRAIN_NUM          portions to dispense per refill (default 1)
   FOOD_EMPTY_CONSECUTIVE  consecutive "empty" food_state reads required (default 2)
@@ -63,7 +67,7 @@ import websockets
 
 from cooldown import CooldownState
 from decision import decide
-from door_fsm import CLOSED, OPEN, DoorFSM
+from door_fsm import CLOSED, CLOSING, OPEN, DoorFSM
 from feed_control import FeedController
 from feeder_client import FeederClient
 from zone_state import ZoneState
@@ -96,6 +100,12 @@ DISPLAY_TEXT_INTERVAL  = max(1, int(os.environ.get("DISPLAY_TEXT_INTERVAL", "2")
 # (the door always has priority over the display bridge).
 DISPLAY_OPEN_INTERVAL   = max(DISPLAY_TEXT_INTERVAL, int(DOOR_CLOSE_TIMEOUT_SEC))
 DISPLAY_REFRESH_MIN_SEC = float(os.environ.get("DISPLAY_REFRESH_MIN_SEC", "25"))
+# Stream-blip grace: while the door is OPEN/CLOSING for a cat, detector SILENCE
+# (watchdog tick or WS disconnect — no events at all, as opposed to a live frame
+# reporting n_cats==0) holds the door open this long before we treat it as a lost
+# stream and close (reason "stream_lost"). A genuine "cat left" with a LIVE stream
+# still closes via DOOR_CLOSE_TIMEOUT_SEC (ZoneState presence TTL), unchanged.
+STREAM_BLIP_GRACE_SEC   = float(os.environ.get("STREAM_BLIP_GRACE_SEC", "25"))
 # Backstop against a permanent clamp: if door/close keeps failing for one open
 # episode (this many attempts in a row OR this many seconds), assume the actuator
 # has physically closed and disarm the FSM so the next cat can be served.
@@ -313,22 +323,34 @@ def _fail_safe_close(client: FeederClient, cooldown: CooldownState, reason: str)
 
 
 async def _watchdog(client: FeederClient, cooldown: CooldownState) -> None:
-    """Close an open door if detector events stop but the WS connection hangs."""
-    interval = max(1.0, min(5.0, DOOR_CLOSE_TIMEOUT_SEC / 3.0))
+    """Close an OPEN door when the detector goes SILENT (no events at all — a hung
+    WS or a stalled detector) for longer than the stream-blip grace.
+
+    This is the "lost stream" path, deliberately distinct from "the cat left": a
+    departing cat keeps the stream alive (live clear/idle frames), so ZoneState's
+    presence TTL closes it as "no_cat" via _handle_event. Silence is the ABSENCE
+    of frames; we hold the door for the current cat through brief blips / quick
+    reconnects and only close (reason "stream_lost") once the silence is
+    sustained. The hold/close decision lives in DoorFSM.note_silence."""
+    interval = max(1.0, min(5.0, STREAM_BLIP_GRACE_SEC / 3.0))
     while True:
         await asyncio.sleep(interval)
-        if _last_event_monotonic is None or _last_event_wall_t is None:
+        if _last_event_monotonic is None:
+            continue
+        # Only an open/closing door has anything to hold or close on silence; a
+        # closed door's presence TTL is driven entirely by live events.
+        if _fsm.state not in (OPEN, CLOSING):
             continue
         silence_sec = time.monotonic() - _last_event_monotonic
-        if silence_sec < DOOR_CLOSE_TIMEOUT_SEC:
-            continue
-        wall_t = _last_event_wall_t + silence_sec
-        _handle_event(
-            {"kind": "watchdog", "wall_ms": int(wall_t * 1000), "boxes": []},
-            client,
-            cooldown,
-            mark_event=False,
-        )
+        cmd = _fsm.note_silence(silence_sec, STREAM_BLIP_GRACE_SEC)
+        if cmd.kind == "close":
+            print(
+                f"[feeder={FEEDER_ID}] detector silent {silence_sec:.0f}s "
+                f">= grace {STREAM_BLIP_GRACE_SEC:.0f}s while door open for "
+                f"{cmd.cat} — closing (stream_lost)",
+                flush=True,
+            )
+            _fail_safe_close(client, cooldown, "stream_lost")
 
 
 async def _run(client: FeederClient, cooldown: CooldownState) -> None:
@@ -341,7 +363,8 @@ async def _run(client: FeederClient, cooldown: CooldownState) -> None:
                     f"allowed={ALLOWED_CATS} cooldown={COOLDOWN_HOURS} "
                     f"close_timeout={DOOR_CLOSE_TIMEOUT_SEC}s min_meal={MIN_MEAL_SEC}s "
                     f"presence_win={PRESENCE_WINDOW_SEC}s min_conf={CLASSIFIER_MIN_CONF} "
-                    f"open_debounce={OPEN_DEBOUNCE_SEC}s multi_debounce={MULTI_DEBOUNCE_SEC}s",
+                    f"open_debounce={OPEN_DEBOUNCE_SEC}s multi_debounce={MULTI_DEBOUNCE_SEC}s "
+                    f"stream_grace={STREAM_BLIP_GRACE_SEC}s",
                     flush=True,
                 )
                 async for raw in ws:
@@ -359,7 +382,10 @@ async def _run(client: FeederClient, cooldown: CooldownState) -> None:
                 f"[feeder={FEEDER_ID}] WS error: {exc!r}; reconnecting in 5s",
                 flush=True,
             )
-        _fail_safe_close(client, cooldown, "detector_ws_lost")
+        # Do NOT slam the door on every disconnect: a brief WS drop is just stream
+        # silence. The watchdog holds the door open for the current cat and closes
+        # only after STREAM_BLIP_GRACE_SEC of silence ("stream_lost"), so a quick
+        # reconnect with the same cat present never chatters the door.
         if watchdog.done():
             watchdog.result()
         await asyncio.sleep(5)

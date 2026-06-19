@@ -156,6 +156,30 @@ class DoorFSM:
             return DoorCommand("close", x, trigger)
         return DoorCommand(None, None, f"closing:{trigger}")
 
+    def note_silence(self, silence_sec: float, grace_sec: float) -> DoorCommand:
+        """Decide what an OPEN/CLOSING door should do during detector SILENCE.
+
+        "Silence" means *no events at all* — a watchdog tick or a WS disconnect —
+        as opposed to live events that report ``present == False`` (a cat that
+        genuinely left, handled by ``_step_open`` as "no_cat"). A momentary stream
+        blip must not chatter the door, so we HOLD it open for the current
+        ``door_cat`` until the silence has lasted ``>= grace_sec``; only then do we
+        close, with reason "stream_lost" so logs distinguish a dropped stream from
+        a departed cat. If events resume within the grace window, the next
+        ``step()`` relatches and this never fires.
+
+        No-op unless the door is physically open (OPEN/CLOSING); does not mutate
+        state (the caller closes via the normal confirm_close path on success).
+
+        Safety tradeoff: during the blind grace window the door stays open, so in
+        theory another cat could sneak a bite; ``grace_sec`` bounds that exposure,
+        and a sustained loss still closes."""
+        if self.state not in (OPEN, CLOSING):
+            return DoorCommand(None, None, "idle")
+        if silence_sec < grace_sec:
+            return DoorCommand(None, self.door_cat, f"stream_blip:{self.door_cat}")
+        return DoorCommand("close", self.door_cat, "stream_lost")
+
     # ---- commits (called by the caller after a successful door I/O) ----
 
     def confirm_open(self, cat: str, wall_t: float) -> None:

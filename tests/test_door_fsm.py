@@ -124,6 +124,53 @@ def test_sustained_identity_change_closes_and_attributes_to_open_cat():
     assert cmd.cat == "alisa"   # meal attributed to the cat the door opened for
 
 
+# ---- stream-silence grace (lost stream vs cat-left) ----
+
+def test_stream_blip_under_grace_does_not_close():
+    fsm = DoorFSM(open_debounce_sec=3, multi_debounce_sec=2)
+    _open_for(fsm, "alisa")
+    # Detector goes silent (watchdog / WS blip), but for less than the grace:
+    # hold the door open for the current cat — no chatter on a brief stream drop.
+    cmd = fsm.step(0.0, _snap(), "open", "alisa")  # arming verdict is irrelevant here
+    cmd = fsm.note_silence(10.0, grace_sec=25.0)
+    assert cmd.kind is None
+    assert fsm.state == OPEN
+    assert fsm.door_cat == "alisa"
+    # A blip during CLOSING is also held (door is still physically open).
+    fsm.step(0.0, _snap(n_cats=2))                 # arm a close trigger → CLOSING
+    assert fsm.state == CLOSING
+    assert fsm.note_silence(24.9, grace_sec=25.0).kind is None
+    assert fsm.state == CLOSING
+
+
+def test_sustained_silence_closes_with_stream_lost():
+    fsm = DoorFSM(open_debounce_sec=3, multi_debounce_sec=2)
+    _open_for(fsm, "alisa")
+    # Silence >= grace → close, with a reason that flags a lost stream (not a cat
+    # that walked away). The meal stays attributed to the open cat.
+    cmd = fsm.note_silence(25.0, grace_sec=25.0)
+    assert cmd.kind == "close"
+    assert cmd.reason == "stream_lost"
+    assert cmd.cat == "alisa"
+
+
+def test_silence_is_noop_when_door_closed():
+    fsm = DoorFSM(open_debounce_sec=3, multi_debounce_sec=2)
+    # Never opened: a silent detector has nothing to close.
+    assert fsm.note_silence(1000.0, grace_sec=25.0).kind is None
+    assert fsm.state == CLOSED
+
+
+def test_events_resume_within_grace_relatch_no_close():
+    fsm = DoorFSM(open_debounce_sec=3, multi_debounce_sec=2)
+    _open_for(fsm, "alisa")
+    # Blip under grace holds...
+    assert fsm.note_silence(12.0, grace_sec=25.0).kind is None
+    # ...then the same cat's events resume → relatch (hold), door never closed.
+    assert fsm.step(13.0, _snap(identity="alisa")).kind is None
+    assert fsm.state == OPEN and fsm.door_cat == "alisa"
+
+
 def test_oscillation_sequence_keeps_door_open():
     """Realistic glitchy stream: an allowed cat with periodic 1-frame dropouts
     must open once and stay open (no chatter)."""
