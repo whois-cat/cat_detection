@@ -142,14 +142,21 @@ def prepare_embeddings(raw: np.ndarray, *, out_dim: int, seed: int) -> np.ndarra
     return (x / np.maximum(norm, 1e-6)).astype(np.float32)
 
 
-def dedupe_nearby(items: list[dict], x: np.ndarray, *, window_sec: float,
-                  threshold: float) -> tuple[list[dict], np.ndarray, int]:
+def dedupe_nearby(items: list[dict], x: np.ndarray | None, *, window_sec: float,
+                  threshold: float) -> tuple[list[dict], np.ndarray | None, int]:
     """Drop near-identical crops close in time on the same camera.
 
-    Embeddings are L2-normalized, so dot product is cosine similarity. The window
-    keeps this conservative: same-looking cats minutes apart are still retained.
+    With embeddings (``x`` given), they are L2-normalized so the dot product is
+    cosine similarity, and a crop is dropped only when it is BOTH within the
+    per-camera window AND cosine-similar (>= ``threshold``) to a kept neighbour —
+    conservative, so same-looking cats minutes apart survive.
+
+    Without embeddings (``x is None``, the time-mode path), there is no similarity
+    signal, so dedup is purely temporal: a crop within the per-camera window of a
+    kept crop is treated as a duplicate. This thins rapid-fire detections to ~one
+    per window while keeping the schema identical.
     """
-    if window_sec <= 0 or threshold <= 0:
+    if window_sec <= 0 or (x is not None and threshold <= 0):
         return items, x, 0
     window_ms = int(window_sec * 1000)
     keep: list[int] = []
@@ -163,7 +170,8 @@ def dedupe_nearby(items: list[dict], x: np.ndarray, *, window_sec: float,
         recent[:] = [j for j in recent if items[j]["wall_ms"] >= cutoff]
         duplicate_of = None
         for j in recent:
-            if float(x[i] @ x[j]) >= threshold:
+            # x is None → time-only: any in-window neighbour is a duplicate.
+            if x is None or float(x[i] @ x[j]) >= threshold:
                 duplicate_of = j
                 break
         if duplicate_of is not None:
@@ -173,7 +181,7 @@ def dedupe_nearby(items: list[dict], x: np.ndarray, *, window_sec: float,
         recent.append(i)
 
     keep.sort()
-    return [items[i] for i in keep], x[keep], dropped
+    return [items[i] for i in keep], (None if x is None else x[keep]), dropped
 
 
 def thin_cluster_members(
@@ -309,6 +317,41 @@ def kmeans(x: np.ndarray, k: int, *, seed: int, max_iter: int,
     return labels, assigned_dist.astype(np.float32)
 
 
+def build_time_episodes(items: list[dict], gap_ms: int) -> dict[int, list[int]]:
+    """Group detections into time episodes PER CAMERA — one episode = one cluster.
+
+    Sort by (camera, wall_ms); start a new episode whenever the gap to the
+    previous detection of the SAME camera is >= ``gap_ms`` (or the camera
+    changes). No embeddings, no torch — fast and fully deterministic. Returns
+    ``{episode_id: [item_index, ...]}`` in chronological order, mirroring the
+    ``cluster_members`` shape the embedding path produces so the downstream
+    (renumber/thin/compact/write) is shared unchanged.
+
+    The >= boundary matches the cluster-review acceptance test: a gap of exactly
+    ``gap_ms`` splits. Same idea as the feeder's presence episodes (group by
+    time gaps), just pinned to an inclusive boundary here.
+    """
+    order = sorted(range(len(items)), key=lambda i: (items[i]["camera"], items[i]["wall_ms"]))
+    episodes: dict[int, list[int]] = {}
+    episode_id = -1
+    prev_camera: str | None = None
+    prev_wall: int | None = None
+    for i in order:
+        camera = items[i]["camera"]
+        wall = int(items[i]["wall_ms"])
+        if (
+            prev_camera is None
+            or camera != prev_camera
+            or wall - prev_wall >= gap_ms
+        ):
+            episode_id += 1
+            episodes[episode_id] = []
+        episodes[episode_id].append(i)
+        prev_camera = camera
+        prev_wall = wall
+    return episodes
+
+
 def default_cluster_count(n: int) -> int:
     if n <= 0:
         return 0
@@ -335,6 +378,16 @@ def main() -> None:
                     help="rows per chunk for k-means assignment; bounds peak RAM "
                          "(never builds the full N×K distance matrix)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--mode", choices=("embedding", "time"), default="embedding",
+                    help="clustering strategy: 'embedding' (default, k-means over "
+                         "visual/EfficientNet embeddings) or 'time' (group "
+                         "detections into per-camera time episodes — fast, "
+                         "deterministic, no torch; one episode = one cluster)")
+    ap.add_argument("--episode-gap-sec", type=float,
+                    default=float(os.environ.get("EPISODE_GAP_SEC", "30")),
+                    help="time mode: start a new per-camera episode when the gap "
+                         "to the previous detection is >= this many seconds "
+                         "(default 30, like the feeder presence episode)")
     ap.add_argument("--embedding", choices=("auto", "visual", "efficientnet"),
                     default="auto",
                     help="feature extractor for clustering; auto uses cached "
@@ -415,78 +468,131 @@ def main() -> None:
         total_regions = sum(len(v) for v in ignore_regions.values())
         print(f"[cluster] using {total_regions} ignore region(s)")
 
-    extractor = build_extractor(
-        args.embedding,
-        batch_size=args.embedding_batch_size,
-        allow_download=args.allow_download,
-    )
-    print(f"[cluster] embedding={extractor.name}")
-
     items: list[dict] = []
-    feats: list[np.ndarray] = []
-    pending_images: list[np.ndarray] = []
 
-    def flush_features() -> None:
-        nonlocal pending_images
-        if not pending_images:
-            return
-        feats.extend(extractor.encode_batch(pending_images))
-        pending_images = []
+    if args.mode == "time":
+        # ---- time mode: per-camera episodes, no decode / embeddings / torch ----
+        if args.clusters is not None:
+            print(f"[cluster] --clusters={args.clusters} ignored in time mode "
+                  "(episodes define the clusters)")
+        # Metadata only — iter_crop_refs never decodes pixels.
+        for n, (stub, _ref) in enumerate(src.iter_crop_refs()):
+            if args.limit is not None and n >= args.limit:
+                break
+            sb = stub.src_box
+            if sb is None or sb.rowid is None:
+                continue
+            items.append({
+                "crop_id": f"{stub.camera_id}:{sb.rowid}",
+                "src_event_key": int(sb.rowid),
+                "wall_ms": int(stub.wall_ms),
+                "camera": stub.camera_id,
+                "model": stub.model,
+                "score": float(sb.score),
+                "box": {"x": int(sb.x), "y": int(sb.y), "w": int(sb.w), "h": int(sb.h)},
+                "rotate_deg": int(stub.rotate_deg),
+                "pad_frac": float(args.pad_frac),
+            })
+        if not items:
+            raise SystemExit("no usable crops after detector-score filtering")
+        # No embeddings → dedup by temporal proximity only.
+        items, _x, deduped = dedupe_nearby(
+            items, None,
+            window_sec=args.dedupe_window_sec,
+            threshold=args.dedupe_threshold,
+        )
+        if not items:
+            raise SystemExit("no usable crops left after duplicate filtering")
+        if deduped:
+            print(f"[cluster] dropped {deduped} near-duplicate crops (time-only)")
+        if ignored_by_region:
+            print(f"[cluster] dropped {ignored_by_region} crops inside ignore region(s)")
 
-    for n, sample in enumerate(src):
-        if args.limit is not None and n >= args.limit:
-            break
-        sb = sample.src_box
-        if sb is None or sb.rowid is None:
-            continue
-        pending_images.append(sample.image)
-        items.append({
-            "crop_id": f"{sample.camera_id}:{sb.rowid}",
-            "src_event_key": int(sb.rowid),
-            "wall_ms": int(sample.wall_ms),
-            "camera": sample.camera_id,
-            "model": sample.model,
-            "score": float(sb.score),
-            "box": {"x": int(sb.x), "y": int(sb.y), "w": int(sb.w), "h": int(sb.h)},
-            "rotate_deg": int(sample.rotate_deg),
-            "pad_frac": float(args.pad_frac),
-        })
-        if len(pending_images) >= max(1, args.embedding_batch_size):
-            flush_features()
-    flush_features()
+        cluster_members = build_time_episodes(items, int(args.episode_gap_sec * 1000))
+        for cid, members in cluster_members.items():
+            for i in members:
+                items[i]["cluster"] = int(cid)
+        embedding_name = "time-episode"
+        embedding_dim_param = 0
+        stored_embeddings_param = False
+        print(f"[cluster] time mode: {len(cluster_members)} episode(s) "
+              f"(per camera, gap >= {args.episode_gap_sec}s)")
+    else:
+        # ---- embedding mode (default): k-means over visual/EfficientNet feats ----
+        extractor = build_extractor(
+            args.embedding,
+            batch_size=args.embedding_batch_size,
+            allow_download=args.allow_download,
+        )
+        print(f"[cluster] embedding={extractor.name}")
 
-    if not items:
-        raise SystemExit("no usable crops after detector-score filtering")
+        feats: list[np.ndarray] = []
+        pending_images: list[np.ndarray] = []
 
-    x = prepare_embeddings(
-        np.stack(feats).astype(np.float32),
-        out_dim=args.embedding_dim,
-        seed=args.seed,
-    )
-    items, x, deduped = dedupe_nearby(
-        items, x,
-        window_sec=args.dedupe_window_sec,
-        threshold=args.dedupe_threshold,
-    )
-    if not items:
-        raise SystemExit("no usable crops left after duplicate filtering")
-    if deduped:
-        print(f"[cluster] dropped {deduped} near-duplicate crops")
-    if ignored_by_region:
-        print(f"[cluster] dropped {ignored_by_region} crops inside ignore region(s)")
+        def flush_features() -> None:
+            nonlocal pending_images
+            if not pending_images:
+                return
+            feats.extend(extractor.encode_batch(pending_images))
+            pending_images = []
 
-    k = args.clusters or default_cluster_count(len(items))
-    labels, distances = kmeans(
-        x, k, seed=args.seed, max_iter=args.max_iter, chunk=args.chunk_size,
-    )
+        for n, sample in enumerate(src):
+            if args.limit is not None and n >= args.limit:
+                break
+            sb = sample.src_box
+            if sb is None or sb.rowid is None:
+                continue
+            pending_images.append(sample.image)
+            items.append({
+                "crop_id": f"{sample.camera_id}:{sb.rowid}",
+                "src_event_key": int(sb.rowid),
+                "wall_ms": int(sample.wall_ms),
+                "camera": sample.camera_id,
+                "model": sample.model,
+                "score": float(sb.score),
+                "box": {"x": int(sb.x), "y": int(sb.y), "w": int(sb.w), "h": int(sb.h)},
+                "rotate_deg": int(sample.rotate_deg),
+                "pad_frac": float(args.pad_frac),
+            })
+            if len(pending_images) >= max(1, args.embedding_batch_size):
+                flush_features()
+        flush_features()
 
-    cluster_members: dict[int, list[int]] = {}
-    for i, (cluster, dist) in enumerate(zip(labels.tolist(), distances.tolist())):
-        items[i]["cluster"] = int(cluster)
-        items[i]["distance"] = float(dist)
-        if not args.no_store_embeddings:
-            items[i]["embedding"] = [round(float(v), 5) for v in x[i]]
-        cluster_members.setdefault(int(cluster), []).append(i)
+        if not items:
+            raise SystemExit("no usable crops after detector-score filtering")
+
+        x = prepare_embeddings(
+            np.stack(feats).astype(np.float32),
+            out_dim=args.embedding_dim,
+            seed=args.seed,
+        )
+        items, x, deduped = dedupe_nearby(
+            items, x,
+            window_sec=args.dedupe_window_sec,
+            threshold=args.dedupe_threshold,
+        )
+        if not items:
+            raise SystemExit("no usable crops left after duplicate filtering")
+        if deduped:
+            print(f"[cluster] dropped {deduped} near-duplicate crops")
+        if ignored_by_region:
+            print(f"[cluster] dropped {ignored_by_region} crops inside ignore region(s)")
+
+        k = args.clusters or default_cluster_count(len(items))
+        labels, distances = kmeans(
+            x, k, seed=args.seed, max_iter=args.max_iter, chunk=args.chunk_size,
+        )
+
+        cluster_members = {}
+        for i, (cluster, dist) in enumerate(zip(labels.tolist(), distances.tolist())):
+            items[i]["cluster"] = int(cluster)
+            items[i]["distance"] = float(dist)
+            if not args.no_store_embeddings:
+                items[i]["embedding"] = [round(float(v), 5) for v in x[i]]
+            cluster_members.setdefault(int(cluster), []).append(i)
+        embedding_name = extractor.name
+        embedding_dim_param = int(x.shape[1])
+        stored_embeddings_param = not args.no_store_embeddings
 
     # Re-number clusters by size, largest first, for a stable human review queue.
     old_to_new = {
@@ -505,7 +611,10 @@ def main() -> None:
     clusters = []
     thinned_by_cluster = 0
     for cluster_id, members in sorted(remapped.items()):
-        members.sort(key=lambda i: items[i]["distance"])
+        # Embedding mode sorts by centroid distance; time mode has none, so fall
+        # back to 0.0 — a stable sort then preserves the chronological member
+        # order build_time_episodes produced.
+        members.sort(key=lambda i: items[i].get("distance", 0.0))
         members, dropped = thin_cluster_members(
             members,
             items,
@@ -533,11 +642,13 @@ def main() -> None:
             "min_score": args.min_score,
             "pad_frac": args.pad_frac,
             "default_rotate_deg": args.default_rotate_deg,
+            "mode": args.mode,
+            "episode_gap_sec": args.episode_gap_sec if args.mode == "time" else None,
             "clusters": len(clusters),
             "seed": args.seed,
-            "embedding": extractor.name,
-            "embedding_dim": int(x.shape[1]),
-            "stored_embeddings": not args.no_store_embeddings,
+            "embedding": embedding_name,
+            "embedding_dim": embedding_dim_param,
+            "stored_embeddings": stored_embeddings_param,
             "dedupe_window_sec": args.dedupe_window_sec,
             "dedupe_threshold": args.dedupe_threshold,
             "deduped": deduped,

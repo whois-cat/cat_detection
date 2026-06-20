@@ -241,18 +241,22 @@ class CropSource(SampleSource):
                 self._warned_missing_rotate = True
         return int(rot or 0)
 
-    def _resolve_label(self, box: Box) -> str | None:
-        """Final identity label for a box, applying human review corrections.
-        Returns None when the box should be dropped (reviewer marked
-        discard/unknown)."""
+    def _resolve_label(self, box: Box) -> tuple[str | None, bool]:
+        """Resolve a box's identity label and whether it must be DROPPED.
+
+        Returns ``(label, dropped)``. ``label`` may legitimately be None for
+        cold-start detector boxes that have no identity yet — those are KEPT
+        (``dropped=False``), since clustering and bulk review work without labels.
+        A box is dropped ONLY when a human review correction marks it
+        discard/unknown."""
         label = box.cat
         if self.reviews and box.rowid is not None:
             corrected = self.reviews.get(box.rowid)
             if corrected is not None:
                 if corrected in self.drop_labels:
-                    return None
+                    return None, True
                 label = corrected
-        return label
+        return label, False
 
     def iter_crop_refs(self) -> Iterator[tuple[Sample, "CropRef"]]:
         """Enumerate (label-carrying Sample STUB, CropRef) per box WITHOUT
@@ -283,8 +287,8 @@ class CropSource(SampleSource):
                     frame = replace(frame, boxes=boxes)
                 rot = self._resolve_rotate(frame)
                 for box in frame.boxes:
-                    label = self._resolve_label(box)
-                    if label is None:
+                    label, dropped = self._resolve_label(box)
+                    if dropped:
                         continue
                     local = _local_box(box, self.pad_frac,
                                        frame.frame_w, frame.frame_h, label)
@@ -306,8 +310,8 @@ class CropSource(SampleSource):
     def _emit(self, frame: FrameRecord, img: np.ndarray) -> Iterator[Sample]:
         rot = self._resolve_rotate(frame)
         for box in frame.boxes:
-            label = self._resolve_label(box)
-            if label is None:
+            label, dropped = self._resolve_label(box)
+            if dropped:
                 continue                    # reviewer marked discard/unknown
             crop, local = _pad_crop(img, box, self.pad_frac)
             if crop is None:
