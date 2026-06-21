@@ -134,10 +134,10 @@ _last_display_cat: str | None = None
 # Backstop bookkeeping for the currently-open episode.
 _close_fail_count: int = 0
 _close_fail_since: float | None = None
-# Throttle for the "not opening" diagnostic so a present-but-rejected cat
-# doesn't spam the log every event.
-_last_not_opening_log_monotonic: float | None = None
-NOT_OPENING_LOG_INTERVAL_SEC = 5.0
+# Edge-trigger state for the "not opening" diagnostic: the last
+# (action, identity, reason-kind) we logged, so a present-but-rejected cat is
+# logged once per change instead of on every frame.
+_last_not_opening_key: tuple | None = None
 
 
 def _set_display_for_open(client: FeederClient, cat: str | None) -> None:
@@ -233,20 +233,22 @@ def _handle_event(
     action, reason = decide(snap, ALLOWED_CATS, cooldown, COOLDOWN_HOURS)
 
     # Diagnostic: a cat is present but the door isn't being opened (cooldown /
-    # no_identity / not_allowed / multi_cat). Throttle so it can't flood the log.
+    # no_identity / not_allowed / multi_cat). Edge-triggered so it can't flood the
+    # log: write once when the (action, identity, reason-kind) changes. The
+    # cooldown reason's volatile "remaining=…s" tail is stripped from the dedup
+    # key (it ticks every frame) but kept in the printed line for the boundary.
+    global _last_not_opening_key
     if snap.present and action != "open":
-        global _last_not_opening_log_monotonic
-        now_mono = time.monotonic()
-        if (
-            _last_not_opening_log_monotonic is None
-            or now_mono - _last_not_opening_log_monotonic >= NOT_OPENING_LOG_INTERVAL_SEC
-        ):
-            _last_not_opening_log_monotonic = now_mono
+        key = (action, snap.identity, reason.split(" remaining=", 1)[0])
+        if key != _last_not_opening_key:
+            _last_not_opening_key = key
             print(
                 f"[feeder={FEEDER_ID}] not opening: action={action} reason={reason}"
                 f" identity={snap.identity} n_cats={snap.n_cats}",
                 flush=True,
             )
+    else:
+        _last_not_opening_key = None       # reset so re-entering the state re-logs
 
     cmd = _fsm.step(wall_t, snap, action, reason)
 

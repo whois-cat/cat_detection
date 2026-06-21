@@ -56,3 +56,40 @@ def test_unknown_does_not_open():
 def test_stable_allowed_cat_opens():
     events = [(i * 0.5, "alisa", 0.95, True) for i in range(12)]  # 0..5.5s
     assert _run(events, allowed=["alisa"]) is True
+
+
+# ---- cooldown reason format + strict boundary ----
+
+from zone_state import ZoneSummary  # noqa: E402
+
+
+class _FixedCooldown:
+    def __init__(self, remaining_h):
+        self._r = remaining_h
+
+    def is_ready(self, *_a, **_k):
+        return self._r <= 0.0          # ready (door may open) at remaining == 0
+
+    def remaining_hours(self, *_a, **_k):
+        return self._r
+
+
+def _present(identity="alisa"):
+    return ZoneSummary(n_cats=1, identity=identity, present=True, meal_sec=0.0)
+
+
+def test_cooldown_reason_shows_seconds_near_zero():
+    # 36 s left == 0.01 h: the old "{:.1f}h" format printed "0.0h", hiding that
+    # the cooldown is still active. The reason must now carry whole seconds.
+    action, reason = decide(_present(), ["alisa"], _FixedCooldown(0.01), {"alisa": 4.0})
+    assert action is None
+    assert reason.startswith("cooldown:alisa")
+    assert "(36s)" in reason
+
+
+def test_expired_cooldown_opens_at_strict_boundary():
+    # remaining == 0 → is_ready True → NOT blocked → opens. Confirms the gate is
+    # strict (> 0), so an expired cooldown opens the door.
+    action, reason = decide(_present(), ["alisa"], _FixedCooldown(0.0), {"alisa": 4.0})
+    assert action == "open"
+    assert reason == "alisa"
