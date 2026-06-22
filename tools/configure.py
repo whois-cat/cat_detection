@@ -326,14 +326,12 @@ def render_compose(cfg: dict) -> str:
         if feeder:
             fid = feeder["id"]
             allowed_cats = ",".join(feeder.get("allowed_cats", []))
-            cooldown_json = json.dumps(feeder.get("cooldown_hours", {}))
             feeder_env = {
                 "CAMERA_ID":               cid,
                 "FEEDER_ID":               fid,
                 "FEEDER_API_BASE_URL":     feeder["api_base_url"],
                 "FEEDER_SERIAL_NUMBER":    feeder["serial_number"],
                 "ALLOWED_CATS":            allowed_cats,
-                "COOLDOWN":                cooldown_json,
                 "DOOR_CLOSE_TIMEOUT_SEC":  str(feeder.get("door_close_timeout_sec", 30)),
                 "MIN_MEAL_SEC":            str(feeder.get("min_meal_sec", 10)),
                 "PRESENCE_WINDOW_SEC":     str(feeder.get("presence_window_sec", 5)),
@@ -341,13 +339,21 @@ def render_compose(cfg: dict) -> str:
                 "OPEN_DEBOUNCE_SEC":       str(feeder.get("open_debounce_sec", 3)),
                 "MULTI_DEBOUNCE_SEC":      str(feeder.get("multi_debounce_sec", 2)),
                 "DISPLAY_TEXT_INTERVAL":   str(feeder.get("display_text_interval", 2)),
-                # Auto-refill on an empty bowl (uses the detector's food_state).
-                # OFF unless feed_enabled: true; needs a calibrated food_region.
-                "FEED_ENABLED":            "1" if feeder.get("feed_enabled", False) else "0",
+                # Feeding mode: "empty_bowl" (default) reacts to the bowl monitor,
+                # or "scheduled" feeds at fixed clock times. grain_num + the shared
+                # journal apply to both; the journal volume is mounted below.
+                "FEED_MODE":               str(feeder.get("feed_mode", "empty_bowl")),
                 "FEED_GRAIN_NUM":          str(feeder.get("feed_grain_num", 1)),
+                "FEED_JOURNAL_DB":         "/data/feed_journal/journal.db",
+                # empty_bowl: OFF unless feed_enabled: true; needs a food_region.
+                "FEED_ENABLED":            "1" if feeder.get("feed_enabled", False) else "0",
                 "FOOD_EMPTY_CONSECUTIVE":  str(feeder.get("food_empty_consecutive", 2)),
                 "FEED_MIN_INTERVAL_SEC":   str(feeder.get("feed_min_interval_sec", 1800)),
                 "FEED_CONFIRM_TIMEOUT_SEC": str(feeder.get("feed_confirm_timeout_sec", 120)),
+                # scheduled: fixed "HH:MM" slots; catch-up cap on restart/downtime.
+                "FEED_TIMES":              ",".join(feeder.get("feed_times", [])),
+                "FEED_TZ":                 str(feeder.get("feed_tz", "")),
+                "FEED_CATCHUP_MAX":        str(feeder.get("feed_catchup_max", 2)),
             }
             feeder_env_lines = "\n".join(
                 f"      {k}: {json.dumps(v)}" for k, v in feeder_env.items()
@@ -361,7 +367,7 @@ def render_compose(cfg: dict) -> str:
     environment:
 {feeder_env_lines}
     volumes:
-      - ./data/cooldowns:/data/cooldowns
+      - ./data/feed_journal:/data/feed_journal
 """)
 
     return (

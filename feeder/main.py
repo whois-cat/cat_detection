@@ -43,16 +43,29 @@ Env vars (all from configure.py — nothing hardcoded):
                           (watchdog/WS-disconnect) this long before closing as a
                           lost stream ("stream_lost"); a live n_cats=0 still closes
                           via DOOR_CLOSE_TIMEOUT_SEC (default 25)
+  FEED_MODE               "empty_bowl" (default) reacts to the bowl monitor, or
+                          "scheduled" feeds at fixed clock times. Mutually
+                          exclusive: scheduled never uses the empty-bowl controller
+  FEED_GRAIN_NUM          portions to dispense per feed (both modes; default 1)
+  FEED_JOURNAL_DB         shared SQLite feed journal across feeders
+                          (default /data/feed_journal/journal.db)
+  -- empty_bowl mode --
   FEED_ENABLED            "1" enables auto-refill on an empty bowl (default 0 = off)
-  FEED_GRAIN_NUM          portions to dispense per refill (default 1)
   FOOD_EMPTY_CONSECUTIVE  consecutive "empty" food_state reads required (default 2)
   FEED_MIN_INTERVAL_SEC   min seconds between refills (default 1800)
   FEED_CONFIRM_TIMEOUT_SEC  seconds to wait for "has_food" after a refill before
                           the next one is allowed (default 120)
+  -- scheduled mode --
+  FEED_TIMES              comma-separated "HH:MM" slots (e.g. 08:00,13:00,18:00,22:00)
+  FEED_TZ                 IANA tz for the slots (default: container local tz)
+  FEED_CATCHUP_MAX        on restart/downtime, at most this many of the latest
+                          missed slots actually feed; older ones are journaled as
+                          "maintenance" (skipped, not dispensed) (default 2)
 """
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import os
 import time
@@ -63,6 +76,8 @@ from decision import decide
 from door_fsm import CLOSED, CLOSING, OPEN, DoorFSM
 from feed_control import FeedController
 from feeder_client import FeederClient
+from journal import FeedJournal
+from schedule_feed import ScheduleFeeder
 from zone_state import ZoneState
 
 # ---- config (all from env) ----
@@ -101,13 +116,32 @@ STREAM_BLIP_GRACE_SEC   = float(os.environ.get("STREAM_BLIP_GRACE_SEC", "25"))
 CLOSE_BACKSTOP_MAX_ATTEMPTS = max(1, int(os.environ.get("CLOSE_BACKSTOP_MAX_ATTEMPTS", "3")))
 CLOSE_BACKSTOP_MAX_SEC      = float(os.environ.get("CLOSE_BACKSTOP_MAX_SEC", "30"))
 
-# Auto-refill on an empty bowl (uses the detector's food_state). OFF by default;
-# set FEED_ENABLED=1 to enable. All anti-spam thresholds are env-driven.
-FEED_ENABLED             = os.environ.get("FEED_ENABLED", "0") == "1"
+# Feeding: "empty_bowl" (react to the bowl monitor) or "scheduled" (fixed times).
+# The two are mutually exclusive — scheduled never constructs/uses FeedController.
+FEED_MODE                = os.environ.get("FEED_MODE", "empty_bowl")
 FEED_GRAIN_NUM           = int(os.environ.get("FEED_GRAIN_NUM", "1"))
+FEED_JOURNAL_DB          = os.environ.get("FEED_JOURNAL_DB", "/data/feed_journal/journal.db")
+# empty_bowl mode (uses the detector's food_state). OFF by default.
+FEED_ENABLED             = os.environ.get("FEED_ENABLED", "0") == "1"
 FOOD_EMPTY_CONSECUTIVE   = max(1, int(os.environ.get("FOOD_EMPTY_CONSECUTIVE", "2")))
 FEED_MIN_INTERVAL_SEC    = float(os.environ.get("FEED_MIN_INTERVAL_SEC", "1800"))
 FEED_CONFIRM_TIMEOUT_SEC = float(os.environ.get("FEED_CONFIRM_TIMEOUT_SEC", "120"))
+# scheduled mode.
+FEED_TIMES: list[str]    = [t.strip() for t in os.environ.get("FEED_TIMES", "").split(",") if t.strip()]
+FEED_CATCHUP_MAX         = int(os.environ.get("FEED_CATCHUP_MAX", "2"))
+SCHEDULE_TICK_SEC        = 30.0
+
+
+def _resolve_feed_tz() -> dt.tzinfo:
+    """FEED_TZ as an IANA name (e.g. Europe/Moscow), or the container local tz."""
+    name = os.environ.get("FEED_TZ", "").strip()
+    if not name:
+        local = dt.datetime.now().astimezone().tzinfo
+        assert local is not None
+        return local
+    from zoneinfo import ZoneInfo
+    return ZoneInfo(name)
+
 
 WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 
@@ -115,7 +149,10 @@ WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 
 _zone: ZoneState
 _fsm: DoorFSM
-_feed: FeedController
+_journal: FeedJournal
+# empty_bowl mode only (None in scheduled mode); scheduled mode only (None otherwise).
+_feed: FeedController | None = None
+_schedule: ScheduleFeeder | None = None
 _last_event_monotonic: float | None = None
 _last_event_wall_t: float | None = None
 _last_display_monotonic: float | None = None
@@ -274,7 +311,10 @@ def _handle_event(
 
 def _maybe_feed(ev: dict, client: FeederClient) -> None:
     """Refill the bowl if food_state has been a sustained 'empty'. No-op unless
-    FEED_ENABLED; _feed enforces the consecutive / interval / confirm guards."""
+    empty_bowl mode is active (scheduled mode leaves _feed None); _feed enforces
+    the consecutive / interval / confirm guards."""
+    if _feed is None:
+        return
     door_stable = _fsm.state in (CLOSED, OPEN)
     if not _feed.observe(ev.get("food_state"), door_stable=door_stable, now=time.monotonic()):
         return
@@ -285,6 +325,8 @@ def _maybe_feed(ev: dict, client: FeederClient) -> None:
     )
     if client.feed(_feed.grain_num):
         _feed.record_fed(time.monotonic())
+        # Unified feed metrics: log the empty-bowl dispense to the shared journal.
+        _journal.record_empty_bowl(FEEDER_ID, _feed.grain_num, acked=True)
     else:
         _feed.record_feed_failed()
 
@@ -329,8 +371,46 @@ async def _watchdog(client: FeederClient) -> None:
             _fail_safe_close(client, "stream_lost")
 
 
+async def _schedule_loop(client: FeederClient) -> None:
+    """Scheduled-feed driver: every SCHEDULE_TICK_SEC, ask the (pure) planner what
+    to do and perform it. The planner caps catch-up — only the latest
+    FEED_CATCHUP_MAX missed slots feed; older missed slots are journaled as
+    "maintenance" (skipped, not dispensed). The same plan() at process start is
+    the catch-up, so no separate startup path is needed.
+
+    Double-feed safety: a fed slot is recorded right after the dispense, so the
+    next tick's plan() excludes it (was_slot_marked); INSERT OR IGNORE on
+    UNIQUE(feeder, slot) is the DB-level backstop. A failed client.feed() does NOT
+    mark the slot, so it's retried next tick; maintenance slots are hardware-
+    independent and always marked."""
+    assert _schedule is not None
+    while True:
+        for slot, action in _schedule.plan(dt.datetime.now(_schedule.tz)):
+            if action == "fed":
+                if not client.feed(_schedule.grain_num):
+                    print(f"[feeder={FEEDER_ID}] scheduled:feed_failed slot={slot.time}"
+                          f" — leaving slot pending for retry", flush=True)
+                    continue                      # don't mark; retry next tick
+                _journal.record_scheduled(
+                    FEEDER_ID, slot.date, slot.time,
+                    status="fed", grain_num=_schedule.grain_num, acked=True,
+                )
+                print(f"[feeder={FEEDER_ID}] scheduled:fed slot={slot.time} "
+                      f"grain={_schedule.grain_num}", flush=True)
+            else:                                 # maintenance (skipped by cap)
+                _journal.record_scheduled(
+                    FEEDER_ID, slot.date, slot.time,
+                    status="maintenance", grain_num=0, acked=False,
+                )
+                print(f"[feeder={FEEDER_ID}] scheduled:maintenance slot={slot.time} "
+                      f"(beyond catch-up cap)", flush=True)
+        await asyncio.sleep(SCHEDULE_TICK_SEC)
+
+
 async def _run(client: FeederClient) -> None:
     watchdog = asyncio.create_task(_watchdog(client))
+    if _schedule is not None:
+        asyncio.create_task(_schedule_loop(client))
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=20) as ws:
@@ -368,7 +448,7 @@ async def _run(client: FeederClient) -> None:
 
 
 def main() -> None:
-    global _zone, _fsm, _feed
+    global _zone, _fsm, _feed, _schedule, _journal
     print(
         f"[feeder={FEEDER_ID}] starting — camera={CAMERA_ID} "
         f"api={FEEDER_API_BASE_URL} serial={FEEDER_SERIAL_NUMBER}",
@@ -383,20 +463,44 @@ def main() -> None:
         open_debounce_sec=OPEN_DEBOUNCE_SEC,
         multi_debounce_sec=MULTI_DEBOUNCE_SEC,
     )
-    _feed = FeedController(
-        enabled=FEED_ENABLED,
-        grain_num=FEED_GRAIN_NUM,
-        empty_consecutive=FOOD_EMPTY_CONSECUTIVE,
-        min_interval_sec=FEED_MIN_INTERVAL_SEC,
-        confirm_timeout_sec=FEED_CONFIRM_TIMEOUT_SEC,
-    )
-    print(
-        f"[feeder={FEEDER_ID}] auto-refill "
-        f"{'ENABLED' if FEED_ENABLED else 'disabled'} "
-        f"(grain={FEED_GRAIN_NUM} empty_consecutive={FOOD_EMPTY_CONSECUTIVE} "
-        f"min_interval={FEED_MIN_INTERVAL_SEC}s confirm_timeout={FEED_CONFIRM_TIMEOUT_SEC}s)",
-        flush=True,
-    )
+    # Journal is shared across feeders and used by BOTH modes (unified metrics).
+    _journal = FeedJournal(FEED_JOURNAL_DB)
+
+    if FEED_MODE == "scheduled":
+        # Build the planner (parse_times raises on a malformed "HH:MM" → fail at
+        # start with a clear error). Empty FEED_TIMES is a non-fatal warning.
+        tz = _resolve_feed_tz()
+        _schedule = ScheduleFeeder(
+            times=FEED_TIMES, grain_num=FEED_GRAIN_NUM, tz=tz,
+            catchup_max=FEED_CATCHUP_MAX, journal=_journal, feeder_id=FEEDER_ID,
+        )
+        if not FEED_TIMES:
+            print(f"[feeder={FEEDER_ID}] WARNING: FEED_MODE=scheduled but FEED_TIMES "
+                  "is empty — no feeds will be scheduled", flush=True)
+        print(
+            f"[feeder={FEEDER_ID}] scheduled feeding times={FEED_TIMES} tz={tz} "
+            f"grain={FEED_GRAIN_NUM} catchup_max={FEED_CATCHUP_MAX} "
+            f"journal={FEED_JOURNAL_DB}",
+            flush=True,
+        )
+    else:
+        # empty_bowl mode: react to the detector's bowl monitor. Scheduled mode
+        # never constructs FeedController (the two are mutually exclusive).
+        _feed = FeedController(
+            enabled=FEED_ENABLED,
+            grain_num=FEED_GRAIN_NUM,
+            empty_consecutive=FOOD_EMPTY_CONSECUTIVE,
+            min_interval_sec=FEED_MIN_INTERVAL_SEC,
+            confirm_timeout_sec=FEED_CONFIRM_TIMEOUT_SEC,
+        )
+        print(
+            f"[feeder={FEEDER_ID}] auto-refill "
+            f"{'ENABLED' if FEED_ENABLED else 'disabled'} "
+            f"(grain={FEED_GRAIN_NUM} empty_consecutive={FOOD_EMPTY_CONSECUTIVE} "
+            f"min_interval={FEED_MIN_INTERVAL_SEC}s confirm_timeout={FEED_CONFIRM_TIMEOUT_SEC}s) "
+            f"journal={FEED_JOURNAL_DB}",
+            flush=True,
+        )
     client = FeederClient(
         api_base_url=FEEDER_API_BASE_URL,
         serial_number=FEEDER_SERIAL_NUMBER,

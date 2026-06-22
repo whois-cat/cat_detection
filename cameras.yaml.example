@@ -108,13 +108,9 @@
 #     allowed_cats   — list of cat names allowed to open this feeder. Names must
 #                      match class_names in the classifier model. Nothing hardcoded
 #                      here — add/remove names freely.
-#     cooldown_hours        — optional map of cat → cooldown in hours. Cats not listed
-#                             have no cooldown (can open repeatedly). Example:
-#                               alisa: 4.0    # 4-hour cooldown after Alisa's meal ends
 #     door_close_timeout_sec — seconds without detection before door closes (default 30).
 #                             Tolerates missed frames and pose changes.
-#     min_meal_sec           — min meal duration (sec) to start a cooldown (default 10).
-#                             A brief blip does not lock the cat out.
+#     min_meal_sec           — min meal duration (sec) (default 10).
 #     presence_window_sec    — sliding window (sec) for n_cats counting and identity
 #                             weighted-vote (default 5). Multi-cat requires 2+ frames
 #                             with 2+ boxes within this window — single-frame glitches
@@ -134,13 +130,18 @@
 #                             door_close_timeout_sec with no extra delay.
 #     display_text_interval  — seconds for /api/{serial}/display/text updates when
 #                             the feeder opens for a recognised cat (default 2).
-#     ---- auto-refill (optional) — dispense food when the bowl reads empty ----
+#     ---- feeding (optional) — dispense food; two mutually exclusive modes ----
+#     Every dispense (both modes) is logged to a shared SQLite journal mounted at
+#     /data/feed_journal/journal.db (one DB for all feeders).
+#     feed_mode              — "empty_bowl" (default) reacts to the bowl monitor, or
+#                             "scheduled" feeds at fixed clock times.
+#     feed_grain_num         — portions dispensed per feed via /api/<serial>/feed,
+#                             both modes (default 1).
+#     ---- empty_bowl mode — refill when the bowl reads empty ----
 #     Reads the detector's food_state, so it needs a calibrated food_region
 #     (food_empty_level / food_full_level above). OFF unless feed_enabled: true.
 #     feed_enabled           — true to enable auto-refill (default false = off; the
 #                             feeder behaves exactly as before).
-#     feed_grain_num         — portions dispensed per refill via /api/<serial>/feed
-#                             (default 1).
 #     food_empty_consecutive — consecutive "empty" food_state reads required before a
 #                             refill, so a single frame never triggers it (default 2).
 #     feed_min_interval_sec  — minimum seconds between refills (default 1800).
@@ -149,6 +150,15 @@
 #                             allowed, or this many seconds, whichever comes first
 #                             (default 120). "unknown" readings are ignored, and no
 #                             refill happens while the door is in motion.
+#     ---- scheduled mode — feed at fixed clock times ----
+#     feed_times             — list of "HH:MM" slots, e.g. ["08:00","13:00","18:00"].
+#                             A malformed entry fails the feeder at startup.
+#     feed_tz                — IANA tz for the slots, e.g. "Europe/Moscow"
+#                             (default: container local tz).
+#     feed_catchup_max       — on restart / after downtime, at most this many of the
+#                             latest missed slots actually feed; older missed slots
+#                             are journaled as "maintenance" (skipped, not dispensed)
+#                             so the day's record is complete (default 2).
 #
 # Globals at the top apply to all cameras.
 
@@ -186,16 +196,23 @@ cameras:
       api_base_url: http://192.168.0.100
       serial_number: ABC123456
       allowed_cats: [alisa, ellie]
-      cooldown_hours:
-        alisa: 4.0
-        ellie: 2.0
-      # Auto-refill (optional; needs the calibrated food_region above). Off by
-      # default — uncomment to enable and tune the anti-spam guards.
+      # Feeding is optional. Pick ONE mode (mutually exclusive). Every dispense is
+      # logged to the shared /data/feed_journal/journal.db regardless of mode.
+      #
+      # empty_bowl mode (default; needs the calibrated food_region above):
+      # feed_mode: empty_bowl
       # feed_enabled: true
       # feed_grain_num: 1
       # food_empty_consecutive: 2
       # feed_min_interval_sec: 1800
       # feed_confirm_timeout_sec: 120
+      #
+      # scheduled mode (fixed clock times; no food_region needed):
+      # feed_mode: scheduled
+      # feed_grain_num: 1
+      # feed_times: ["08:00", "13:00", "18:00", "22:00"]
+      # feed_tz: Europe/Moscow      # default: container local tz
+      # feed_catchup_max: 2         # latest N missed slots feed; older = maintenance
 
   - id: kitchen
     label: Kitchen
@@ -207,5 +224,3 @@ cameras:
       api_base_url: http://192.168.0.101
       serial_number: DEF789012
       allowed_cats: [chuzh]
-      cooldown_hours:
-        chuzh: 3.0
