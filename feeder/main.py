@@ -23,19 +23,14 @@ The physical door is driven by an explicit state machine (door_fsm.DoorFSM,
 CLOSED→ARMING→OPEN→CLOSING) that debounces the pure decide() verdict so single
 glitch frames never chatter the door. decide() stays a pure function.
 
-Cooldown is recorded at the END of a meal (door close), and only when the
-cat was present for at least MIN_MEAL_SEC.
-
 Env vars (all from configure.py — nothing hardcoded):
   CAMERA_ID               detector service to connect to (detector-<id>)
-  FEEDER_ID               this feeder's identifier (for logs / cooldown DB name)
+  FEEDER_ID               this feeder's identifier (for logs)
   FEEDER_API_BASE_URL     base URL of the feeder REST API
   FEEDER_SERIAL_NUMBER    feeder hardware serial
   ALLOWED_CATS            comma-separated list of allowed cat names
-  COOLDOWN                JSON {"cat": cooldown_hours, ...}  (default: {})
-  COOLDOWN_DB             SQLite path (default /data/cooldowns/feeder-<FEEDER_ID>.db)
   DOOR_CLOSE_TIMEOUT_SEC  seconds without detection before door closes (default 30)
-  MIN_MEAL_SEC            min meal duration (sec) to record a cooldown (default 10)
+  MIN_MEAL_SEC            min meal duration (sec) (default 10)
   PRESENCE_WINDOW_SEC     sliding window (sec) for n_cats / identity smoothing (default 5)
   CLASSIFIER_MIN_CONF     min cat_score to participate in identity vote (default 0.9)
   OPEN_DEBOUNCE_SEC       allowed cat must hold the open-verdict this long before
@@ -61,11 +56,9 @@ import asyncio
 import json
 import os
 import time
-from pathlib import Path
 
 import websockets
 
-from cooldown import CooldownState
 from decision import decide
 from door_fsm import CLOSED, CLOSING, OPEN, DoorFSM
 from feed_control import FeedController
@@ -81,10 +74,6 @@ FEEDER_SERIAL_NUMBER = os.environ["FEEDER_SERIAL_NUMBER"]
 ALLOWED_CATS: list[str] = [
     c.strip() for c in os.environ.get("ALLOWED_CATS", "").split(",") if c.strip()
 ]
-COOLDOWN_HOURS: dict[str, float] = json.loads(os.environ.get("COOLDOWN", "{}"))
-COOLDOWN_DB = Path(
-    os.environ.get("COOLDOWN_DB", f"/data/cooldowns/feeder-{FEEDER_ID}.db")
-)
 DOOR_CLOSE_TIMEOUT_SEC = float(os.environ.get("DOOR_CLOSE_TIMEOUT_SEC", "30"))
 MIN_MEAL_SEC           = float(os.environ.get("MIN_MEAL_SEC", "10"))
 PRESENCE_WINDOW_SEC    = float(os.environ.get("PRESENCE_WINDOW_SEC", "5"))
@@ -176,9 +165,7 @@ def _reset_close_backstop() -> None:
     _close_fail_since = None
 
 
-def _close_backstop_after_failure(
-    cooldown: CooldownState, cat: str | None, meal_sec: float
-) -> None:
+def _close_backstop_after_failure(cat: str | None) -> None:
     """Called when a door/close command failed. Counts consecutive failures for
     this open episode; once they exceed the attempt/time budget, log loudly and
     force the FSM closed (confirm_close) so it can disarm and serve the next cat.
@@ -197,8 +184,6 @@ def _close_backstop_after_failure(
         f" disarming FSM (backstop) so the next cat can be served",
         flush=True,
     )
-    if cat and meal_sec >= MIN_MEAL_SEC:
-        cooldown.record_meal_end(cat)
     _fsm.confirm_close()
     _reset_close_backstop()
 
@@ -206,7 +191,6 @@ def _close_backstop_after_failure(
 def _handle_event(
     ev: dict,
     client: FeederClient,
-    cooldown: CooldownState,
     *,
     mark_event: bool = True,
 ) -> None:
@@ -230,16 +214,14 @@ def _handle_event(
         _zone.update(wall_t, ev.get("cat"), ev.get("cat_score"), bool(box.get("in_action")))
 
     snap = _zone.snapshot(wall_t)
-    action, reason = decide(snap, ALLOWED_CATS, cooldown, COOLDOWN_HOURS)
+    action, reason = decide(snap, ALLOWED_CATS)
 
-    # Diagnostic: a cat is present but the door isn't being opened (cooldown /
-    # no_identity / not_allowed / multi_cat). Edge-triggered so it can't flood the
-    # log: write once when the (action, identity, reason-kind) changes. The
-    # cooldown reason's volatile "remaining=…s" tail is stripped from the dedup
-    # key (it ticks every frame) but kept in the printed line for the boundary.
+    # Diagnostic: a cat is present but the door isn't being opened (no_identity /
+    # not_allowed / multi_cat). Edge-triggered so it can't flood the log: write
+    # once when the (action, identity, reason) changes.
     global _last_not_opening_key
     if snap.present and action != "open":
-        key = (action, snap.identity, reason.split(" remaining=", 1)[0])
+        key = (action, snap.identity, reason)
         if key != _last_not_opening_key:
             _last_not_opening_key = key
             print(
@@ -270,15 +252,13 @@ def _handle_event(
                 f" reason={cmd.reason}",
                 flush=True,
             )
-            if cmd.cat and snap.meal_sec >= MIN_MEAL_SEC:
-                cooldown.record_meal_end(cmd.cat)
             _fsm.confirm_close()
             _reset_close_backstop()
         else:
             # Close failed (commonly a ReadTimeout to the bridge). Count it and,
             # if it keeps failing for this episode, force the FSM closed so it
             # can't latch open forever on one cat.
-            _close_backstop_after_failure(cooldown, cmd.cat, snap.meal_sec)
+            _close_backstop_after_failure(cmd.cat)
 
     # cmd.kind is None: arming / latch hold / closing debounce — no door change.
     # Only on these no-door-command events do we consider a slow display refresh,
@@ -309,22 +289,16 @@ def _maybe_feed(ev: dict, client: FeederClient) -> None:
         _feed.record_feed_failed()
 
 
-def _fail_safe_close(client: FeederClient, cooldown: CooldownState, reason: str) -> None:
+def _fail_safe_close(client: FeederClient, reason: str) -> None:
     """Close the physical door immediately when detector liveness is unknown."""
     if _fsm.state not in {"open", "closing"} and client.state != "open":
         return
-    cat = _fsm.door_cat
-    meal_sec = 0.0
-    if _fsm.opened_at is not None:
-        meal_sec = ((_last_event_wall_t or time.time()) - _fsm.opened_at)
     if client.set_door("close", reason):
         print(f"[feeder={FEEDER_ID}] fail-safe door close: {reason}", flush=True)
-        if cat and meal_sec >= MIN_MEAL_SEC:
-            cooldown.record_meal_end(cat)
         _fsm.confirm_close()
 
 
-async def _watchdog(client: FeederClient, cooldown: CooldownState) -> None:
+async def _watchdog(client: FeederClient) -> None:
     """Close an OPEN door when the detector goes SILENT (no events at all — a hung
     WS or a stalled detector) for longer than the stream-blip grace.
 
@@ -352,17 +326,17 @@ async def _watchdog(client: FeederClient, cooldown: CooldownState) -> None:
                 f"{cmd.cat} — closing (stream_lost)",
                 flush=True,
             )
-            _fail_safe_close(client, cooldown, "stream_lost")
+            _fail_safe_close(client, "stream_lost")
 
 
-async def _run(client: FeederClient, cooldown: CooldownState) -> None:
-    watchdog = asyncio.create_task(_watchdog(client, cooldown))
+async def _run(client: FeederClient) -> None:
+    watchdog = asyncio.create_task(_watchdog(client))
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=20) as ws:
                 print(
                     f"[feeder={FEEDER_ID}] connected to {WS_URL} "
-                    f"allowed={ALLOWED_CATS} cooldown={COOLDOWN_HOURS} "
+                    f"allowed={ALLOWED_CATS} "
                     f"close_timeout={DOOR_CLOSE_TIMEOUT_SEC}s min_meal={MIN_MEAL_SEC}s "
                     f"presence_win={PRESENCE_WINDOW_SEC}s min_conf={CLASSIFIER_MIN_CONF} "
                     f"open_debounce={OPEN_DEBOUNCE_SEC}s multi_debounce={MULTI_DEBOUNCE_SEC}s "
@@ -374,7 +348,7 @@ async def _run(client: FeederClient, cooldown: CooldownState) -> None:
                         ev = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    _handle_event(ev, client, cooldown)
+                    _handle_event(ev, client)
                 print(
                     f"[feeder={FEEDER_ID}] WS closed; reconnecting in 5s",
                     flush=True,
@@ -423,14 +397,13 @@ def main() -> None:
         f"min_interval={FEED_MIN_INTERVAL_SEC}s confirm_timeout={FEED_CONFIRM_TIMEOUT_SEC}s)",
         flush=True,
     )
-    cooldown = CooldownState(COOLDOWN_DB)
     client = FeederClient(
         api_base_url=FEEDER_API_BASE_URL,
         serial_number=FEEDER_SERIAL_NUMBER,
         feeder_id=FEEDER_ID,
     )
     client.force_closed()
-    asyncio.run(_run(client, cooldown))
+    asyncio.run(_run(client))
 
 
 if __name__ == "__main__":

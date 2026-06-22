@@ -3,15 +3,7 @@ unstable identity, or an unknown cat, and DOES open for a stable allowed cat.
 Exercises the real pipeline (ZoneState -> decide -> DoorFSM), not one frame."""
 from decision import decide
 from door_fsm import DoorFSM
-from zone_state import ZoneState
-
-
-class _NoCooldown:
-    def is_ready(self, *_a, **_k):
-        return True
-
-    def remaining_hours(self, *_a, **_k):
-        return 0.0
+from zone_state import ZoneState, ZoneSummary
 
 
 def _run(events, *, allowed, window_sec=0.4, open_debounce=3.0):
@@ -20,12 +12,11 @@ def _run(events, *, allowed, window_sec=0.4, open_debounce=3.0):
     zone = ZoneState(window_sec=window_sec, door_close_timeout_sec=30.0,
                      classifier_min_conf=0.5)
     fsm = DoorFSM(open_debounce_sec=open_debounce, multi_debounce_sec=2.0)
-    cooldown = _NoCooldown()
     opened = False
     for wall_t, cat, score, in_action in events:
         zone.update(wall_t, cat, score, in_action)
         snap = zone.snapshot(wall_t)
-        action, reason = decide(snap, allowed, cooldown, {})
+        action, reason = decide(snap, allowed)
         cmd = fsm.step(wall_t, snap, action, reason)
         if cmd.kind == "open":
             opened = True
@@ -58,38 +49,21 @@ def test_stable_allowed_cat_opens():
     assert _run(events, allowed=["alisa"]) is True
 
 
-# ---- cooldown reason format + strict boundary ----
+# ---- decide() verdicts (no cooldown) ----
 
-from zone_state import ZoneSummary  # noqa: E402
-
-
-class _FixedCooldown:
-    def __init__(self, remaining_h):
-        self._r = remaining_h
-
-    def is_ready(self, *_a, **_k):
-        return self._r <= 0.0          # ready (door may open) at remaining == 0
-
-    def remaining_hours(self, *_a, **_k):
-        return self._r
+def _present(identity="alisa", n_cats=1, present=True):
+    return ZoneSummary(n_cats=n_cats, identity=identity, present=present, meal_sec=0.0)
 
 
-def _present(identity="alisa"):
-    return ZoneSummary(n_cats=1, identity=identity, present=True, meal_sec=0.0)
-
-
-def test_cooldown_reason_shows_seconds_near_zero():
-    # 36 s left == 0.01 h: the old "{:.1f}h" format printed "0.0h", hiding that
-    # the cooldown is still active. The reason must now carry whole seconds.
-    action, reason = decide(_present(), ["alisa"], _FixedCooldown(0.01), {"alisa": 4.0})
-    assert action is None
-    assert reason.startswith("cooldown:alisa")
-    assert "(36s)" in reason
-
-
-def test_expired_cooldown_opens_at_strict_boundary():
-    # remaining == 0 → is_ready True → NOT blocked → opens. Confirms the gate is
-    # strict (> 0), so an expired cooldown opens the door.
-    action, reason = decide(_present(), ["alisa"], _FixedCooldown(0.0), {"alisa": 4.0})
+def test_allowed_present_single_cat_opens():
+    # An allowed, present, single, identified cat opens immediately — there is no
+    # cooldown gate anymore.
+    action, reason = decide(_present("alisa"), ["alisa"])
     assert action == "open"
     assert reason == "alisa"
+
+
+def test_not_allowed_cat_closes():
+    action, reason = decide(_present("chuzh"), ["alisa"])
+    assert action == "close"
+    assert reason == "not_allowed:chuzh"
