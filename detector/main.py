@@ -171,9 +171,14 @@ FOOD_MONITOR = (
 )
 _last_food_check_monotonic = 0.0
 _last_food_calib_log_monotonic = 0.0
+_last_food_calib_raw: float | None = None      # last raw_contrast we actually logged
 _food_state = "unknown"
 _food_level: float | None = None
+# Calibration log is edge-triggered: only print when raw_contrast moves by more
+# than this, with FOOD_CALIB_LOG_INTERVAL_SEC as a rate cap so near-threshold
+# jitter can't spam. A steady value is logged once, not every interval.
 FOOD_CALIB_LOG_INTERVAL_SEC = 30.0
+FOOD_CALIB_LOG_DELTA = 1.0
 
 
 def _parse_ignore_regions() -> list[dict]:
@@ -224,7 +229,7 @@ def _maybe_update_food_monitor(
     frame_h: int,
 ) -> tuple[str, float | None]:
     global _last_food_check_monotonic, _last_food_calib_log_monotonic
-    global _food_state, _food_level
+    global _last_food_calib_raw, _food_state, _food_level
     if FOOD_MONITOR is None or FOOD_REGION is None:
         return "unknown", None
 
@@ -246,11 +251,18 @@ def _maybe_update_food_monitor(
     if fill is not None:
         _food_level = fill
     # Calibration mode: raw is available but no normalized fill yet. Surface the
-    # raw contrast at most every ~30s so the operator can record empty/full
-    # reference numbers for this camera. This is the only new log line.
+    # raw contrast so the operator can record empty/full reference numbers for
+    # this camera. Edge-triggered: log only when raw_contrast moves by more than
+    # FOOD_CALIB_LOG_DELTA (a steady value is logged once, not on every check),
+    # with the interval as a rate cap against near-threshold jitter.
     if raw is not None and fill is None:
-        if now - _last_food_calib_log_monotonic >= FOOD_CALIB_LOG_INTERVAL_SEC:
+        changed = (
+            _last_food_calib_raw is None
+            or abs(raw - _last_food_calib_raw) > FOOD_CALIB_LOG_DELTA
+        )
+        if changed and now - _last_food_calib_log_monotonic >= FOOD_CALIB_LOG_INTERVAL_SEC:
             _last_food_calib_log_monotonic = now
+            _last_food_calib_raw = raw
             print(f"food calib {CAMERA_ID}: raw_contrast={raw:.2f}", flush=True)
     return _food_state, _food_level
 
