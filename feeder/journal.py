@@ -1,10 +1,17 @@
-"""Feed journal — one shared SQLite log of all dispense events, every feeder.
+"""Feed + door journal — one shared SQLite log for every feeder.
 
 ONE database for all feeders (env FEED_JOURNAL_DB, default
-/data/feed_journal/journal.db), mounted into each feeder container. Each row is
-one feeding decision: a scheduled-slot feed/maintenance, or an empty-bowl refill.
-This gives unified feed metrics across both modes and is the natural
-double-feed guard for the scheduled path (UNIQUE per slot).
+/data/feed_journal/journal.db), mounted into each feeder container. Two tables:
+
+  - feed_events  — one row per feeding decision: a scheduled-slot feed/maintenance
+                   or an empty-bowl refill. Unified feed metrics across both modes
+                   and the double-feed guard for the scheduled path (UNIQUE per
+                   slot).
+  - door_sessions — one row per door open→close session (a "meal"): which cat the
+                   door opened for, when it opened/closed, how long it stayed open,
+                   the presence-based meal estimate, whether the meal "counted"
+                   (>= MIN_MEAL_SEC), and the close reason. Recorded on close
+                   across all close paths (normal, backstop, fail-safe).
 
 Style mirrors detector/storage.py: WAL + synchronous=NORMAL + busy_timeout so
 concurrent feeders on a shared (possibly CIFS) volume don't fail under
@@ -39,11 +46,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_feed_slot
     ON feed_events(feeder_id, slot_date, slot_time);
 CREATE INDEX IF NOT EXISTS idx_feed_feeder_time
     ON feed_events(feeder_id, fed_at);
+
+CREATE TABLE IF NOT EXISTS door_sessions (
+    id           INTEGER PRIMARY KEY,
+    feeder_id    TEXT    NOT NULL,
+    cat          TEXT,                 -- cat the door opened for (NULL if unknown)
+    opened_at    TEXT,                 -- ISO UTC of door open (NULL if unknown)
+    closed_at    TEXT    NOT NULL,     -- ISO UTC of door close
+    open_sec     REAL,                 -- door physically-open duration (wall)
+    meal_sec     REAL,                 -- presence-based meal estimate
+    counted_meal INTEGER NOT NULL DEFAULT 0,  -- 1 if meal_sec >= MIN_MEAL_SEC
+    close_reason TEXT    NOT NULL      -- cat_left | multi_cat | identity_change | stream_lost | backstop | ...
+);
+CREATE INDEX IF NOT EXISTS idx_door_feeder_time
+    ON door_sessions(feeder_id, closed_at);
 """
 
 
 def _utc_now_iso() -> str:
     return dt.datetime.now(UTC).isoformat()
+
+
+def _wall_to_iso(wall_t: float) -> str:
+    """Epoch-seconds wall time (feeder events use wall_ms/1000) → ISO UTC."""
+    return dt.datetime.fromtimestamp(wall_t, tz=UTC).isoformat()
 
 
 class FeedJournal:
@@ -101,6 +127,26 @@ class FeedJournal:
                    (feeder_id, mode, status, slot_date, slot_time, grain_num, fed_at, acked)
                VALUES (?, 'empty_bowl', 'fed', NULL, NULL, ?, ?, ?)""",
             (feeder_id, grain_num, _utc_now_iso(), 1 if acked else 0),
+        )
+
+    # ---- door sessions (meals) ----
+
+    def record_door_session(self, feeder_id: str, *, cat: str | None,
+                            opened_at_wall: float | None, closed_at_wall: float,
+                            open_sec: float | None, meal_sec: float | None,
+                            counted_meal: bool, close_reason: str) -> None:
+        """Append one door open→close session. Wall times are epoch seconds
+        (feeder events use wall_ms/1000) and are stored as ISO UTC. One row per
+        session — written once, on close."""
+        self._conn.execute(
+            """INSERT INTO door_sessions
+                   (feeder_id, cat, opened_at, closed_at, open_sec, meal_sec,
+                    counted_meal, close_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (feeder_id, cat,
+             _wall_to_iso(opened_at_wall) if opened_at_wall is not None else None,
+             _wall_to_iso(closed_at_wall), open_sec, meal_sec,
+             1 if counted_meal else 0, close_reason),
         )
 
     def close(self) -> None:
