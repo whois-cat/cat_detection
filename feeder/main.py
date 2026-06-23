@@ -151,6 +151,9 @@ WS_URL = f"ws://detector-{CAMERA_ID}:8091/ws"
 _zone: ZoneState
 _fsm: DoorFSM
 _journal: FeedJournal
+# id of the door_sessions row opened at confirm_open; None when the door is closed
+# or the session has been finalized.
+_open_session_id: int | None = None
 # empty_bowl mode only (None in scheduled mode); scheduled mode only (None otherwise).
 _feed: FeedController | None = None
 _schedule: ScheduleFeeder | None = None
@@ -206,28 +209,23 @@ _CLOSE_REASON_JOURNAL = {
 }
 
 
-def _record_door_session(closed_at_wall: float, reason: str,
-                         *, meal_sec: float | None = None) -> None:
-    """Journal the door open→close session that is ending. Reads cat/opened_at
-    from the FSM, so call this BEFORE _fsm.confirm_close() (which clears them).
+def _finalize_open_session(closed_at_wall: float, reason: str,
+                           *, meal_sec: float | None = None) -> None:
+    """Finalize the door session opened at confirm_open. Call BEFORE confirm_close.
 
-    A session is only recorded when the door was actually open (opened_at known).
-    `meal_sec` is the presence-based meal estimate when available (normal close);
-    otherwise it falls back to the door-open duration (fail-safe/backstop have no
-    ZoneState snapshot). `counted_meal` uses MIN_MEAL_SEC — the constant kept for
-    exactly this journal. The FSM `reason` is mapped to a clearer journal label."""
-    opened_at = _fsm.opened_at
-    if opened_at is None:
-        return                                   # not a real session
-    open_sec = max(0.0, closed_at_wall - opened_at)
-    effective_meal = meal_sec if meal_sec is not None else open_sec
-    _journal.record_door_session(
-        FEEDER_ID, cat=_fsm.door_cat,
-        opened_at_wall=opened_at, closed_at_wall=closed_at_wall,
-        open_sec=open_sec, meal_sec=effective_meal,
-        counted_meal=effective_meal >= MIN_MEAL_SEC,
-        close_reason=_CLOSE_REASON_JOURNAL.get(reason, reason),
+    No-op if no session is open (door never opened, or already finalized). On a
+    normal close `meal_sec` is the presence-based estimate; fail-safe/backstop have
+    no ZoneState snapshot, so they pass meal_sec=None → meal_sec stays NULL in the
+    DB (duration is still computed from opened_at). The FSM `reason` is mapped to a
+    clearer journal label; counted_meal uses MIN_MEAL_SEC."""
+    global _open_session_id
+    if _open_session_id is None:
+        return
+    _journal.finalize_session(
+        _open_session_id, closed_at_wall, meal_sec,
+        _CLOSE_REASON_JOURNAL.get(reason, reason), MIN_MEAL_SEC,
     )
+    _open_session_id = None
 
 
 def _reset_close_backstop() -> None:
@@ -256,8 +254,8 @@ def _close_backstop_after_failure(cat: str | None) -> None:
         flush=True,
     )
     # The backstop trip is the real end of this session (no presence snapshot
-    # here, so meal_sec falls back to the door-open duration in the helper).
-    _record_door_session(_last_event_wall_t or time.time(), "backstop")
+    # here → meal_sec=None, duration still computed from opened_at).
+    _finalize_open_session(_last_event_wall_t or time.time(), "backstop")
     _fsm.confirm_close()
     _reset_close_backstop()
 
@@ -310,7 +308,11 @@ def _handle_event(
 
     if cmd.kind == "open":
         if client.set_door("open", cmd.reason):
+            global _open_session_id
             _fsm.confirm_open(cmd.cat, wall_t)
+            # The door just physically opened: cat + opened_at are known only here,
+            # so this is where the door_sessions row is created.
+            _open_session_id = _journal.open_session(FEEDER_ID, cmd.cat, wall_t)
             # Fresh episode: clear any stale close-failure bookkeeping and set
             # the display name once (long interval) — never refreshed per-event.
             _reset_close_backstop()
@@ -326,7 +328,7 @@ def _handle_event(
                 f" reason={cmd.reason}",
                 flush=True,
             )
-            _record_door_session(wall_t, cmd.reason, meal_sec=snap.meal_sec)
+            _finalize_open_session(wall_t, cmd.reason, meal_sec=snap.meal_sec)
             _fsm.confirm_close()
             _reset_close_backstop()
         else:
@@ -375,8 +377,8 @@ def _fail_safe_close(client: FeederClient, reason: str) -> None:
         return
     if client.set_door("close", reason):
         print(f"[feeder={FEEDER_ID}] fail-safe door close: {reason}", flush=True)
-        # No presence snapshot here; the helper falls back to the open duration.
-        _record_door_session(_last_event_wall_t or time.time(), reason)
+        # No presence snapshot here → meal_sec=None (duration still computed).
+        _finalize_open_session(_last_event_wall_t or time.time(), reason)
         _fsm.confirm_close()
 
 
@@ -505,6 +507,13 @@ def main() -> None:
     )
     # Journal is shared across feeders and used by BOTH modes (unified metrics).
     _journal = FeedJournal(FEED_JOURNAL_DB)
+    # A previous process may have crashed with the door open, leaving a session
+    # row with closed_at NULL. Mark those interrupted now (the physical door is
+    # force-closed just below — don't duplicate that here).
+    recovered = _journal.recover_interrupted(FEEDER_ID)
+    if recovered:
+        print(f"[feeder={FEEDER_ID}] recovered {recovered} interrupted door "
+              f"session(s)", flush=True)
 
     if FEED_MODE == "scheduled":
         # Build the planner (parse_times raises on a malformed "HH:MM" → fail at

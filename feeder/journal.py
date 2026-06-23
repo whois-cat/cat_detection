@@ -7,11 +7,12 @@ ONE database for all feeders (env FEED_JOURNAL_DB, default
                    or an empty-bowl refill. Unified feed metrics across both modes
                    and the double-feed guard for the scheduled path (UNIQUE per
                    slot).
-  - door_sessions — one row per door open→close session (a "meal"): which cat the
-                   door opened for, when it opened/closed, how long it stayed open,
-                   the presence-based meal estimate, whether the meal "counted"
-                   (>= MIN_MEAL_SEC), and the close reason. Recorded on close
-                   across all close paths (normal, backstop, fail-safe).
+  - door_sessions — one row per door open→close session (a "meal"). The row is
+                   INSERTed at OPEN (opened_at + cat known; closed_at/duration/
+                   meal NULL) and UPDATEd at CLOSE (finalize). A session left open
+                   by a crashed process is marked incomplete='interrupted' by the
+                   next process's startup recovery, with the close fields kept NULL
+                   (honestly unknown).
 
 Style mirrors detector/storage.py: WAL + synchronous=NORMAL + busy_timeout so
 concurrent feeders on a shared (possibly CIFS) volume don't fail under
@@ -50,16 +51,19 @@ CREATE INDEX IF NOT EXISTS idx_feed_feeder_time
 CREATE TABLE IF NOT EXISTS door_sessions (
     id           INTEGER PRIMARY KEY,
     feeder_id    TEXT    NOT NULL,
-    cat          TEXT,                 -- cat the door opened for (NULL if unknown)
-    opened_at    TEXT,                 -- ISO UTC of door open (NULL if unknown)
-    closed_at    TEXT    NOT NULL,     -- ISO UTC of door close
-    open_sec     REAL,                 -- door physically-open duration (wall)
-    meal_sec     REAL,                 -- presence-based meal estimate
+    cat          TEXT,                 -- cat the door opened for (known at open)
+    opened_at    TEXT    NOT NULL,     -- ISO UTC, written AT OPEN
+    closed_at    TEXT,                 -- NULL while open / if interrupted by a crash
+    duration_sec REAL,                 -- NULL while open / if interrupted
+    meal_sec     REAL,                 -- NULL while open / if interrupted
     counted_meal INTEGER NOT NULL DEFAULT 0,  -- 1 if meal_sec >= MIN_MEAL_SEC
-    close_reason TEXT    NOT NULL      -- cat_left | multi_cat | identity_change | stream_lost | backstop | ...
+    incomplete   INTEGER NOT NULL DEFAULT 0,  -- 1 if the session did not close cleanly
+    close_reason TEXT                  -- NULL while open; cat_left|multi_cat|stream_lost|backstop|interrupted
 );
-CREATE INDEX IF NOT EXISTS idx_door_feeder_time
-    ON door_sessions(feeder_id, closed_at);
+CREATE INDEX IF NOT EXISTS idx_door_feeder_opened
+    ON door_sessions(feeder_id, opened_at);
+CREATE INDEX IF NOT EXISTS idx_door_cat_opened
+    ON door_sessions(cat, opened_at);
 """
 
 
@@ -86,11 +90,23 @@ class FeedJournal:
         self._migrate()
 
     def _migrate(self) -> None:
-        """Idempotent, additive migrations for pre-existing journals. No columns
-        have changed yet; this is the hook so future changes stay in this file."""
-        # cols = {row[1] for row in self._conn.execute("PRAGMA table_info(feed_events)")}
-        # (add ALTER TABLE ... ADD COLUMN guarded by `if "<col>" not in cols` here)
-        return
+        """Idempotent migrations for pre-existing journals.
+
+        door_sessions changed shape between an earlier (reverted) close-only
+        version — `closed_at TEXT NOT NULL`, no `incomplete` column — and the
+        current open→finalize version. CREATE TABLE IF NOT EXISTS leaves an
+        existing old table untouched, so we detect the old form and rebuild it.
+        Dev-only data, so DROP+CREATE is acceptable; this guarantees a fresh DB
+        and a DB from the reverted commit converge to the same schema."""
+        info = {row[1]: row for row in
+                self._conn.execute("PRAGMA table_info(door_sessions)")}
+        if not info:
+            return                                   # SCHEMA already made the new table
+        # row = (cid, name, type, notnull, dflt_value, pk); [3] == 1 → NOT NULL.
+        old_form = ("incomplete" not in info) or (info["closed_at"][3] == 1)
+        if old_form:
+            self._conn.execute("DROP TABLE door_sessions")
+            self._conn.executescript(SCHEMA)         # recreate under the new schema
 
     # ---- scheduled mode ----
 
@@ -129,25 +145,56 @@ class FeedJournal:
             (feeder_id, grain_num, _utc_now_iso(), 1 if acked else 0),
         )
 
-    # ---- door sessions (meals) ----
+    # ---- door sessions (meals): open → finalize, with crash recovery ----
 
-    def record_door_session(self, feeder_id: str, *, cat: str | None,
-                            opened_at_wall: float | None, closed_at_wall: float,
-                            open_sec: float | None, meal_sec: float | None,
-                            counted_meal: bool, close_reason: str) -> None:
-        """Append one door open→close session. Wall times are epoch seconds
-        (feeder events use wall_ms/1000) and are stored as ISO UTC. One row per
-        session — written once, on close."""
-        self._conn.execute(
-            """INSERT INTO door_sessions
-                   (feeder_id, cat, opened_at, closed_at, open_sec, meal_sec,
-                    counted_meal, close_reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (feeder_id, cat,
-             _wall_to_iso(opened_at_wall) if opened_at_wall is not None else None,
-             _wall_to_iso(closed_at_wall), open_sec, meal_sec,
-             1 if counted_meal else 0, close_reason),
+    def open_session(self, feeder_id: str, cat: str | None,
+                     opened_at_wall: float) -> int:
+        """Insert a row AT door open and return its id. closed_at / duration_sec /
+        meal_sec / close_reason are left NULL until finalize_session()."""
+        cur = self._conn.execute(
+            """INSERT INTO door_sessions (feeder_id, cat, opened_at)
+               VALUES (?, ?, ?)""",
+            (feeder_id, cat, _wall_to_iso(opened_at_wall)),
         )
+        return int(cur.lastrowid)
+
+    def finalize_session(self, session_id: int, closed_at_wall: float,
+                         meal_sec: float | None, close_reason: str,
+                         min_meal_sec: float) -> None:
+        """Complete the open row: fill closed_at, duration (from the stored
+        opened_at), meal_sec and counted_meal, and the close reason. `incomplete`
+        stays 0. No-op if the row vanished (defensive)."""
+        row = self._conn.execute(
+            "SELECT opened_at FROM door_sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return
+        opened_epoch = dt.datetime.fromisoformat(row[0]).timestamp()
+        duration = max(0.0, closed_at_wall - opened_epoch)
+        counted = 1 if (meal_sec is not None and meal_sec >= min_meal_sec) else 0
+        self._conn.execute(
+            """UPDATE door_sessions
+                   SET closed_at=?, duration_sec=?, meal_sec=?,
+                       counted_meal=?, close_reason=?
+               WHERE id=?""",
+            (_wall_to_iso(closed_at_wall), duration, meal_sec,
+             counted, close_reason, session_id),
+        )
+
+    def recover_interrupted(self, feeder_id: str) -> int:
+        """Mark every still-open session for this feeder (closed_at IS NULL —
+        left behind by a crashed process) as incomplete='interrupted'. closed_at /
+        duration_sec / meal_sec stay NULL (honestly unknown); counted_meal stays
+        0. Returns the number of rows recovered (for logging)."""
+        # closed_at stays NULL, so also require incomplete=0 to skip rows already
+        # recovered by an earlier call — otherwise re-running would re-match them.
+        cur = self._conn.execute(
+            """UPDATE door_sessions
+                   SET incomplete=1, close_reason='interrupted'
+               WHERE feeder_id=? AND closed_at IS NULL AND incomplete=0""",
+            (feeder_id,),
+        )
+        return cur.rowcount
 
     def close(self) -> None:
         self._conn.close()
