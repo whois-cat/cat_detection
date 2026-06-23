@@ -224,3 +224,11 @@ cameras:
       api_base_url: http://192.168.0.101
       serial_number: DEF789012
       allowed_cats: [chuzh]
+      # Concrete scheduled example: 1 portion at each of these local times.
+      # After a restart, only the latest feed_catchup_max missed slots are fed;
+      # older missed slots are journaled as "maintenance" (skipped, not dispensed).
+      feed_mode: scheduled
+      feed_grain_num: 1
+      feed_times: ["08:00", "13:00", "18:00", "22:00"]
+      feed_tz: Europe/Moscow      # omit to use the container's local tz
+      feed_catchup_max: 2
