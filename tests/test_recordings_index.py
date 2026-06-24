@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 import sqlite3
 
 from recordings_index import (
+    delete_paths_from_index,
+    incremental_update,
+    last_indexed_to_ms,
     lookup_segment,
     merge_availability_ranges,
     query_ranges,
+    reconcile_deletions,
     refresh_index,
 )
 from storage import init_db
@@ -21,6 +26,12 @@ def _segment(root, camera: str, name: str, body: bytes = b"mp4"):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(body)
     return path
+
+
+def _age(path, *, seconds: float) -> None:
+    """Backdate a file's mtime so the indexer treats it as a settled segment."""
+    t = path.stat().st_mtime - seconds
+    os.utime(path, (t, t))
 
 
 def test_storage_init_creates_recording_segments_schema(tmp_path, monkeypatch):
@@ -151,3 +162,213 @@ def test_empty_index_returns_empty_fallback_values(tmp_path, monkeypatch):
     assert stats == {"ready": 0, "marked_missing": 0, "cameras": []}
     assert query_ranges(conn, camera_id="grey", from_ms=0, to_ms=1) == []
     assert lookup_segment(conn, camera_id="grey", wall_ms=1) is None
+
+
+# --- live (incremental) indexer ------------------------------------------------
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def test_incremental_indexes_new_file_appearing_after_rebuild(tmp_path, monkeypatch):
+    """A fresh mp4 written after the initial rebuild becomes visible via the
+    live indexer with no manual rebuild — the core bug we're fixing."""
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    now = _now_ms()
+    conn = sqlite3.connect(tmp_path / "events.db")
+
+    # Initial state already indexed (a segment from ~30 min ago).
+    first_name = datetime.fromtimestamp((now - 1800_000) / 1000, timezone.utc).strftime(
+        "%Y-%m-%d_%H-%M-%S-%f"
+    ) + ".mp4"
+    first = _segment(rec, "grey", first_name)
+    _age(first, seconds=60)
+    refresh_index(conn, rec, now_ms=now)
+    assert query_ranges(conn, camera_id="grey", from_ms=now - 3600_000, to_ms=now + 3600_000)
+
+    # A new segment lands later. No rebuild is run.
+    fname = datetime.fromtimestamp((now - 60_000) / 1000, timezone.utc).strftime(
+        "%Y-%m-%d_%H-%M-%S-%f"
+    ) + ".mp4"
+    fresh = _segment(rec, "grey", fname)
+    _age(fresh, seconds=30)
+
+    stats = incremental_update(conn, rec, now_ms=now)
+
+    assert stats["inserted"] == 1
+    seg = lookup_segment(conn, camera_id="grey", wall_ms=now - 45_000)
+    assert seg is not None and seg.path == str(fresh)
+
+
+def test_incremental_skips_file_still_being_written(tmp_path, monkeypatch):
+    """A just-modified (partial) mp4 is ignored until it settles."""
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    now = _now_ms()
+    fname = datetime.fromtimestamp((now - 5_000) / 1000, timezone.utc).strftime(
+        "%Y-%m-%d_%H-%M-%S-%f"
+    ) + ".mp4"
+    partial = _segment(rec, "grey", fname, b"partial")
+    _age(partial, seconds=2)  # younger than the 10s stable-age default
+    conn = sqlite3.connect(tmp_path / "events.db")
+
+    stats = incremental_update(conn, rec, now_ms=now)
+    assert stats["inserted"] == 0
+    assert stats["skipped_unstable"] == 1
+    assert lookup_segment(conn, camera_id="grey", wall_ms=now - 1_000) is None
+
+    # Once it stops changing, the next cycle picks it up.
+    _age(partial, seconds=30)
+    stats = incremental_update(conn, rec, now_ms=now)
+    assert stats["inserted"] == 1
+
+
+def test_incremental_empty_size_is_skipped(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    now = _now_ms()
+    fname = datetime.fromtimestamp((now - 60_000) / 1000, timezone.utc).strftime(
+        "%Y-%m-%d_%H-%M-%S-%f"
+    ) + ".mp4"
+    empty = _segment(rec, "grey", fname, b"")
+    _age(empty, seconds=60)
+    conn = sqlite3.connect(tmp_path / "events.db")
+
+    stats = incremental_update(conn, rec, now_ms=now)
+    assert stats["inserted"] == 0
+    assert stats["skipped_unstable"] == 1
+
+
+def test_incremental_only_scans_recent_window(tmp_path, monkeypatch):
+    """Old files outside the window are not touched by an incremental cycle."""
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    now = _now_ms()
+    old = _segment(rec, "grey", "2020-01-01_00-00-00-000000.mp4")
+    _age(old, seconds=99999)
+    recent_name = datetime.fromtimestamp((now - 60_000) / 1000, timezone.utc).strftime(
+        "%Y-%m-%d_%H-%M-%S-%f"
+    ) + ".mp4"
+    recent = _segment(rec, "grey", recent_name)
+    _age(recent, seconds=30)
+    conn = sqlite3.connect(tmp_path / "events.db")
+
+    stats = incremental_update(conn, rec, now_ms=now, window_ms=10 * 60_000)
+
+    assert stats["inserted"] == 1  # only the recent file
+    assert conn.execute(
+        "SELECT COUNT(*) FROM recording_segments WHERE path=?", (str(old),)
+    ).fetchone()[0] == 0
+
+
+def test_incremental_reconciles_recent_deletion(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    now = _now_ms()
+    fname = datetime.fromtimestamp((now - 60_000) / 1000, timezone.utc).strftime(
+        "%Y-%m-%d_%H-%M-%S-%f"
+    ) + ".mp4"
+    seg = _segment(rec, "grey", fname)
+    _age(seg, seconds=30)
+    conn = sqlite3.connect(tmp_path / "events.db")
+    incremental_update(conn, rec, now_ms=now)
+
+    seg.unlink()
+    stats = incremental_update(conn, rec, now_ms=now)
+
+    assert stats["marked_missing"] == 1
+    assert lookup_segment(conn, camera_id="grey", wall_ms=now - 45_000) is None
+
+
+def test_reconcile_deletions_drops_pruned_old_rows(tmp_path, monkeypatch):
+    """Pruner deletes old files outside the incremental window; reconcile drops
+    their rows so the timeline stops advertising them."""
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    old = _segment(rec, "grey", "2026-06-20_12-00-00-000000.mp4")
+    keep = _segment(rec, "grey", "2026-06-20_12-30-00-000000.mp4")  # survives pruning
+    conn = sqlite3.connect(tmp_path / "events.db")
+    refresh_index(conn, rec)
+    assert conn.execute("SELECT COUNT(*) FROM recording_segments").fetchone()[0] == 2
+
+    old.unlink()  # pruner removes the aged-out segment
+    stats = reconcile_deletions(conn)
+
+    assert stats == {"checked": 2, "deleted": 1, "skipped_all_missing": False}
+    rows = conn.execute("SELECT path FROM recording_segments").fetchall()
+    assert rows == [(str(keep),)]
+
+
+def test_reconcile_deletions_safety_skips_when_all_missing(tmp_path, monkeypatch):
+    """If every file is gone we assume the volume is unmounted and change nothing."""
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    a = _segment(rec, "grey", "2026-06-20_12-00-00-000000.mp4")
+    b = _segment(rec, "grey", "2026-06-20_12-00-30-000000.mp4")
+    conn = sqlite3.connect(tmp_path / "events.db")
+    refresh_index(conn, rec)
+
+    a.unlink()
+    b.unlink()
+    stats = reconcile_deletions(conn)
+
+    assert stats["skipped_all_missing"] is True
+    assert conn.execute("SELECT COUNT(*) FROM recording_segments").fetchone()[0] == 2
+
+
+def test_delete_paths_from_index_removes_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    p = _segment(rec, "grey", "2026-06-24_12-00-00-000000.mp4")
+    conn = sqlite3.connect(tmp_path / "events.db")
+    refresh_index(conn, rec)
+
+    removed = delete_paths_from_index(conn, [str(p)])
+
+    assert removed == 1
+    assert conn.execute("SELECT COUNT(*) FROM recording_segments").fetchone()[0] == 0
+
+
+def test_incremental_does_not_resurrect_deleted_typo_camera(tmp_path, monkeypatch):
+    """An allow-list keeps a deleted/typo camera dir from being re-indexed even
+    if files still linger on disk, and reconcile drops any stale rows."""
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    now = _now_ms()
+    good_name = datetime.fromtimestamp((now - 60_000) / 1000, timezone.utc).strftime(
+        "%Y-%m-%d_%H-%M-%S-%f"
+    ) + ".mp4"
+    good = _segment(rec, "beige", good_name)
+    typo = _segment(rec, "beidge", good_name)
+    _age(good, seconds=30)
+    _age(typo, seconds=30)
+    conn = sqlite3.connect(tmp_path / "events.db")
+
+    stats = incremental_update(conn, rec, now_ms=now, cameras={"beige", "grey"})
+
+    assert stats["cameras"] == ["beige"]
+    cams = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT camera_id FROM recording_segments"
+        ).fetchall()
+    ]
+    assert cams == ["beige"]
+    assert lookup_segment(conn, camera_id="beidge", wall_ms=now - 45_000) is None
+
+
+def test_last_indexed_to_ms_tracks_catchup_point(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    _segment(rec, "grey", "2026-06-24_12-00-00-000000.mp4")
+    _segment(rec, "grey", "2026-06-24_12-00-30-000000.mp4")
+    conn = sqlite3.connect(tmp_path / "events.db")
+    assert last_indexed_to_ms(conn) is None
+
+    refresh_index(conn, rec)
+
+    assert last_indexed_to_ms(conn) == _ms("2026-06-24T12:01:00")
+    assert last_indexed_to_ms(conn, cameras={"grey"}) == _ms("2026-06-24T12:01:00")
+    assert last_indexed_to_ms(conn, cameras={"nope"}) is None

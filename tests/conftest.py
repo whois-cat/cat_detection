@@ -16,6 +16,12 @@ DETECTOR = Path(__file__).resolve().parent.parent / "detector"
 if str(DETECTOR) not in sys.path:
     sys.path.insert(0, str(DETECTOR))
 
+# indexer/ runs flat too (WORKDIR=/app) and imports recordings_index by bare
+# name, which resolves via the detector/ entry above.
+INDEXER = Path(__file__).resolve().parent.parent / "indexer"
+if str(INDEXER) not in sys.path:
+    sys.path.insert(0, str(INDEXER))
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))

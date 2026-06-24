@@ -225,10 +225,20 @@ train-compare *ARGS:
 journal-feed CAT DAYS="3":
     python3 tools/feed_log.py {{CAT}} --days {{DAYS}} --db {{journal_db}}
 
-# Rebuild the SQLite recording segment index from files under RECORDINGS_ROOT.
+# Full rebuild of the SQLite recording segment index from files under
+# RECORDINGS_ROOT. Recovery/backfill only — the `indexer` service keeps the
+# index live during normal operation, so you should not need this routinely.
 [group('dev')]
 recordings-index-rebuild:
     uv run --extra test python -m detector.recordings_index rebuild \
+        --db "{{events_db}}" \
+        --recordings "{{recordings}}"
+
+# One-shot incremental index of recent files (what the indexer service does
+# every cycle). Handy for manual verification without the container.
+[group('dev')]
+recordings-index-incremental:
+    uv run --extra test python -m detector.recordings_index incremental \
         --db "{{events_db}}" \
         --recordings "{{recordings}}"
 
@@ -237,5 +247,5 @@ recordings-index-rebuild:
 # Fast local checks for changed Python code.
 [group('dev')]
 check:
-    uv run --extra test python -m compileall feeder detector training/*.py pruner review
+    uv run --extra test python -m compileall feeder detector training/*.py pruner indexer review
     uv run --extra test pytest

@@ -47,6 +47,33 @@ services:
       PRUNE_INTERVAL_SEC: ${PRUNER_INTERVAL_SEC:-3600}
       DRY_RUN: ${PRUNER_DRY_RUN:-0}
 
+  # Live recording indexer: keeps recording_segments in sync with the mp4 files
+  # mediamtx writes, so the WebUI timeline grows automatically without a manual
+  # `just recordings-index-rebuild`. Single writer of recording_segments; the
+  # detector only reads it. Build context is the repo root so it can reuse
+  # detector/recordings_index.py (the index logic's single source of truth).
+  indexer:
+    build:
+      context: .
+      dockerfile: indexer/Dockerfile
+    restart: unless-stopped
+    depends_on: [mediamtx]
+    volumes:
+      - ./data/recordings:/recordings:ro
+      - ./data/events:/data/events
+    environment:
+      RECORDINGS_DIR: /recordings
+      EVENTS_DB: /data/events/events.db
+      RECORDING_TZ: ${RECORDING_TZ:-UTC}
+      SEGMENT_DURATION_SEC: "30"        # must match mediamtx recordSegmentDuration
+      INDEX_INTERVAL_SEC: ${INDEXER_INTERVAL_SEC:-30}
+      INDEX_WINDOW_SEC: ${INDEXER_WINDOW_SEC:-900}
+      RECONCILE_INTERVAL_SEC: ${INDEXER_RECONCILE_SEC:-300}
+      STARTUP_LOOKBACK_SEC: ${INDEXER_STARTUP_LOOKBACK_SEC:-86400}
+      MIN_STABLE_AGE_SEC: ${INDEXER_MIN_STABLE_AGE_SEC:-10}
+      # Optional allow-list (csv). Empty => index every camera dir found.
+      RECORDINGS_CAMERAS: ${RECORDINGS_CAMERAS:-}
+
   webui:
     build: ./webui
     restart: unless-stopped
