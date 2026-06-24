@@ -33,6 +33,7 @@ Storage: SQLite at /data/events/events.db (one row per detection box).
 import asyncio
 from functools import partial
 import json
+import math
 import os
 import queue
 import threading
@@ -545,8 +546,16 @@ def detector_loop():
 
 clients: "set[web.WebSocketResponse]" = set()
 db_conn = None  # initialised in main()
-_ranges_cache: dict[tuple[str, int, int], tuple[float, list[dict]]] = {}
+_ranges_cache: dict[tuple[str, int, int], tuple[float, list[list[int]]]] = {}
 _ranges_inflight: dict[tuple[str, int, int], asyncio.Task] = {}
+
+
+def _parse_epoch_ms_param(request: web.Request, name: str) -> int:
+    raw = request.query[name]
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(name)
+    return int(round(value))
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -568,8 +577,8 @@ async def events_handler(request: web.Request) -> web.Response:
        &camera=<id>        optional, defaults to this detector's CAMERA_ID
        &model=<name>       optional"""
     try:
-        t_from = int(request.query["from"])
-        t_to   = int(request.query["to"])
+        t_from = _parse_epoch_ms_param(request, "from")
+        t_to   = _parse_epoch_ms_param(request, "to")
     except (KeyError, ValueError):
         return web.json_response({"error": "from/to required (epoch ms)"}, status=400)
     camera = request.query.get("camera", CAMERA_ID)
@@ -592,8 +601,8 @@ async def recordings_ranges_handler(request: web.Request) -> web.Response:
       &camera=<id>         optional, defaults to this detector's CAMERA_ID
     """
     try:
-        t_from = int(request.query["from"])
-        t_to = int(request.query["to"])
+        t_from = _parse_epoch_ms_param(request, "from")
+        t_to = _parse_epoch_ms_param(request, "to")
     except (KeyError, ValueError):
         return web.json_response({"error": "from/to required (epoch ms)"}, status=400)
     if t_to < t_from:
@@ -608,6 +617,7 @@ async def recordings_ranges_handler(request: web.Request) -> web.Response:
             "camera": camera,
             "from_ms": t_from,
             "to_ms": t_to,
+            "format": "pairs",
             "ranges": hit[1],
             "source": "cache",
         })
@@ -622,12 +632,13 @@ async def recordings_ranges_handler(request: web.Request) -> web.Response:
         "camera": camera,
         "from_ms": t_from,
         "to_ms": t_to,
+        "format": "pairs",
         "ranges": rows,
         "source": "db",
     })
 
 
-async def _load_recording_ranges(key: tuple[str, int, int]) -> list[dict]:
+async def _load_recording_ranges(key: tuple[str, int, int]) -> list[list[int]]:
     camera, t_from, t_to = key
     started = time.perf_counter()
     loop = asyncio.get_running_loop()
@@ -641,7 +652,7 @@ async def _load_recording_ranges(key: tuple[str, int, int]) -> list[dict]:
         rows,
     )
     print(
-        f"[recordings/ranges] camera={camera} rows={len(rows)} "
+        f"[recordings/ranges] camera={camera} ranges={len(rows)} "
         f"from={t_from} to={t_to} elapsed_ms={elapsed_ms:.1f}",
         flush=True,
     )

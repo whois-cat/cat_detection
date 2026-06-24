@@ -219,32 +219,48 @@ def query_ranges(
     camera_id: str,
     from_ms: int,
     to_ms: int,
-) -> list[dict]:
+) -> list[list[int]]:
+    """Return compact merged availability ranges for a camera/time window.
+
+    This intentionally does *not* expose segment paths or file metadata. The
+    WebUI timeline only needs "media exists here" intervals, and thousands of
+    per-segment rows with absolute paths make the payload much larger than the
+    signal it carries.
+    """
     ensure_schema(conn)
     rows = conn.execute(
         """
-        SELECT camera_id, start_ms, end_ms, path, size_bytes, mtime_ms, status
+        SELECT start_ms, end_ms
         FROM recording_segments
         WHERE camera_id = ?
           AND start_ms <= ?
           AND end_ms >= ?
           AND status = 'ready'
-        ORDER BY start_ms, path
+        ORDER BY start_ms, end_ms
         """,
         (camera_id, to_ms, from_ms),
     ).fetchall()
-    return [
-        {
-            "camera_id": r[0],
-            "from_ms": r[1],
-            "to_ms": r[2],
-            "path": r[3],
-            "size_bytes": r[4],
-            "mtime_ms": r[5],
-            "status": r[6],
-        }
-        for r in rows
-    ]
+    return merge_availability_ranges(rows, from_ms=from_ms, to_ms=to_ms)
+
+
+def merge_availability_ranges(
+    rows,
+    *,
+    from_ms: int,
+    to_ms: int,
+    merge_gap_ms: int = 1000,
+) -> list[list[int]]:
+    merged: list[list[int]] = []
+    for start_ms, end_ms in rows:
+        start = max(int(start_ms), int(from_ms))
+        end = min(int(end_ms), int(to_ms))
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1] + merge_gap_ms:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
 
 
 def _row_to_segment(row) -> RecordingSegment:

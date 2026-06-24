@@ -1,14 +1,40 @@
+export function normalizeEpochMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error(`invalid epoch ms: ${value}`);
+  return Math.max(0, Math.round(n));
+}
+
 export function rangeCacheKey(cameraId, fromMs, toMs) {
-  return `${cameraId}:${Math.round(fromMs)}:${Math.round(toMs)}`;
+  return `${cameraId}:${normalizeEpochMs(fromMs)}:${normalizeEpochMs(toMs)}`;
+}
+
+export function normalizeAvailabilityRanges(ranges) {
+  if (!Array.isArray(ranges)) return [];
+  return ranges.map((range) => {
+    if (Array.isArray(range)) {
+      return {
+        from_ms: normalizeEpochMs(range[0]),
+        to_ms: normalizeEpochMs(range[1]),
+      };
+    }
+    return {
+      from_ms: normalizeEpochMs(range?.from_ms),
+      to_ms: normalizeEpochMs(range?.to_ms),
+    };
+  }).filter((range) => range.to_ms > range.from_ms);
 }
 
 export async function fetchJsonWithTimeout(url, {
   fetchImpl = globalThis.fetch,
   timeoutMs = 1500,
   headers = { Accept: 'application/json' },
+  signal = null,
 } = {}) {
   if (typeof fetchImpl !== 'function') throw new Error('fetch is unavailable');
   const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener?.('abort', abort, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const r = await fetchImpl(url, { headers, signal: controller.signal });
@@ -26,6 +52,7 @@ export async function fetchJsonWithTimeout(url, {
     return await r.json();
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener?.('abort', abort);
   }
 }
 
@@ -48,22 +75,31 @@ export function createJsonRequestCache({
     }
     if (inflight.has(key)) {
       onTiming({ key, url, source: 'inflight', elapsedMs: 0 });
-      return inflight.get(key);
+      return inflight.get(key).promise;
     }
 
     const started = now();
+    const controller = new AbortController();
+    const externalSignal = opts.signal;
+    const abortFromExternal = () => controller.abort(externalSignal?.reason);
+    if (externalSignal?.aborted) abortFromExternal();
+    else externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
+    let entry;
     const promise = fetchJsonWithTimeout(url, {
       fetchImpl,
       timeoutMs: opts.timeoutMs ?? timeoutMs,
       headers: opts.headers,
+      signal: controller.signal,
     }).then((value) => {
       cache.set(key, { value, expiresAt: now() + (opts.ttlMs ?? ttlMs) });
       onTiming({ key, url, source: 'network', elapsedMs: now() - started });
       return value;
     }).finally(() => {
-      inflight.delete(key);
+      externalSignal?.removeEventListener?.('abort', abortFromExternal);
+      if (inflight.get(key) === entry) inflight.delete(key);
     });
-    inflight.set(key, promise);
+    entry = { promise, controller };
+    inflight.set(key, entry);
     return promise;
   }
 
@@ -71,10 +107,22 @@ export function createJsonRequestCache({
     for (const key of cache.keys()) {
       if (!prefix || key.startsWith(prefix)) cache.delete(key);
     }
-    for (const key of inflight.keys()) {
-      if (!prefix || key.startsWith(prefix)) inflight.delete(key);
+    for (const [key, entry] of inflight.entries()) {
+      if (!prefix || key.startsWith(prefix)) {
+        entry.controller.abort();
+        inflight.delete(key);
+      }
     }
   }
 
-  return { get, clear, _cache: cache, _inflight: inflight };
+  function abort(prefix = '') {
+    for (const [key, entry] of inflight.entries()) {
+      if (!prefix || key.startsWith(prefix)) {
+        entry.controller.abort();
+        inflight.delete(key);
+      }
+    }
+  }
+
+  return { get, clear, abort, _cache: cache, _inflight: inflight };
 }

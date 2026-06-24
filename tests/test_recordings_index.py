@@ -5,6 +5,7 @@ import sqlite3
 
 from recordings_index import (
     lookup_segment,
+    merge_availability_ranges,
     query_ranges,
     refresh_index,
 )
@@ -67,11 +68,30 @@ def test_query_ranges_returns_segments_overlapping_range(tmp_path, monkeypatch):
         to_ms=_ms("2026-06-24T12:00:45"),
     )
 
-    assert [r["from_ms"] for r in rows] == [
-        _ms("2026-06-24T12:00:00"),
-        _ms("2026-06-24T12:00:30"),
+    assert rows == [[
+        _ms("2026-06-24T12:00:20"),
+        _ms("2026-06-24T12:00:45"),
+    ]]
+    assert all("mp4" not in str(r) for r in rows)
+
+
+def test_merge_availability_ranges_keeps_gaps_and_clamps_window():
+    rows = [
+        (_ms("2026-06-24T12:00:00"), _ms("2026-06-24T12:00:30")),
+        (_ms("2026-06-24T12:00:30"), _ms("2026-06-24T12:01:00")),
+        (_ms("2026-06-24T12:03:00"), _ms("2026-06-24T12:03:30")),
     ]
-    assert {r["camera_id"] for r in rows} == {"grey"}
+
+    merged = merge_availability_ranges(
+        rows,
+        from_ms=_ms("2026-06-24T12:00:10"),
+        to_ms=_ms("2026-06-24T12:03:10"),
+    )
+
+    assert merged == [
+        [_ms("2026-06-24T12:00:10"), _ms("2026-06-24T12:01:00")],
+        [_ms("2026-06-24T12:03:00"), _ms("2026-06-24T12:03:10")],
+    ]
 
 
 def test_missing_file_is_marked_missing_and_not_returned(tmp_path, monkeypatch):

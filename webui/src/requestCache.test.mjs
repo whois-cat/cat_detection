@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
-import { createJsonRequestCache, rangeCacheKey } from './requestCache.js';
+import {
+  createJsonRequestCache,
+  normalizeAvailabilityRanges,
+  normalizeEpochMs,
+  rangeCacheKey,
+} from './requestCache.js';
 
 function jsonResponse(body, { status = 200 } = {}) {
   return {
@@ -24,6 +29,19 @@ function deferred() {
 assert.equal(
   rangeCacheKey('grey', 1000.2, 2000.8),
   'grey:1000:2001',
+);
+assert.equal(normalizeEpochMs(123.49), 123);
+assert.equal(normalizeEpochMs(123.5), 124);
+assert.deepEqual(
+  normalizeAvailabilityRanges([
+    [1000.2, 2000.8],
+    { from_ms: 3000.1, to_ms: 4000.6, path: '/too/much/data.mp4' },
+    [5000, 5000],
+  ]),
+  [
+    { from_ms: 1000, to_ms: 2001 },
+    { from_ms: 3000, to_ms: 4001 },
+  ],
 );
 
 {
@@ -88,6 +106,25 @@ assert.equal(
   await assert.rejects(() => cache.get('models:grey', '/models'));
   await assert.rejects(() => cache.get('models:grey', '/models'));
   assert.equal(calls, 2);
+}
+
+{
+  let aborted = false;
+  const cache = createJsonRequestCache({
+    fetchImpl: async (_url, opts) => {
+      return new Promise((_resolve, reject) => {
+        opts.signal.addEventListener('abort', () => {
+          aborted = true;
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        }, { once: true });
+      });
+    },
+  });
+  const p = cache.get('ranges:grey:1', '/slow-ranges');
+  cache.abort('ranges:grey:');
+  await assert.rejects(() => p);
+  assert.equal(aborted, true);
+  assert.equal(cache._inflight.size, 0);
 }
 
 console.log('requestCache.test.mjs: all assertions passed');
