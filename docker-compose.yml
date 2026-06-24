@@ -76,8 +76,9 @@ services:
       RECONCILE_INTERVAL_SEC: ${INDEXER_RECONCILE_SEC:-300}
       STARTUP_LOOKBACK_SEC: ${INDEXER_STARTUP_LOOKBACK_SEC:-86400}
       MIN_STABLE_AGE_SEC: ${INDEXER_MIN_STABLE_AGE_SEC:-10}
-      # Optional allow-list (csv). Empty => index every camera dir found.
-      RECORDINGS_CAMERAS: ${RECORDINGS_CAMERAS:-}
+      # Explicit camera allow-list (csv). Keeps the deleted typo camera
+      # "beidge" from ever being re-indexed. Override via env if cameras change.
+      RECORDINGS_CAMERAS: ${RECORDINGS_CAMERAS:-beige,grey}
 
   webui:
     build: ./webui

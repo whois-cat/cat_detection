@@ -296,13 +296,14 @@ def test_reconcile_deletions_drops_pruned_old_rows(tmp_path, monkeypatch):
     old.unlink()  # pruner removes the aged-out segment
     stats = reconcile_deletions(conn)
 
-    assert stats == {"checked": 2, "deleted": 1, "skipped_all_missing": False}
+    assert stats == {"checked": 2, "deleted": 1, "skipped_cameras": []}
     rows = conn.execute("SELECT path FROM recording_segments").fetchall()
     assert rows == [(str(keep),)]
 
 
-def test_reconcile_deletions_safety_skips_when_all_missing(tmp_path, monkeypatch):
-    """If every file is gone we assume the volume is unmounted and change nothing."""
+def test_reconcile_deletions_safety_skips_when_all_of_a_camera_missing(tmp_path, monkeypatch):
+    """If every file for a camera is gone we assume its dir is unmounted and
+    change nothing for it."""
     monkeypatch.setenv("RECORDING_TZ", "UTC")
     rec = tmp_path / "recordings"
     a = _segment(rec, "grey", "2026-06-20_12-00-00-000000.mp4")
@@ -314,8 +315,39 @@ def test_reconcile_deletions_safety_skips_when_all_missing(tmp_path, monkeypatch
     b.unlink()
     stats = reconcile_deletions(conn)
 
-    assert stats["skipped_all_missing"] is True
+    assert stats["skipped_cameras"] == ["grey"]
+    assert stats["deleted"] == 0
     assert conn.execute("SELECT COUNT(*) FROM recording_segments").fetchone()[0] == 2
+
+
+def test_reconcile_deletions_is_per_camera(tmp_path, monkeypatch):
+    """One camera's whole dir being unmounted must not block reconciling a
+    healthy sibling, and must not touch the unmounted camera's rows."""
+    monkeypatch.setenv("RECORDING_TZ", "UTC")
+    rec = tmp_path / "recordings"
+    # grey: 2 files, 1 pruned -> healthy, reconcile the gone one.
+    g_old = _segment(rec, "grey", "2026-06-20_12-00-00-000000.mp4")
+    _segment(rec, "grey", "2026-06-20_12-30-00-000000.mp4")
+    # beige: both files vanish at once -> looks unmounted, leave alone.
+    b1 = _segment(rec, "beige", "2026-06-20_12-00-00-000000.mp4")
+    b2 = _segment(rec, "beige", "2026-06-20_12-00-30-000000.mp4")
+    conn = sqlite3.connect(tmp_path / "events.db")
+    refresh_index(conn, rec)
+
+    g_old.unlink()
+    b1.unlink()
+    b2.unlink()
+    stats = reconcile_deletions(conn)
+
+    assert stats["deleted"] == 1
+    assert stats["skipped_cameras"] == ["beige"]
+    cams = {
+        r[0]: r[1]
+        for r in conn.execute(
+            "SELECT camera_id, COUNT(*) FROM recording_segments GROUP BY camera_id"
+        )
+    }
+    assert cams == {"grey": 1, "beige": 2}
 
 
 def test_delete_paths_from_index_removes_rows(tmp_path, monkeypatch):

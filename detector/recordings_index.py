@@ -442,32 +442,51 @@ def reconcile_deletions(
     caught here. This walks index *rows* and stats each path — it never globs
     the archive — so it's cheap enough to run every few minutes.
 
-    Safety: if every ready row's file is missing we assume the recordings volume
-    is unmounted/empty rather than truly emptied, and make no changes (mirrors
-    the pruner's "no events → skip" guard).
+    Safety is **per camera**: if *every* ready row for a camera is missing we
+    assume that camera's directory is unmounted/empty rather than truly emptied,
+    and leave its rows untouched (mirrors the pruner's "no events → skip"
+    guard). A healthy camera is still reconciled even if a sibling is unmounted.
+    This only ever touches ``recording_segments`` — it never deletes media.
     """
     ensure_schema(conn)
     if cameras:
         placeholders = ",".join("?" for _ in cameras)
         rows = conn.execute(
-            f"SELECT path FROM recording_segments "
+            f"SELECT path, camera_id FROM recording_segments "
             f"WHERE status='ready' AND camera_id IN ({placeholders})",
             tuple(cameras),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT path FROM recording_segments WHERE status='ready'"
+            "SELECT path, camera_id FROM recording_segments WHERE status='ready'"
         ).fetchall()
-    gone = [row[0] for row in rows if not os.path.exists(row[0])]
-    if rows and len(gone) == len(rows):
-        return {"checked": len(rows), "deleted": 0, "skipped_all_missing": True}
-    if gone:
+
+    by_cam: dict[str, list[str]] = defaultdict(list)
+    for path, camera_id in rows:
+        by_cam[camera_id].append(path)
+
+    to_delete: list[str] = []
+    skipped_cameras: list[str] = []
+    for camera_id, paths in by_cam.items():
+        gone = [p for p in paths if not os.path.exists(p)]
+        if gone and len(gone) == len(paths):
+            # Whole camera vanished at once → almost certainly an unmounted dir,
+            # not a real bulk delete. Leave it alone.
+            skipped_cameras.append(camera_id)
+            continue
+        to_delete.extend(gone)
+
+    if to_delete:
         with conn:
             conn.executemany(
                 "DELETE FROM recording_segments WHERE path=?",
-                [(p,) for p in gone],
+                [(p,) for p in to_delete],
             )
-    return {"checked": len(rows), "deleted": len(gone), "skipped_all_missing": False}
+    return {
+        "checked": len(rows),
+        "deleted": len(to_delete),
+        "skipped_cameras": sorted(skipped_cameras),
+    }
 
 
 def open_index_db(db_path: Path) -> sqlite3.Connection:

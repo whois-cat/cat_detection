@@ -69,7 +69,7 @@ def _fmt_last_indexed(last: dict[str, int]) -> str:
     return ",".join(f"{cam}@{ts}" for cam, ts in sorted(last.items()))
 
 
-def run_incremental(conn, *, since_ms=None, label="cycle") -> dict:
+def run_incremental(conn, *, since_ms=None, cameras=None, label="cycle") -> dict:
     started = time.perf_counter()
     stats = incremental_update(
         conn,
@@ -78,7 +78,7 @@ def run_incremental(conn, *, since_ms=None, label="cycle") -> dict:
         window_ms=INDEX_WINDOW_MS,
         min_stable_age_ms=MIN_STABLE_AGE_MS,
         segment_duration_ms=SEGMENT_DURATION_MS,
-        cameras=RECORDINGS_CAMERAS,
+        cameras=cameras if cameras is not None else RECORDINGS_CAMERAS,
     )
     elapsed_ms = (time.perf_counter() - started) * 1000
     # Only log cycles that did something (or the explicit catch-up), so steady
@@ -99,10 +99,11 @@ def run_reconcile(conn) -> dict:
     started = time.perf_counter()
     stats = reconcile_deletions(conn, cameras=RECORDINGS_CAMERAS)
     elapsed_ms = (time.perf_counter() - started) * 1000
-    if stats.get("skipped_all_missing"):
+    if stats.get("skipped_cameras"):
         print(
-            f"[indexer] reconcile SKIPPED: all {stats['checked']} ready rows missing "
-            f"(recordings volume unmounted/empty?) — making no changes",
+            f"[indexer] reconcile: skipped cameras {stats['skipped_cameras']} "
+            f"(all their ready rows missing — dir unmounted/empty?); "
+            f"deleted={stats['deleted']} checked={stats['checked']}",
             flush=True,
         )
     elif stats["deleted"]:
@@ -114,14 +115,36 @@ def run_reconcile(conn) -> dict:
     return stats
 
 
-def catchup_since_ms(conn, now_ms: int) -> int:
-    """Restart catch-up window: resume from MAX(end_ms) in the DB, but never go
-    back further than STARTUP_LOOKBACK_SEC (caps a long-down indexer)."""
+def catchup_since_ms(conn, camera: str, now_ms: int) -> int:
+    """Per-camera restart catch-up: resume from that camera's own MAX(end_ms),
+    never going back further than STARTUP_LOOKBACK_SEC.
+
+    Per camera (not a global MAX) so a camera that lagged or was added later
+    still gets fully caught up even if a busier camera is already current."""
     floor_ms = now_ms - STARTUP_LOOKBACK_MS
-    last = last_indexed_to_ms(conn, cameras=RECORDINGS_CAMERAS)
+    last = last_indexed_to_ms(conn, cameras={camera})
     if last is None:
         return floor_ms
     return max(floor_ms, last - CATCHUP_OVERLAP_MS)
+
+
+def resolve_cameras(conn) -> list[str]:
+    """Cameras to catch up at startup. Prefer the explicit allow-list; otherwise
+    fall back to the union of on-disk camera dirs and already-indexed cameras.
+    With the allow-list set (RECORDINGS_CAMERAS=beige,grey) a deleted typo dir
+    like ``beidge`` is never touched."""
+    if RECORDINGS_CAMERAS:
+        return sorted(RECORDINGS_CAMERAS)
+    cams: set[str] = set()
+    try:
+        cams |= {e.name for e in os.scandir(RECORDINGS_DIR) if e.is_dir()}
+    except OSError:
+        pass
+    cams |= {
+        row[0]
+        for row in conn.execute("SELECT DISTINCT camera_id FROM recording_segments")
+    }
+    return sorted(cams)
 
 
 def main() -> None:
@@ -135,10 +158,11 @@ def main() -> None:
     conn = open_index_db(EVENTS_DB)
 
     now_ms = int(time.time() * 1000)
-    since = catchup_since_ms(conn, now_ms)
-    print(f"[indexer] startup catch-up from {since} (now {now_ms})", flush=True)
     try:
-        run_incremental(conn, since_ms=since, label="catch-up")
+        for camera in resolve_cameras(conn):
+            since = catchup_since_ms(conn, camera, now_ms)
+            print(f"[indexer] startup catch-up {camera} from {since} (now {now_ms})", flush=True)
+            run_incremental(conn, since_ms=since, cameras={camera}, label=f"catch-up[{camera}]")
         run_reconcile(conn)
     except Exception as e:  # never let startup hiccups kill the loop
         print(f"[indexer] startup error: {e!r}", flush=True)
