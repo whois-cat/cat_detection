@@ -31,6 +31,7 @@ Also broadcast on the same WS, identified by `kind` field:
 Storage: SQLite at /data/events/events.db (one row per detection box).
 """
 import asyncio
+from functools import partial
 import json
 import os
 import queue
@@ -43,6 +44,7 @@ from aiohttp import web, WSMsgType
 
 from bowl_monitor import BowlMonitor
 from detectors import build_detector
+from recordings_index import query_ranges as query_recording_ranges
 from storage import init_db, insert_event, query_events, list_models
 
 
@@ -327,6 +329,8 @@ EVENTS_DB     = os.environ.get("EVENTS_DB", "/data/events/events.db")
 WS_PORT       = int(os.environ.get("WS_PORT", "8091"))
 CONTROL_PORT  = int(os.environ.get("CONTROL_PORT", "8092"))
 STATS_INTERVAL_SEC = float(os.environ.get("STATS_INTERVAL_SEC", "1.0"))
+RECORDING_RANGES_CACHE_TTL_SEC = float(os.environ.get("RECORDING_RANGES_CACHE_TTL_SEC", "10.0"))
+DETECTOR_TARGET_FPS = max(0.0, float(os.environ.get("DETECTOR_TARGET_FPS", "2.0")))
 
 # Dynamic artificial delay (ms), tunable at runtime via the control endpoint.
 artificial_delay_ms = int(os.environ.get("ARTIFICIAL_DELAY_MS", "0"))
@@ -356,6 +360,10 @@ def _enqueue_pending(item: "tuple[int, dict]") -> None:
 # stats broadcaster. Single writer per counter; plain ints are fine in CPython.
 _fps_in_count = 0          # frames decoded from RTSP
 _fps_proc_count = 0        # frames the detector actually processed
+_frames_dropped_count = 0  # frames skipped by target-fps throttling
+_decode_latency_ms_sum = 0.0
+_detect_latency_ms_sum = 0.0
+_loop_latency_ms_sum = 0.0
 
 # Latest-frame slot: decoder always overwrites; detector takes whatever's there
 # and runs. Frames produced while the detector is busy are dropped (only the
@@ -419,11 +427,14 @@ def decoder_loop():
 
 def detector_loop():
     """Take the most-recent frame from the shared slot, run detection, enqueue
-    events. Blocks until a frame is available, then processes it immediately —
-    no fixed cadence. Detection rate (fps_proc) is therefore the natural
-    `min(camera_fps, 1/detector_latency)`."""
-    global _fps_proc_count, _latest_frame
+    events. Blocks until a frame is available, then processes at no more than
+    DETECTOR_TARGET_FPS. Frames that arrive while throttled or busy are dropped
+    by the latest-frame slot; an unbounded queue is never built."""
+    global _fps_proc_count, _latest_frame, _frames_dropped_count
+    global _decode_latency_ms_sum, _detect_latency_ms_sum, _loop_latency_ms_sum
     prev_had_detections = False
+    last_processed_monotonic = 0.0
+    min_interval_sec = (1.0 / DETECTOR_TARGET_FPS) if DETECTOR_TARGET_FPS > 0 else 0.0
     while True:
         with _latest_cv:
             while _latest_frame is None:
@@ -431,8 +442,18 @@ def detector_loop():
             frame, tb_num, tb_den = _latest_frame
             _latest_frame = None
 
+        if min_interval_sec > 0:
+            now = time.monotonic()
+            if last_processed_monotonic and now - last_processed_monotonic < min_interval_sec:
+                _frames_dropped_count += 1
+                continue
+            last_processed_monotonic = now
+
+        loop_started = time.perf_counter()
         try:
+            decode_started = time.perf_counter()
             img_cam = frame.to_ndarray(format="bgr24")
+            _decode_latency_ms_sum += (time.perf_counter() - decode_started) * 1000
         except Exception as e:
             print(f"[detector] frame decode failed: {e!r}", flush=True)
             continue
@@ -460,7 +481,9 @@ def detector_loop():
             else:
                 img_inf = crop_cam
             rot_H, rot_W = img_inf.shape[:2]
+            detect_started = time.perf_counter()
             local_boxes = detector.detect(img_inf)
+            _detect_latency_ms_sum += (time.perf_counter() - detect_started) * 1000
 
         boxes = []
         for b in local_boxes:
@@ -496,6 +519,7 @@ def detector_loop():
                 _attach_food_fields(clear_ev, food_state, food_level)
                 _enqueue_pending((wall_ms + artificial_delay_ms, clear_ev))
             prev_had_detections = False
+            _loop_latency_ms_sum += (time.perf_counter() - loop_started) * 1000
             continue
 
         prev_had_detections = True
@@ -514,12 +538,15 @@ def detector_loop():
             }
             _attach_food_fields(ev, food_state, food_level)
             _enqueue_pending((wall_ms + artificial_delay_ms, ev))
+        _loop_latency_ms_sum += (time.perf_counter() - loop_started) * 1000
 
 
 # ---- aiohttp ----
 
 clients: "set[web.WebSocketResponse]" = set()
 db_conn = None  # initialised in main()
+_ranges_cache: dict[tuple[str, int, int], tuple[float, list[dict]]] = {}
+_ranges_inflight: dict[tuple[str, int, int], asyncio.Task] = {}
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -555,6 +582,70 @@ async def models_handler(request: web.Request) -> web.Response:
     """List models that have any events for a given camera."""
     camera = request.query.get("camera", CAMERA_ID)
     return web.json_response({"models": list_models(db_conn, camera_id=camera)})
+
+
+async def recordings_ranges_handler(request: web.Request) -> web.Response:
+    """Fast recording segment ranges from SQLite, not MediaMTX /list.
+
+    Query params:
+      ?from=<ms>&to=<ms>   required epoch-ms range
+      &camera=<id>         optional, defaults to this detector's CAMERA_ID
+    """
+    try:
+        t_from = int(request.query["from"])
+        t_to = int(request.query["to"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "from/to required (epoch ms)"}, status=400)
+    if t_to < t_from:
+        return web.json_response({"error": "to must be >= from"}, status=400)
+
+    camera = request.query.get("camera", CAMERA_ID)
+    key = (camera, t_from, t_to)
+    now = time.monotonic()
+    hit = _ranges_cache.get(key)
+    if hit and hit[0] > now:
+        return web.json_response({
+            "camera": camera,
+            "from_ms": t_from,
+            "to_ms": t_to,
+            "ranges": hit[1],
+            "source": "cache",
+        })
+
+    task = _ranges_inflight.get(key)
+    if task is None:
+        task = asyncio.create_task(_load_recording_ranges(key))
+        _ranges_inflight[key] = task
+        task.add_done_callback(lambda _task, _key=key: _ranges_inflight.pop(_key, None))
+    rows = await task
+    return web.json_response({
+        "camera": camera,
+        "from_ms": t_from,
+        "to_ms": t_to,
+        "ranges": rows,
+        "source": "db",
+    })
+
+
+async def _load_recording_ranges(key: tuple[str, int, int]) -> list[dict]:
+    camera, t_from, t_to = key
+    started = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(
+        None,
+        partial(query_recording_ranges, db_conn, camera_id=camera, from_ms=t_from, to_ms=t_to),
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    _ranges_cache[key] = (
+        time.monotonic() + RECORDING_RANGES_CACHE_TTL_SEC,
+        rows,
+    )
+    print(
+        f"[recordings/ranges] camera={camera} rows={len(rows)} "
+        f"from={t_from} to={t_to} elapsed_ms={elapsed_ms:.1f}",
+        flush=True,
+    )
+    return rows
 
 
 async def health(_request: web.Request) -> web.Response:
@@ -646,7 +737,8 @@ async def stats_task():
 
     Browser displays this in the header so the user can see live throughput
     even during quiet (no-detection) periods."""
-    global _fps_in_count, _fps_proc_count
+    global _fps_in_count, _fps_proc_count, _frames_dropped_count
+    global _decode_latency_ms_sum, _detect_latency_ms_sum, _loop_latency_ms_sum
     last_t = time.time()
     while True:
         await asyncio.sleep(STATS_INTERVAL_SEC)
@@ -654,8 +746,17 @@ async def stats_task():
         elapsed = max(1e-6, now - last_t)
         fps_in = _fps_in_count / elapsed
         fps_proc = _fps_proc_count / elapsed
+        proc_count = _fps_proc_count
+        frames_dropped = _frames_dropped_count
+        avg_decode_ms = _decode_latency_ms_sum / proc_count if proc_count else 0.0
+        avg_detect_ms = _detect_latency_ms_sum / proc_count if proc_count else 0.0
+        avg_loop_ms = _loop_latency_ms_sum / proc_count if proc_count else 0.0
         _fps_in_count = 0
         _fps_proc_count = 0
+        _frames_dropped_count = 0
+        _decode_latency_ms_sum = 0.0
+        _detect_latency_ms_sum = 0.0
+        _loop_latency_ms_sum = 0.0
         last_t = now
         msg = {
             "kind": "stats",
@@ -663,6 +764,11 @@ async def stats_task():
             "model": detector.model_name if detector else "(unknown)",
             "fps_in": round(fps_in, 2),
             "fps_processed": round(fps_proc, 2),
+            "target_fps": DETECTOR_TARGET_FPS,
+            "frames_dropped": frames_dropped,
+            "decode_latency_ms": round(avg_decode_ms, 1),
+            "detector_latency_ms": round(avg_detect_ms, 1),
+            "loop_latency_ms": round(avg_loop_ms, 1),
             "active_tracks": 0,    # placeholder; tracker integration TBD
             "wall_ms": int(now * 1000),
             # detect_roi: axis-aligned rect [x0,y0,x1,y1] in [0..1].
@@ -714,6 +820,7 @@ async def main():
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/events", events_handler)
     app.router.add_get("/models", models_handler)
+    app.router.add_get("/recordings/ranges", recordings_ranges_handler)
     app.router.add_get("/health", health)
     app.router.add_get("/config", config_handler)
     runner = web.AppRunner(app)

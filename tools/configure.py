@@ -270,6 +270,7 @@ def render_compose(cfg: dict) -> str:
             "CAMERA_ID":           cid,
             "RTSP_SOURCE":         f"rtsp://host.docker.internal:8554/{cid}",
             "DETECTOR_TYPE":       cam.get("detector_type", "blob"),
+            "DETECTOR_TARGET_FPS": cam.get("detector_target_fps", 2.0),
             "BLOB_BRIGHT_THRESHOLD": cam.get("blob_bright_threshold", 240),
             "BLOB_MIN_AREA":       cam.get("blob_min_area", 500),
             "YOLO_WEIGHTS":        cam.get("yolo_weights", "/opt/models/yolov8n_int8_openvino_model/"),

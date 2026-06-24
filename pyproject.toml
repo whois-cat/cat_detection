@@ -1,0 +1,51 @@
+[project]
+name = "cat-detection"
+version = "0.1.0"
+description = "Local cat detection, review, and training tooling."
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "av==12.3.0",
+    "fastapi>=0.115",
+    "numpy==1.26.4",
+    "opencv-python-headless==4.10.0.84",
+    "openvino==2024.4.0",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+training = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "scikit-learn",
+]
+classifier = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "scikit-learn",
+]
+yolo = [
+    "ultralytics==8.3.18",
+]
+dev = [
+    "ultralytics==8.3.18",
+]
+test = [
+    "Pillow>=10",
+    "pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "platform_system == 'Linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "platform_system == 'Linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -30,6 +30,16 @@ def test_food_region_accepts_rect_mapping():
     }
 
 
+def test_detector_target_fps_rendered_with_default_and_override():
+    default_compose = configure.render_compose({"cameras": [{"id": "grey"}]})
+    tuned_compose = configure.render_compose({
+        "cameras": [{"id": "grey", "detector_target_fps": 3.5}]
+    })
+
+    assert "DETECTOR_TARGET_FPS: 2.0" in default_compose
+    assert "DETECTOR_TARGET_FPS: 3.5" in tuned_compose
+
+
 def _feeder_cfg(feeder_extra: dict) -> dict:
     feeder = {
         "id": "feeder1",

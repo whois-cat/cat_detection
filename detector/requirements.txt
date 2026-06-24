@@ -4,8 +4,13 @@ numpy==1.26.4
 Pillow>=10.0.0
 aiohttp==3.10.5
 watchfiles==0.24.0
-# YOLO + classifier. Brings torch (~1 GB). torch/torchvision used only at
-# build time for the OpenVINO export step; runtime inference uses OpenVINO only.
+# Linux detector builds are CPU-only. Install PyTorch from the CPU wheel index
+# before ultralytics so pip/uv does not resolve nvidia-* CUDA runtime wheels.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu; platform_system == "Linux"
+torchvision==0.20.1+cpu; platform_system == "Linux"
+# YOLO + classifier. Runtime inference uses OpenVINO models, but ultralytics
+# still imports torch for its predictor/result wrappers.
 ultralytics==8.3.18
 # OpenVINO runtime — INT8 inference for YOLO and EfficientNet classifier.
 openvino==2024.4.0

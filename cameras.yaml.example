@@ -22,6 +22,11 @@
 #   label           — optional pretty name for the UI picker.
 #   detector_type   — "blob" | "yolo" | "yolo_cat"
 #                     yolo_cat: YOLO detects cats, EfficientNet-B0 identifies them.
+#   detector_target_fps — max detector processing cadence per camera (default 2.0).
+#                     The decoder still drains the stream and the detector keeps
+#                     only the latest frame, so this limits CPU without building
+#                     a stale backlog. Raise for fast scenes; feeder safety still
+#                     relies on the temporal action-zone aggregator below.
 #   yolo_weights    — path inside container (default: baked INT8 IR).
 #   yolo_conf       — YOLO confidence threshold.
 #   classifier_weights  — OpenVINO IR dir for the cat identity classifier
@@ -170,6 +175,7 @@ cameras:
     # Embed credentials inline (see rtsp note above); kept bare here.
     rtsp: rtsp://192.168.0.214:554/stream1
     detector_type: yolo_cat
+    detector_target_fps: 2.0
     rotate_deg: 0
     decision_polygon:
       - [0.10, 0.20]

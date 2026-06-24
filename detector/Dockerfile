@@ -11,10 +11,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 
-# torchvision is needed only for the EfficientNet export step below.
-# ultralytics already pulled torch; this adds ~100 MB for the model arch.
-RUN uv pip install --system --no-cache torchvision
-
 # ── YOLO: export INT8 OpenVINO IR ──────────────────────────────────────────
 # Output to /opt/models/ (NOT /app/) because dev-mode compose bind-mounts
 # ./detector over /app, which would mask anything baked into /app at runtime.
@@ -34,6 +30,6 @@ RUN python export_classifier.py \
     --pt /app/models/cat_classifier.pt \
     --out /opt/models/cat_classifier_openvino/
 
-COPY storage.py detectors.py bowl_monitor.py main.py ./
+COPY storage.py recordings_index.py detectors.py bowl_monitor.py main.py ./
 
 CMD ["python", "-u", "main.py"]

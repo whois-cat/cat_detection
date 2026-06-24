@@ -209,10 +209,17 @@ train-compare *ARGS:
 journal-feed CAT DAYS="3":
     python3 tools/feed_log.py {{CAT}} --days {{DAYS}} --db {{journal_db}}
 
+# Rebuild the SQLite recording segment index from files under RECORDINGS_ROOT.
+[group('dev')]
+recordings-index-rebuild:
+    uv run --extra test python -m detector.recordings_index rebuild \
+        --db "{{events_db}}" \
+        --recordings "{{recordings}}"
+
 # ─────────────────────────────── dev ─────────────────────────────
 
 # Fast local checks for changed Python code.
 [group('dev')]
 check:
-    uv run python -m compileall feeder detector training pruner review
-    uv run pytest
+    uv run --extra test python -m compileall feeder detector training/*.py pruner review
+    uv run --extra test pytest

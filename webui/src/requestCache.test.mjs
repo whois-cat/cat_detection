@@ -1,0 +1,93 @@
+import assert from 'node:assert/strict';
+import { createJsonRequestCache, rangeCacheKey } from './requestCache.js';
+
+function jsonResponse(body, { status = 200 } = {}) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => 'application/json' },
+    async json() { return body; },
+    async text() { return JSON.stringify(body); },
+  };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+assert.equal(
+  rangeCacheKey('grey', 1000.2, 2000.8),
+  'grey:1000:2001',
+);
+
+{
+  let calls = 0;
+  let now = 0;
+  const cache = createJsonRequestCache({
+    ttlMs: 100,
+    now: () => now,
+    fetchImpl: async () => {
+      calls++;
+      return jsonResponse({ ok: true, calls });
+    },
+  });
+
+  assert.deepEqual(await cache.get('grey:1', '/ranges'), { ok: true, calls: 1 });
+  assert.deepEqual(await cache.get('grey:1', '/ranges'), { ok: true, calls: 1 });
+  assert.equal(calls, 1);
+
+  now = 101;
+  assert.deepEqual(await cache.get('grey:1', '/ranges'), { ok: true, calls: 2 });
+  assert.equal(calls, 2);
+}
+
+{
+  let calls = 0;
+  const d = deferred();
+  const cache = createJsonRequestCache({
+    fetchImpl: async () => {
+      calls++;
+      return d.promise;
+    },
+  });
+  const a = cache.get('same', '/slow');
+  const b = cache.get('same', '/slow');
+  assert.equal(calls, 1);
+  d.resolve(jsonResponse({ done: true }));
+  assert.deepEqual(await a, { done: true });
+  assert.deepEqual(await b, { done: true });
+}
+
+{
+  let calls = 0;
+  const cache = createJsonRequestCache({
+    fetchImpl: async () => {
+      calls++;
+      return jsonResponse({ calls });
+    },
+  });
+  await cache.get('cam-a:1', '/ranges?camera=a');
+  await cache.get('cam-b:1', '/ranges?camera=b');
+  assert.equal(calls, 2);
+}
+
+{
+  let calls = 0;
+  const cache = createJsonRequestCache({
+    fetchImpl: async () => {
+      calls++;
+      return jsonResponse({ error: true }, { status: 502 });
+    },
+  });
+  await assert.rejects(() => cache.get('models:grey', '/models'));
+  await assert.rejects(() => cache.get('models:grey', '/models'));
+  assert.equal(calls, 2);
+}
+
+console.log('requestCache.test.mjs: all assertions passed');

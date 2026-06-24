@@ -9,6 +9,11 @@ UI queries) run alongside the detector's writes.
 import sqlite3
 from pathlib import Path
 
+try:
+    from recordings_index import ensure_schema as ensure_recording_segments_schema
+except ImportError:  # imported as detector.storage from repo root
+    from .recordings_index import ensure_schema as ensure_recording_segments_schema
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -43,6 +48,7 @@ def init_db(path: Path) -> sqlite3.Connection:
     # readers (UI/pruner) don't make the detector's writes fail under contention.
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    ensure_recording_segments_schema(conn)
     _migrate(conn)
     return conn
 

@@ -15,12 +15,14 @@
   //     loadedmetadata where possible); we look up the closest event in
   //     `allEvents` and draw it.
   //
-  // Retention ranges shown in the timeline come from mediamtx /recordings/list
-  // — that endpoint is the canonical record of
-  // what's actually playable.
+  // Retention ranges shown in the timeline come from the detector's
+  // SQLite-backed /recordings/ranges endpoint, which is rebuilt from MediaMTX
+  // recording files and avoids blocking on MediaMTX /list during UI work.
   import { onMount, onDestroy, untrack } from 'svelte';
   import Timeline from './Timeline.svelte';
   import { planSeek, sameWindowLoaded } from './seek.js';
+  import { appendBoundedEvent, mergeBoundedEvents } from './eventBuffer.js';
+  import { createJsonRequestCache, fetchJsonWithTimeout, rangeCacheKey } from './requestCache.js';
 
   // ---- DOM refs (plain let) ----
   let liveVideo, historyVideo, canvas, wrap, appRoot;
@@ -69,6 +71,27 @@
     return DEFAULT_PLAYBACK_WINDOW_SEC;
   }
   let playbackWindowSec = readPlaybackWindowSec();
+  const MAX_EVENTS = 2000;
+  const HISTORY_EVENTS_WINDOW_MS = 6 * 3600_000;
+  const RECORDING_RANGES_WINDOW_MS = 24 * 3600_000;
+  const RANGE_FETCH_TTL_MS = 15_000;
+  const MODEL_FETCH_TTL_MS = 30_000;
+  const REQUEST_TIMEOUT_MS = 1500;
+
+  const rangesRequests = createJsonRequestCache({
+    ttlMs: RANGE_FETCH_TTL_MS,
+    timeoutMs: 2000,
+    onTiming: ({ url, source, elapsedMs }) => {
+      console.log(`[recordings/ranges] ${source} ${Math.round(elapsedMs)}ms ${url}`);
+    },
+  });
+  const modelRequests = createJsonRequestCache({
+    ttlMs: MODEL_FETCH_TTL_MS,
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    onTiming: ({ url, source, elapsedMs }) => {
+      console.log(`[models] ${source} ${Math.round(elapsedMs)}ms ${url}`);
+    },
+  });
 
   // ---- Reactive state ----
   let nowMs        = $state(Date.now());
@@ -76,6 +99,8 @@
   let allEvents    = $state([]);
   let hlsRanges    = $state([]);
   let hlsErrorText = $state('');
+  let rangeWarningText = $state('');
+  let modelWarningText = $state('');
   // historyPaused reflects the actual <video>.paused flag for the UI.
   // userWantsPlaying is what the user intends — set by the play/pause button
   // and used to decide whether to resume after a src reload (every seek).
@@ -478,44 +503,28 @@
   // ---- History playback (via mediamtx /recordings/get) ----
   //
   // mediamtx's /get returns a fragmented MP4 stream (NOT an HLS playlist),
-  // which browsers can play natively via <video src>. We load one big window
-  // (PLAYBACK_WINDOW_HOURS) ending at "now" and track its start wall-clock
+  // which browsers can play natively via <video src>. We load one bounded
+  // window starting at the committed seek target and track its start wall-clock
   // so we can map between target wall-time and historyVideo.currentTime.
-  //
-  // /recordings/list returns the available recording intervals; we use those
-  // for the timeline retention band.
-
-  // mediamtx /list may return `duration` as either a Go-style string
-  // ("1h2m3s"), seconds-as-number, or nanoseconds-as-number depending on
-  // version. Best-effort: detect and normalize to ms.
-  function durationToMs(d) {
-    if (typeof d === 'number') {
-      // > 1e10 looks like ns (would be >2.7h in seconds), < 1e10 like seconds
-      return d > 1e10 ? d / 1e6 : d * 1000;
-    }
-    if (typeof d === 'string') {
-      let total = 0;
-      for (const m of d.matchAll(/(\d+(?:\.\d+)?)([hms])/g)) {
-        const n = parseFloat(m[1]);
-        total += n * (m[2] === 'h' ? 3600 : m[2] === 'm' ? 60 : 1);
-      }
-      return total * 1000;
-    }
-    return 0;
-  }
 
   async function refreshRecordingsList() {
     try {
       if (!cameraId) return;
-      const r = await fetch(`/recordings/list?path=${encodeURIComponent(cameraId)}`);
-      if (!r.ok) return;
-      const arr = await r.json();
-      hlsRanges = arr.map(x => {
-        const start = new Date(x.start).getTime();
-        return { from_ms: start, to_ms: start + durationToMs(x.duration) };
-      });
+      const to = Math.ceil(Date.now() / 60_000) * 60_000;
+      const from = to - RECORDING_RANGES_WINDOW_MS;
+      const url = `/detector/${cameraId}/recordings/ranges?from=${from}&to=${to}`;
+      const data = await rangesRequests.get(
+        rangeCacheKey(cameraId, from, to),
+        url,
+      );
+      hlsRanges = (data.ranges || []).map(x => ({
+        from_ms: x.from_ms,
+        to_ms: x.to_ms,
+      }));
+      rangeWarningText = '';
     } catch (e) {
-      console.warn('[recordings/list] failed', e);
+      console.warn('[recordings/ranges] failed', e);
+      rangeWarningText = 'recording ranges unavailable';
     }
   }
 
@@ -644,7 +653,7 @@
         applyOverlayRegions(ev);
         return;
       }
-      allEvents = [...allEvents, ev];
+      appendBoundedEvent(allEvents, ev, MAX_EVENTS);
       recentLive.push(ev);
       if (recentLive.length > 40) recentLive.shift();
     };
@@ -658,20 +667,15 @@
     const url = `/detector/${cameraId}/models`;
     try {
       if (!cameraId) return;
-      const r = await fetch(url, { headers: { Accept: 'application/json' } });
-      const contentType = r.headers.get('content-type') || '';
-      if (!r.ok || !contentType.includes('application/json')) {
-        const body = await r.text();
-        throw new Error(
-          `${url} returned HTTP ${r.status} ${contentType || 'without content-type'}; ` +
-          `expected JSON. First bytes: ${body.slice(0, 80).replace(/\s+/g, ' ')}`
-        );
-      }
-      const j = await r.json();
+      const j = await modelRequests.get(`models:${cameraId}`, url, {
+        timeoutMs: REQUEST_TIMEOUT_MS,
+      });
       availableModels = Array.isArray(j.models) ? j.models : [];
+      modelWarningText = '';
     } catch (e) {
       console.warn('[models] fetch failed', e);
       availableModels = [];
+      modelWarningText = 'models unavailable';
     }
   }
 
@@ -690,16 +694,14 @@
   // ---- Initial history fetch ----
   async function loadHistory() {
     if (!cameraId) return;
-    const to = Date.now();
-    const from = to - 24 * 3600_000;
+    const center = follow ? Date.now() : playheadMs;
+    const to = Math.min(Date.now(), center + 15 * 60_000);
+    const from = Math.max(0, center - HISTORY_EVENTS_WINDOW_MS);
     let url = `/detector/${cameraId}/events?from=${from}&to=${to}`;
     if (selectedModel) url += `&model=${encodeURIComponent(selectedModel)}`;
     try {
-      const r = await fetch(url);
-      const arr = await r.json();
-      const known = new Set(allEvents.map(e => `${e.wall_ms}:${e.pts}:${e.model}`));
-      const merged = arr.filter(e => !known.has(`${e.wall_ms}:${e.pts}:${e.model}`)).concat(allEvents);
-      allEvents = merged;
+      const arr = await fetchJsonWithTimeout(url, { timeoutMs: 2500 });
+      allEvents = mergeBoundedEvents(allEvents, arr, MAX_EVENTS);
     } catch (e) {
       console.warn('[history] fetch failed', e);
     }
@@ -722,6 +724,7 @@
   function onSeek(t) {
     follow = false;
     playheadMs = t;
+    loadHistory();
     scheduleHistorySeek(t);          // explicitly user-initiated reload
   }
   function onEnterLive()     { follow = true;  playheadMs = Date.now(); nowMs = playheadMs; }
@@ -789,6 +792,8 @@
     allEvents = [];
     recentLive = [];
     hlsRanges = [];
+    rangeWarningText = '';
+    modelWarningText = '';
     stats = null;
     applyCameraZones(newId);
     availableModels = [];
@@ -930,6 +935,10 @@
       zones
     </label>
 
+    {#if modelWarningText || rangeWarningText}
+      <span class="warn">{[modelWarningText, rangeWarningText].filter(Boolean).join(' · ')}</span>
+    {/if}
+
     <span class="spacer"></span>
     <button class="fs-app" onclick={toggleAppFullscreen} title="Fullscreen the whole app">⛶ app</button>
   </header>
@@ -1020,6 +1029,10 @@
   .camera-label { color: #ccc; font-size: 0.9rem; font-weight: 600; }
   header .stats {
     color: #9c9; font-family: ui-monospace, monospace; font-size: 0.8rem;
+  }
+  header .warn {
+    color: #f4c76b; font-family: ui-monospace, monospace; font-size: 0.78rem;
+    white-space: nowrap;
   }
   main { padding: 1rem; }
 
