@@ -37,6 +37,7 @@ import os
 import random
 import sys
 from collections import defaultdict, namedtuple
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
@@ -52,7 +53,17 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 DROP_LABELS = {"discard", "unknown"}
 
-Meta = namedtuple("Meta", ["label", "camera", "wall_ms"])
+@dataclass(frozen=True)
+class Meta:
+    label: str
+    camera: str
+    wall_ms: int
+    rowid: int | None = None
+    duplicate_group_id: str | None = None
+    suspicious_score: float = 0.0
+    sampling_reason: str | None = None
+
+
 CropRefLite = namedtuple("CropRefLite", ["camera_id", "wall_ms", "box", "rotate_deg"])
 # A training item is decoded from exactly ONE of:
 #   ref     — a fresh CropRefLite, decoded from recordings per batch, OR
@@ -201,6 +212,90 @@ def check_split_leakage(episodes: list[list[int]],
             f"episode {ep_n} leaks across splits {sorted(homes)} "
             f"(crops {episode[:5]})"
         )
+
+
+def _evenly_spaced(indices: list[int], quota: int) -> list[int]:
+    if quota <= 0:
+        return []
+    if len(indices) <= quota:
+        return list(indices)
+    if quota == 1:
+        return [indices[0]]
+    out = []
+    step = (len(indices) - 1) / float(quota - 1)
+    for n in range(quota):
+        out.append(indices[round(n * step)])
+    return list(dict.fromkeys(out))
+
+
+def sample_indices_for_training(
+    indices: list[int],
+    episodes: list[list[int]],
+    metas: list[Meta],
+    *,
+    max_per_episode: int = 0,
+    max_per_duplicate_group: int = 0,
+    keep_suspicious_per_episode: int = 4,
+) -> list[int]:
+    """Deterministically thin near-duplicate training examples within episodes.
+
+    The split unit stays the episode/visit. This function only decides which
+    crops inside already-assigned episodes are useful enough to decode/train on,
+    so adjacent frames cannot leak across train/val/test.
+    """
+    allowed = set(indices)
+    if not allowed:
+        return []
+    if max_per_episode <= 0 and max_per_duplicate_group <= 0:
+        return list(indices)
+
+    selected: set[int] = set()
+    for episode in episodes:
+        ep = [i for i in episode if i in allowed]
+        if not ep:
+            continue
+        ep.sort(key=lambda i: (metas[i].wall_ms, metas[i].rowid or -1, i))
+
+        keep: set[int] = set()
+        # First/last preserve visit boundaries; suspicious keeps hard examples.
+        keep.add(ep[0])
+        keep.add(ep[-1])
+        suspicious = sorted(
+            ep,
+            key=lambda i: (-float(metas[i].suspicious_score), metas[i].wall_ms, i),
+        )
+        for i in suspicious[:max(0, keep_suspicious_per_episode)]:
+            if metas[i].suspicious_score > 0:
+                keep.add(i)
+
+        by_group: dict[str, list[int]] = defaultdict(list)
+        for i in ep:
+            gid = metas[i].duplicate_group_id or f"event:{i}"
+            by_group[gid].append(i)
+        if max_per_duplicate_group > 0:
+            for group in by_group.values():
+                keep.update(_evenly_spaced(group, max_per_duplicate_group))
+        else:
+            keep.update(ep)
+
+        if max_per_episode > 0 and len(keep) < min(len(ep), max_per_episode):
+            remaining = [i for i in ep if i not in keep]
+            keep.update(_evenly_spaced(remaining, max_per_episode - len(keep)))
+
+        if max_per_episode > 0 and len(keep) > max_per_episode:
+            keep_order = sorted(
+                keep,
+                key=lambda i: (
+                    i not in {ep[0], ep[-1]},
+                    -float(metas[i].suspicious_score),
+                    metas[i].wall_ms,
+                    i,
+                ),
+            )
+            keep = set(keep_order[:max_per_episode])
+        selected.update(keep)
+
+    return [i for i in indices if i in selected]
 
 
 # ----------------------------------------------------------------- metrics ----
@@ -453,6 +548,15 @@ def main() -> None:
                          "was persisted (set to the camera's rotate_deg then)")
     ap.add_argument("--min-score", type=float, default=0.7, help="drop low YOLO-score boxes")
     ap.add_argument("--episode-gap-sec", type=float, default=60.0)
+    ap.add_argument("--max-crops-per-episode", type=int, default=24,
+                    help="sample at most this many fresh reviewed crops per "
+                         "episode/visit per split; 0 disables")
+    ap.add_argument("--max-crops-per-duplicate-group", type=int, default=3,
+                    help="sample at most this many crops from the same review "
+                         "duplicate_group_id; 0 disables")
+    ap.add_argument("--keep-suspicious-per-episode", type=int, default=4,
+                    help="always try to retain this many suspicious/hard examples "
+                         "per episode before thinning")
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--test-frac", type=float, default=0.1)
     ap.add_argument("--epochs", type=int, default=25)
@@ -502,6 +606,7 @@ def main() -> None:
         sys.path.insert(0, str(ROOT / "detector"))
         from classifier import _preprocess
     from training import load_reviews
+    from training.reviews import load_review_rows
     from training.ram import log_rss
     from training.db import iter_frames, open_db_ro
     from training.replay import decode_replay_image, load_replay_items
@@ -523,7 +628,10 @@ def main() -> None:
     confuse = {c.strip() for c in args.confuse.split(",") if c.strip()}
 
     # --- collect crop refs/metadata only; pixels are decoded per batch later ---
-    reviews = load_reviews(args.reviews_db) if args.reviews_db else {}
+    review_rows = load_review_rows(args.reviews_db) if args.reviews_db else {}
+    reviews = {key: row.label for key, row in review_rows.items()}
+    if not review_rows and args.reviews_db:
+        reviews = load_reviews(args.reviews_db)
     log.info("loaded %d human corrections", len(reviews))
 
     segment_indices: dict[str, SegmentIndex] = {}
@@ -562,7 +670,12 @@ def main() -> None:
             hit = segment_index(frame.camera_id).locate(frame.wall_ms)
             for box in frame.boxes:
                 scanned += 1
-                human = reviews.get(box.rowid) if box.rowid is not None else None
+                review_row = review_rows.get(box.rowid) if box.rowid is not None else None
+                human = (
+                    review_row.label if review_row is not None
+                    else reviews.get(box.rowid) if box.rowid is not None
+                    else None
+                )
                 label = decide_label(
                     box.cat, box.cat_score, human,
                     args.trust_classifier, args.trust_conf,
@@ -572,7 +685,21 @@ def main() -> None:
                 if hit is None:
                     unavailable += 1
                     continue
-                meta = Meta(label=label, camera=frame.camera_id, wall_ms=frame.wall_ms)
+                meta = Meta(
+                    label=label,
+                    camera=frame.camera_id,
+                    wall_ms=frame.wall_ms,
+                    rowid=box.rowid,
+                    duplicate_group_id=(
+                        review_row.duplicate_group_id if review_row is not None else None
+                    ),
+                    suspicious_score=(
+                        review_row.suspicious_score if review_row is not None else 0.0
+                    ),
+                    sampling_reason=(
+                        review_row.sampling_reason if review_row is not None else None
+                    ),
+                )
                 ref = CropRefLite(frame.camera_id, frame.wall_ms, box, int(rot or 0))
                 fresh_items.append(TrainItem(meta=meta, ref=ref, image=None, replay=None))
     finally:
@@ -629,6 +756,39 @@ def main() -> None:
         required={m.label for m in fresh_metas}, seed=args.seed,
     )
     check_split_leakage(episodes, train_idx, val_idx, test_idx)
+    raw_split_sizes = (len(train_idx), len(val_idx), len(test_idx))
+    train_idx = sample_indices_for_training(
+        train_idx,
+        episodes,
+        fresh_metas,
+        max_per_episode=args.max_crops_per_episode,
+        max_per_duplicate_group=args.max_crops_per_duplicate_group,
+        keep_suspicious_per_episode=args.keep_suspicious_per_episode,
+    )
+    val_idx = sample_indices_for_training(
+        val_idx,
+        episodes,
+        fresh_metas,
+        max_per_episode=args.max_crops_per_episode,
+        max_per_duplicate_group=args.max_crops_per_duplicate_group,
+        keep_suspicious_per_episode=args.keep_suspicious_per_episode,
+    )
+    test_idx = sample_indices_for_training(
+        test_idx,
+        episodes,
+        fresh_metas,
+        max_per_episode=args.max_crops_per_episode,
+        max_per_duplicate_group=args.max_crops_per_duplicate_group,
+        keep_suspicious_per_episode=args.keep_suspicious_per_episode,
+    )
+    check_split_leakage(episodes, train_idx, val_idx, test_idx)
+    if raw_split_sizes != (len(train_idx), len(val_idx), len(test_idx)):
+        log.info(
+            "sampled fresh crops after episode split: train %d/%d, val %d/%d, test %d/%d",
+            len(train_idx), raw_split_sizes[0],
+            len(val_idx), raw_split_sizes[1],
+            len(test_idx), raw_split_sizes[2],
+        )
 
     # --- cross-source leakage guard: replay crops must not duplicate val/test ---
     # Replay memory is train-only, but a replay crop is an old fresh crop; if the
@@ -677,6 +837,14 @@ def main() -> None:
         if res.moved_eval_crops:
             log.warning("moved %d eval crop(s) to train to resolve replay leakage",
                         res.moved_eval_crops)
+            train_idx = sample_indices_for_training(
+                train_idx,
+                episodes,
+                fresh_metas,
+                max_per_episode=args.max_crops_per_episode,
+                max_per_duplicate_group=args.max_crops_per_duplicate_group,
+                keep_suspicious_per_episode=args.keep_suspicious_per_episode,
+            )
         # Re-verify the fresh split is still internally consistent after any move.
         check_split_leakage(episodes, train_idx, val_idx, test_idx)
 
@@ -899,6 +1067,9 @@ def main() -> None:
         "replay_sets": [str(p) for p in args.replay_set],
         "replay_count": len(replay_metas),
         "batch_max_side": args.batch_max_side,
+        "max_crops_per_episode": args.max_crops_per_episode,
+        "max_crops_per_duplicate_group": args.max_crops_per_duplicate_group,
+        "keep_suspicious_per_episode": args.keep_suspicious_per_episode,
         "init_from": str(args.init_from) if args.init_from else None,
         "full_finetune": args.full_finetune, "head_only": args.head_only,
         "finetune_mode": finetune_mode, "best_epoch": best["epoch"],

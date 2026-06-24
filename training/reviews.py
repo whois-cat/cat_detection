@@ -8,9 +8,21 @@ review".
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class ReviewRow:
+    src_event_key: int
+    label: str
+    crop_id: str | None = None
+    duplicate_group_id: str | None = None
+    is_duplicate: bool = False
+    suspicious_score: float = 0.0
+    sampling_reason: str | None = None
 
 
 def resolve_reviews_db(reviews_db: Path | str) -> Path:
@@ -49,3 +61,57 @@ def load_reviews(reviews_db: Path | str) -> dict[int, str]:
     finally:
         conn.close()
     return {int(k): v for k, v in rows}
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def load_review_rows(reviews_db: Path | str) -> dict[int, ReviewRow]:
+    """Return review rows with optional review-sampling metadata.
+
+    Older reviews.db files only have ``src_event_key`` and ``label``; the extra
+    columns are treated as optional so training remains backwards-compatible.
+    """
+    path = resolve_reviews_db(reviews_db)
+    if not path.exists():
+        return {}
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        cols = _columns(conn, "reviews")
+        select = ["src_event_key", "label"]
+        optional = [
+            "crop_id",
+            "duplicate_group_id",
+            "is_duplicate",
+            "suspicious_score",
+            "sampling_reason",
+        ]
+        for name in optional:
+            select.append(name if name in cols else f"NULL AS {name}")
+        rows = conn.execute(
+            "SELECT " + ", ".join(select) + " FROM reviews"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    out: dict[int, ReviewRow] = {}
+    for (
+        key,
+        label,
+        crop_id,
+        duplicate_group_id,
+        is_duplicate,
+        suspicious_score,
+        sampling_reason,
+    ) in rows:
+        out[int(key)] = ReviewRow(
+            src_event_key=int(key),
+            label=str(label),
+            crop_id=crop_id,
+            duplicate_group_id=duplicate_group_id,
+            is_duplicate=bool(is_duplicate),
+            suspicious_score=float(suspicious_score or 0.0),
+            sampling_reason=sampling_reason,
+        )
+    return out

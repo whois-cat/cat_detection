@@ -23,7 +23,7 @@ def _manifest() -> dict:
     # lobes (so kmeans(2) splits cleanly); cluster 1 has three crops.
     items = []
 
-    def add(crop_id, key, emb):
+    def add(crop_id, key, emb, **extra):
         items.append({
             "crop_id": crop_id,
             "src_event_key": key,
@@ -33,13 +33,32 @@ def _manifest() -> dict:
             "rotate_deg": 0,
             "box": {"x": 0, "y": 0, "w": 10, "h": 10},
             "embedding": emb,
+            **extra,
         })
 
     # cluster 0 members: indices 0..5  (lobe A near [0,0], lobe B near [9,9])
     for k in range(3):
-        add(f"grey:{k}", k, [0.0 + 0.01 * k, 0.0])
+        add(
+            f"grey:{k}",
+            k,
+            [0.0 + 0.01 * k, 0.0],
+            duplicate_group_id="0:a",
+            is_duplicate=k > 0,
+            review_visible=k == 0,
+            suspicious_score=0.1 * k,
+            suspicious_reasons=["low_detector_score"] if k == 2 else [],
+        )
     for k in range(3, 6):
-        add(f"grey:{k}", k, [9.0, 9.0 + 0.01 * k])
+        add(
+            f"grey:{k}",
+            k,
+            [9.0, 9.0 + 0.01 * k],
+            duplicate_group_id="0:b",
+            is_duplicate=k > 3,
+            review_visible=k == 3,
+            suspicious_score=0.9 if k == 5 else 0.0,
+            suspicious_reasons=["far_from_centroid"] if k == 5 else [],
+        )
     # cluster 1 members: indices 6..8
     for k in range(6, 9):
         add(f"grey:{k}", k, [4.0, 4.0])
@@ -172,3 +191,109 @@ def test_per_crop_label_rejects_unknown_crop_and_label(client):
                        json={"crop_ids": ["grey:0"], "label": "banana"}).status_code == 400
     assert client.post("/api/crop_label",
                        json={"crop_ids": [], "label": "alisa"}).status_code == 400
+
+
+def _review_rows(client):
+    return client.mod._conn.execute(
+        "SELECT crop_id, label FROM reviews ORDER BY src_event_key"
+    ).fetchall()
+
+
+def test_cluster_label_with_exceptions_labels_selected_and_rest(client):
+    r = client.post("/api/cluster_label_with_exceptions", json={
+        "cluster_id": 0,
+        "majority_label": "felisis",
+        "exceptions": {"discard": ["grey:0", "grey:5"], "chuzh": ["grey:3"]},
+    })
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["total_cluster_crops"] == 6
+    assert data["majority_labeled_count"] == 3
+    assert data["exception_counts"] == {"discard": 2, "chuzh": 1}
+
+    rows = dict(_review_rows(client))
+    assert rows["grey:0"] == "discard"
+    assert rows["grey:5"] == "discard"
+    assert rows["grey:3"] == "chuzh"
+    assert rows["grey:1"] == "felisis"
+    assert rows["grey:2"] == "felisis"
+    assert rows["grey:4"] == "felisis"
+    status = client.get("/api/clusters").json()["queue"][0]["status"]
+    assert status["status"] == "labeled"
+    assert status["label"] == "felisis"
+
+
+def test_cluster_label_with_exceptions_rejects_invalid_label_and_camera_names(client):
+    assert client.post("/api/cluster_label_with_exceptions", json={
+        "cluster_id": 0,
+        "majority_label": "beige",
+        "exceptions": {},
+    }).status_code == 400
+    assert client.post("/api/cluster_label_with_exceptions", json={
+        "cluster_id": 0,
+        "majority_label": "alisa",
+        "exceptions": {"grey": ["grey:0"]},
+    }).status_code == 400
+    assert client.mod._conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 0
+
+
+def test_cluster_label_with_exceptions_rejects_crop_from_other_cluster(client):
+    r = client.post("/api/cluster_label_with_exceptions", json={
+        "cluster_id": 0,
+        "majority_label": "alisa",
+        "exceptions": {"discard": ["grey:6"]},
+    })
+    assert r.status_code == 400
+    assert "does not belong" in r.text
+    assert client.mod._conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 0
+
+
+def test_cluster_label_with_exceptions_rolls_back_on_write_failure(client, monkeypatch):
+    calls = {"n": 0}
+    original = client.mod._write_review_label
+
+    def flaky(conn, item, label, now):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("boom")
+        return original(conn, item, label, now)
+
+    monkeypatch.setattr(client.mod, "_write_review_label", flaky)
+    with pytest.raises(RuntimeError):
+        client.post("/api/cluster_label_with_exceptions", json={
+            "cluster_id": 0,
+            "majority_label": "alisa",
+            "exceptions": {"discard": ["grey:0"]},
+        })
+    assert client.mod._conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 0
+    assert client.mod._conn.execute("SELECT COUNT(*) FROM cluster_reviews").fetchone()[0] == 0
+
+
+def test_items_hide_duplicates_by_default_and_suspicious_mode_orders(client):
+    data = client.get("/api/cluster/0/items?mode=representative").json()
+    assert data["total"] == 6
+    assert data["hidden_duplicate_count"] == 4
+    assert [it["crop_id"] for it in data["items"]] == ["grey:0", "grey:3"]
+
+    with_dups = client.get(
+        "/api/cluster/0/items?mode=representative&show_duplicates=true"
+    ).json()
+    assert len(with_dups["items"]) == 6
+
+    suspicious = client.get(
+        "/api/cluster/0/items?mode=suspicious&show_duplicates=true"
+    ).json()["items"]
+    assert suspicious[0]["crop_id"] == "grey:5"
+    assert suspicious[0]["suspicious_reasons"] == ["far_from_centroid"]
+
+
+def test_hidden_duplicate_can_be_overridden_as_exception(client):
+    r = client.post("/api/cluster_label_with_exceptions", json={
+        "cluster_id": 0,
+        "majority_label": "alisa",
+        "exceptions": {"discard": ["grey:2"]},
+    })
+    assert r.status_code == 200, r.text
+    rows = dict(_review_rows(client))
+    assert rows["grey:2"] == "discard"
+    assert rows["grey:1"] == "alisa"

@@ -100,6 +100,22 @@ label-build *ARGS:
             --labels "${REVIEW_LABELS:-}" \
             {{ARGS}}
 
+# Time/episode review manifest: one feeding visit per camera becomes a review
+# group. Override EPISODE_GAP_SEC or pass extra args after the recipe name.
+[group('label')]
+label-build-time *ARGS:
+    {{COMPOSE}} run --rm --no-deps \
+        -e RECORDING_TZ="{{rec_tz}}" \
+        -v "$PWD":/work -w /work {{CLUSTER_SERVICE}} \
+        python -m training.build_cluster_manifest \
+            --db "{{events_db}}" \
+            --recordings "{{recordings}}" \
+            --out "{{manifest}}" \
+            --labels "${REVIEW_LABELS:-}" \
+            --mode time \
+            --episode-gap-sec "${EPISODE_GAP_SEC:-30}" \
+            {{ARGS}}
+
 # Bulk-label clusters in the browser.
 [group('label')]
 label-review PORT="8095":

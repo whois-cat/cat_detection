@@ -5,6 +5,8 @@ from training.train_classifier import (
     Meta,
     build_episodes,
     check_split_leakage,
+    decide_label,
+    sample_indices_for_training,
     split_episodes,
     supported_macro_recall,
 )
@@ -66,3 +68,41 @@ def test_macro_recall_ignores_classes_absent_from_eval_split():
     ])
 
     assert supported_macro_recall(cm) == 1.0
+
+
+def test_training_sampler_caps_duplicate_groups_and_keeps_suspicious():
+    metas = [
+        Meta(
+            "alisa",
+            "grey",
+            i * 1_000,
+            rowid=i,
+            duplicate_group_id="visit-a",
+            suspicious_score=1.0 if i == 4 else 0.0,
+        )
+        for i in range(10)
+    ]
+    episodes = build_episodes(metas, gap_ms=60_000)
+    assert episodes == [list(range(10))]
+
+    sampled = sample_indices_for_training(
+        list(range(10)),
+        episodes,
+        metas,
+        max_per_episode=5,
+        max_per_duplicate_group=2,
+        keep_suspicious_per_episode=1,
+    )
+
+    assert len(sampled) <= 5
+    assert 0 in sampled          # first crop
+    assert 9 in sampled          # last crop
+    assert 4 in sampled          # hard/suspicious example
+    check_split_leakage(episodes, train_idx=sampled, val_idx=[], test_idx=[])
+
+
+def test_discard_and_unknown_are_not_classifier_labels():
+    assert decide_label(None, None, "discard", False, 0.9) is None
+    assert decide_label(None, None, "unknown", False, 0.9) is None
+    assert decide_label("alisa", 0.99, None, False, 0.9) is None
+    assert decide_label("alisa", 0.99, None, True, 0.9) == "alisa"

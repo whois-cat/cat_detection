@@ -35,19 +35,19 @@ EXTRA_LABELS = ["unknown", "discard"]
 def _load_manifest() -> dict:
     if not MANIFEST.exists():
         # Actionable failure instead of a bare traceback. The manifest is either
-        # not built yet, or was archived by `just review-reset` into a sibling
+        # not built yet, or was archived by `just label-reset` into a sibling
         # _backup_<ts>/ dir — surface both fixes, and any backup we can see.
         lines = [
             f"cluster manifest not found: {MANIFEST}",
             "",
             "Build it first (writes data/review/clusters.json):",
-            "    just cluster-manifest",
+            "    just label-build",
         ]
         backups = sorted(MANIFEST.parent.glob("_backup_*/clusters.json"), reverse=True)
         if backups:
             lines += [
                 "",
-                "Or restore the most recent review-reset backup:",
+                "Or restore the most recent label-reset backup:",
                 f"    mv {backups[0]} {MANIFEST}",
             ]
         msg = "\n".join(lines)
@@ -77,6 +77,10 @@ _conn.execute(
            conf          REAL,
            camera        TEXT,
            wall_ms       INTEGER,
+           duplicate_group_id TEXT,
+           is_duplicate INTEGER NOT NULL DEFAULT 0,
+           suspicious_score REAL,
+           sampling_reason TEXT,
            reviewed_at   TEXT NOT NULL
        )"""
 )
@@ -97,6 +101,87 @@ _conn.execute(
        )"""
 )
 _conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
+    cols = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if name not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+for _name, _decl in (
+    ("duplicate_group_id", "TEXT"),
+    ("is_duplicate", "INTEGER NOT NULL DEFAULT 0"),
+    ("suspicious_score", "REAL"),
+    ("sampling_reason", "TEXT"),
+):
+    _ensure_column(_conn, "reviews", _name, _decl)
+_conn.commit()
+
+
+CAT_LABELS = set(LABELS)
+SERVICE_LABELS = set(EXTRA_LABELS)
+CONCRETE_LABELS = CAT_LABELS | SERVICE_LABELS
+CLUSTER_STATUS_LABELS = CONCRETE_LABELS | {"mixed", "skip"}
+
+
+def _validate_concrete_label(label: str, *, field: str = "label") -> None:
+    if label not in CONCRETE_LABELS:
+        raise HTTPException(status_code=400, detail=f"invalid {field} {label!r}")
+
+
+def _cluster_member_items(cluster: dict) -> list[dict]:
+    return [ITEMS[int(i)] for i in cluster["item_indices"]]
+
+
+def _cluster_counts(cluster: dict) -> dict[str, int]:
+    members = _cluster_member_items(cluster)
+    visible = sum(1 for item in members if bool(item.get("review_visible", True)))
+    hidden_duplicate = sum(
+        1 for item in members
+        if bool(item.get("is_duplicate")) and not bool(item.get("review_visible", True))
+    )
+    return {
+        "visible_count": visible,
+        "hidden_duplicate_count": hidden_duplicate,
+        "hidden_count": max(0, len(members) - visible),
+    }
+
+
+def _write_review_label(
+    conn: sqlite3.Connection,
+    item: dict,
+    label: str,
+    now: str,
+) -> None:
+    conn.execute(
+        """INSERT INTO reviews
+               (src_event_key, crop_id, label, predicted, conf, camera, wall_ms,
+                duplicate_group_id, is_duplicate, suspicious_score,
+                sampling_reason, reviewed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(src_event_key) DO UPDATE SET
+               label=excluded.label, crop_id=excluded.crop_id,
+               predicted=excluded.predicted, conf=excluded.conf,
+               camera=excluded.camera, wall_ms=excluded.wall_ms,
+               duplicate_group_id=excluded.duplicate_group_id,
+               is_duplicate=excluded.is_duplicate,
+               suspicious_score=excluded.suspicious_score,
+               sampling_reason=excluded.sampling_reason,
+               reviewed_at=excluded.reviewed_at""",
+        (
+            item["src_event_key"], item["crop_id"], label, None,
+            item.get("score"), item["camera"], item["wall_ms"],
+            item.get("duplicate_group_id"),
+            1 if item.get("is_duplicate") else 0,
+            item.get("suspicious_score"),
+            item.get("sampling_reason"),
+            now,
+        ),
+    )
 
 
 def _reviews_map() -> dict[str, str]:
@@ -164,7 +249,7 @@ def _all_clusters() -> list[dict]:
     children: dict[int, list[dict]] = {}
     for row in _split_rows():
         members = [int(i) for i in row["item_indices"]]
-        children.setdefault(row["parent_id"], []).append({
+        child = {
             "cluster_id": row["child_id"],
             "parent_id": row["parent_id"],
             "size": len(members),
@@ -172,7 +257,9 @@ def _all_clusters() -> list[dict]:
             "representatives": [ITEMS[i]["crop_id"] for i in members[:24]],
             "split_child": True,
             "created_at": row["created_at"],
-        })
+        }
+        child.update(_cluster_counts(child))
+        children.setdefault(row["parent_id"], []).append(child)
 
     out: list[dict] = []
 
@@ -229,14 +316,53 @@ def _crop_rgb(crop_id: str) -> np.ndarray:
     return np.ascontiguousarray(crop_bgr[..., ::-1])
 
 
-def _select_cluster_items(cluster: dict, mode: str, limit: int | None = None) -> list[dict]:
+def _select_cluster_items(
+    cluster: dict,
+    mode: str,
+    limit: int | None = None,
+    *,
+    show_duplicates: bool = False,
+) -> list[dict]:
     members = [ITEMS[i] for i in cluster["item_indices"]]
+    if not show_duplicates:
+        visible = [item for item in members if bool(item.get("review_visible", True))]
+        members = visible or members[:1]
+
     if mode == "outliers":
-        members = list(reversed(members))
+        members = sorted(
+            members,
+            key=lambda item: (
+                float(item.get("distance", 0.0)),
+                int(item.get("wall_ms", 0)),
+                item.get("crop_id", ""),
+            ),
+            reverse=True,
+        )
     elif mode == "random":
         rng = random.Random(int(cluster["cluster_id"]))
         members = members[:]
         rng.shuffle(members)
+    elif mode == "suspicious":
+        members = sorted(
+            members,
+            key=lambda item: (
+                -float(item.get("suspicious_score", 0.0)),
+                -float(item.get("distance", 0.0)),
+                int(item.get("wall_ms", 0)),
+                item.get("crop_id", ""),
+            ),
+        )
+    else:
+        members = sorted(
+            members,
+            key=lambda item: (
+                int(item.get("representative_rank")
+                    if item.get("representative_rank") is not None else 10**9),
+                float(item.get("distance", 0.0)),
+                int(item.get("wall_ms", 0)),
+                item.get("crop_id", ""),
+            ),
+        )
     return members if limit is None else members[:limit]
 
 
@@ -276,11 +402,15 @@ def api_clusters() -> JSONResponse:
         cid = int(c["cluster_id"])
         crop_ids = [ITEMS[i]["crop_id"] for i in c["item_indices"]]
         reviewed_items = sum(1 for crop_id in crop_ids if crop_id in reviews)
+        counts = _cluster_counts(c)
         queue.append({
             "cluster_id": cid,
             "parent_id": c.get("parent_id"),
             "split_child": bool(c.get("split_child")),
             "size": c["size"],
+            "visible_count": counts["visible_count"],
+            "hidden_duplicate_count": counts["hidden_duplicate_count"],
+            "hidden_count": counts["hidden_count"],
             "reviewed_items": reviewed_items,
             "representatives": c.get("representatives", [])[:8],
             "status": status.get(cid),
@@ -300,16 +430,19 @@ def api_clusters() -> JSONResponse:
 
 @app.get("/api/cluster/{cluster_id}/sheet")
 def api_sheet(cluster_id: int, mode: str = "representative",
-              limit: int = 24, cols: int = 6, thumb: int = 128) -> Response:
+              limit: int = 24, cols: int = 6, thumb: int = 128,
+              show_duplicates: bool = False) -> Response:
     cluster = _cluster_by_id(cluster_id)
     if cluster is None:
         raise HTTPException(status_code=404, detail="unknown cluster")
-    if mode not in {"representative", "random", "outliers"}:
+    if mode not in {"representative", "random", "outliers", "suspicious"}:
         raise HTTPException(status_code=400, detail="bad mode")
     limit = max(1, min(48, int(limit)))
     cols = max(1, min(8, int(cols)))
     thumb = max(80, min(180, int(thumb)))
-    selected = _select_cluster_items(cluster, mode, limit)
+    selected = _select_cluster_items(
+        cluster, mode, limit, show_duplicates=show_duplicates,
+    )
     rows = (len(selected) + cols - 1) // cols
     sheet = Image.new("RGB", (cols * thumb, max(1, rows) * thumb), (12, 14, 20))
     for i, item in enumerate(selected):
@@ -322,23 +455,48 @@ def api_sheet(cluster_id: int, mode: str = "representative",
 
 
 @app.get("/api/cluster/{cluster_id}/items")
-def api_cluster_items(cluster_id: int, mode: str = "representative") -> JSONResponse:
+def api_cluster_items(
+    cluster_id: int,
+    mode: str = "representative",
+    show_duplicates: bool = False,
+) -> JSONResponse:
     cluster = _cluster_by_id(cluster_id)
     if cluster is None:
         raise HTTPException(status_code=404, detail="unknown cluster")
-    if mode not in {"representative", "random", "outliers"}:
+    if mode not in {"representative", "random", "outliers", "suspicious"}:
         raise HTTPException(status_code=400, detail="bad mode")
     reviews = _reviews_map()
     items = []
-    for item in _select_cluster_items(cluster, mode, limit=None):
+    selected = _select_cluster_items(
+        cluster, mode, limit=None, show_duplicates=show_duplicates,
+    )
+    for item in selected:
         items.append({
             "crop_id": item["crop_id"],
             "camera": item["camera"],
             "wall_ms": item["wall_ms"],
             "score": item.get("score"),
             "label": reviews.get(item["crop_id"]),
+            "is_duplicate": bool(item.get("is_duplicate")),
+            "duplicate_group_id": item.get("duplicate_group_id"),
+            "representative_rank": item.get("representative_rank"),
+            "suspicious_score": float(item.get("suspicious_score", 0.0)),
+            "suspicious_reasons": item.get("suspicious_reasons", []),
+            "sampling_reason": item.get("sampling_reason"),
+            "review_visible": bool(item.get("review_visible", True)),
         })
-    return JSONResponse({"cluster_id": cluster_id, "mode": mode, "items": items})
+    counts = _cluster_counts(cluster)
+    return JSONResponse({
+        "cluster_id": cluster_id,
+        "mode": mode,
+        "show_duplicates": show_duplicates,
+        "items": items,
+        "total": int(cluster["size"]),
+        "visible_count": counts["visible_count"],
+        "shown_count": len(items),
+        "hidden_duplicate_count": counts["hidden_duplicate_count"],
+        "hidden_count": counts["hidden_count"],
+    })
 
 
 @app.get("/api/crop/{crop_id:path}")
@@ -360,40 +518,106 @@ async def api_cluster_review(payload: dict) -> JSONResponse:
     cluster = _cluster_by_id(cluster_id)
     if cluster is None:
         raise HTTPException(status_code=404, detail="unknown cluster")
-    allowed = set(LABELS) | set(EXTRA_LABELS) | {"mixed", "skip"}
-    if label not in allowed:
+    if label not in CLUSTER_STATUS_LABELS:
         raise HTTPException(status_code=400, detail=f"invalid label {label!r}")
 
     now = datetime.now(timezone.utc).isoformat()
     status = "mixed" if label == "mixed" else "skipped" if label == "skip" else "labeled"
     with _db_lock:
-        if label in set(LABELS) | set(EXTRA_LABELS):
+        try:
+            _conn.execute("BEGIN")
+            if label in CONCRETE_LABELS:
+                for idx in cluster["item_indices"]:
+                    _write_review_label(_conn, ITEMS[idx], label, now)
+            _conn.execute(
+                """INSERT INTO cluster_reviews (cluster_id, status, label, reviewed_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(cluster_id) DO UPDATE SET
+                       status=excluded.status, label=excluded.label,
+                       reviewed_at=excluded.reviewed_at""",
+                (cluster_id, status, label, now),
+            )
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+    return JSONResponse({"ok": True, "cluster_id": cluster_id, "label": label, "status": status})
+
+
+@app.post("/api/cluster_label_with_exceptions")
+async def api_cluster_label_with_exceptions(payload: dict) -> JSONResponse:
+    """Atomically label selected exception crops as X and every remaining crop
+    in the cluster as Y.
+
+    This is the main review workflow for mostly-clean clusters: users select a
+    few wrong/garbage crops, give those concrete labels, then label the rest as
+    the majority cat in one transaction.
+    """
+    cluster_id = int(payload.get("cluster_id"))
+    majority_label = payload.get("majority_label")
+    exceptions = payload.get("exceptions") or {}
+    cluster = _cluster_by_id(cluster_id)
+    if cluster is None:
+        raise HTTPException(status_code=404, detail="unknown cluster")
+    _validate_concrete_label(majority_label, field="majority_label")
+    if not isinstance(exceptions, dict):
+        raise HTTPException(status_code=400, detail="exceptions must be an object")
+
+    members = _cluster_member_items(cluster)
+    member_by_crop = {item["crop_id"]: item for item in members}
+    exception_label_by_crop: dict[str, str] = {}
+    exception_counts: dict[str, int] = {}
+    for label, crop_ids in exceptions.items():
+        _validate_concrete_label(label, field="exception label")
+        if not isinstance(crop_ids, list):
+            raise HTTPException(status_code=400, detail=f"exceptions[{label!r}] must be a list")
+        for crop_id in crop_ids:
+            if crop_id not in member_by_crop:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"crop {crop_id!r} does not belong to cluster {cluster_id}",
+                )
+            previous = exception_label_by_crop.get(crop_id)
+            if previous is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"crop {crop_id!r} appears multiple times in exceptions",
+                )
+            exception_label_by_crop[crop_id] = label
+        exception_counts[label] = exception_counts.get(label, 0) + len(crop_ids)
+
+    now = datetime.now(timezone.utc).isoformat()
+    majority_count = 0
+    with _db_lock:
+        try:
+            _conn.execute("BEGIN")
             for idx in cluster["item_indices"]:
                 item = ITEMS[idx]
-                _conn.execute(
-                    """INSERT INTO reviews
-                           (src_event_key, crop_id, label, predicted, conf, camera, wall_ms, reviewed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(src_event_key) DO UPDATE SET
-                           label=excluded.label, crop_id=excluded.crop_id,
-                           predicted=excluded.predicted, conf=excluded.conf,
-                           camera=excluded.camera, wall_ms=excluded.wall_ms,
-                           reviewed_at=excluded.reviewed_at""",
-                    (
-                        item["src_event_key"], item["crop_id"], label, None,
-                        item.get("score"), item["camera"], item["wall_ms"], now,
-                    ),
-                )
-        _conn.execute(
-            """INSERT INTO cluster_reviews (cluster_id, status, label, reviewed_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(cluster_id) DO UPDATE SET
-                   status=excluded.status, label=excluded.label,
-                   reviewed_at=excluded.reviewed_at""",
-            (cluster_id, status, label, now),
-        )
-        _conn.commit()
-    return JSONResponse({"ok": True, "cluster_id": cluster_id, "label": label, "status": status})
+                label = exception_label_by_crop.get(item["crop_id"], majority_label)
+                if label == majority_label:
+                    majority_count += 1
+                _write_review_label(_conn, item, label, now)
+            _conn.execute(
+                """INSERT INTO cluster_reviews (cluster_id, status, label, reviewed_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(cluster_id) DO UPDATE SET
+                       status=excluded.status, label=excluded.label,
+                       reviewed_at=excluded.reviewed_at""",
+                (cluster_id, "labeled", majority_label, now),
+            )
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+    return JSONResponse({
+        "ok": True,
+        "cluster_id": cluster_id,
+        "majority_label": majority_label,
+        "total_cluster_crops": len(members),
+        "majority_labeled_count": majority_count,
+        "exception_counts": exception_counts,
+        "status": "labeled",
+    })
 
 
 @app.post("/api/cluster_split")
@@ -425,55 +649,60 @@ async def api_cluster_split(payload: dict) -> JSONResponse:
 
     now = datetime.now(timezone.utc).isoformat()
     with _db_lock:
-        # Re-split = REPLACE the previous partition (no 409). Drop any existing
-        # descendant children (recursively) and their cluster_reviews, then redo
-        # the split below. The per-crop `reviews` rows are cleared for all of this
-        # cluster's members further down — children only ever partition those, so
-        # that single delete also removes labels applied to old grandchildren.
-        replaced_children = _descendant_child_ids(_conn, cluster_id)
-        if replaced_children:
-            placeholders = ",".join("?" * len(replaced_children))
-            _conn.execute(
-                f"DELETE FROM cluster_splits WHERE child_id IN ({placeholders})",
-                replaced_children,
+        try:
+            _conn.execute("BEGIN")
+            # Re-split = REPLACE the previous partition (no 409). Drop any existing
+            # descendant children (recursively) and their cluster_reviews, then redo
+            # the split below. The per-crop `reviews` rows are cleared for all of this
+            # cluster's members further down — children only ever partition those, so
+            # that single delete also removes labels applied to old grandchildren.
+            replaced_children = _descendant_child_ids(_conn, cluster_id)
+            if replaced_children:
+                placeholders = ",".join("?" * len(replaced_children))
+                _conn.execute(
+                    f"DELETE FROM cluster_splits WHERE child_id IN ({placeholders})",
+                    replaced_children,
+                )
+                _conn.execute(
+                    f"DELETE FROM cluster_reviews WHERE cluster_id IN ({placeholders})",
+                    replaced_children,
+                )
+            used_ids = [int(c["cluster_id"]) for c in BASE_CLUSTERS]
+            used_ids.extend(
+                int(r[0]) for r in _conn.execute("SELECT child_id FROM cluster_splits").fetchall()
             )
-            _conn.execute(
-                f"DELETE FROM cluster_reviews WHERE cluster_id IN ({placeholders})",
-                replaced_children,
+            next_id = max(used_ids, default=-1) + 1
+            _conn.executemany(
+                "DELETE FROM reviews WHERE src_event_key=?",
+                [(ITEMS[i]["src_event_key"],) for i in members],
             )
-        used_ids = [int(c["cluster_id"]) for c in BASE_CLUSTERS]
-        used_ids.extend(
-            int(r[0]) for r in _conn.execute("SELECT child_id FROM cluster_splits").fetchall()
-        )
-        next_id = max(used_ids, default=-1) + 1
-        _conn.executemany(
-            "DELETE FROM reviews WHERE src_event_key=?",
-            [(ITEMS[i]["src_event_key"],) for i in members],
-        )
-        children = []
-        for group in ordered_groups:
-            child_id = next_id
-            next_id += 1
-            children.append({
-                "cluster_id": child_id,
-                "parent_id": cluster_id,
-                "size": len(group),
-            })
+            children = []
+            for group in ordered_groups:
+                child_id = next_id
+                next_id += 1
+                children.append({
+                    "cluster_id": child_id,
+                    "parent_id": cluster_id,
+                    "size": len(group),
+                })
+                _conn.execute(
+                    """INSERT INTO cluster_splits
+                           (child_id, parent_id, item_indices, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (child_id, cluster_id, json.dumps(group, separators=(",", ":")), now),
+                )
             _conn.execute(
-                """INSERT INTO cluster_splits
-                       (child_id, parent_id, item_indices, created_at)
-                   VALUES (?, ?, ?, ?)""",
-                (child_id, cluster_id, json.dumps(group, separators=(",", ":")), now),
+                """INSERT INTO cluster_reviews (cluster_id, status, label, reviewed_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(cluster_id) DO UPDATE SET
+                       status=excluded.status, label=excluded.label,
+                       reviewed_at=excluded.reviewed_at""",
+                (cluster_id, "split", None, now),
             )
-        _conn.execute(
-            """INSERT INTO cluster_reviews (cluster_id, status, label, reviewed_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(cluster_id) DO UPDATE SET
-                   status=excluded.status, label=excluded.label,
-                   reviewed_at=excluded.reviewed_at""",
-            (cluster_id, "split", None, now),
-        )
-        _conn.commit()
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
     return JSONResponse({
         "ok": True, "cluster_id": cluster_id, "children": children,
         "replaced": len(replaced_children),
@@ -487,8 +716,7 @@ async def api_crop_label(payload: dict) -> JSONResponse:
     to an explicit selection instead of the whole cluster."""
     label = payload.get("label")
     crop_ids = payload.get("crop_ids") or []
-    if label not in set(LABELS) | set(EXTRA_LABELS):
-        raise HTTPException(status_code=400, detail=f"invalid label {label!r}")
+    _validate_concrete_label(label)
     if not isinstance(crop_ids, list) or not crop_ids:
         raise HTTPException(status_code=400, detail="no crops selected")
     unknown = [cid for cid in crop_ids if cid not in BY_ID]
@@ -497,23 +725,14 @@ async def api_crop_label(payload: dict) -> JSONResponse:
 
     now = datetime.now(timezone.utc).isoformat()
     with _db_lock:
-        for cid in crop_ids:
-            item = BY_ID[cid]
-            _conn.execute(
-                """INSERT INTO reviews
-                       (src_event_key, crop_id, label, predicted, conf, camera, wall_ms, reviewed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(src_event_key) DO UPDATE SET
-                       label=excluded.label, crop_id=excluded.crop_id,
-                       predicted=excluded.predicted, conf=excluded.conf,
-                       camera=excluded.camera, wall_ms=excluded.wall_ms,
-                       reviewed_at=excluded.reviewed_at""",
-                (
-                    item["src_event_key"], cid, label, None,
-                    item.get("score"), item["camera"], item["wall_ms"], now,
-                ),
-            )
-        _conn.commit()
+        try:
+            _conn.execute("BEGIN")
+            for cid in crop_ids:
+                _write_review_label(_conn, BY_ID[cid], label, now)
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
     return JSONResponse({"ok": True, "labeled": len(crop_ids), "label": label})
 
 

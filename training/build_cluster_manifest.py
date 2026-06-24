@@ -243,6 +243,211 @@ def thin_cluster_members(
     return selected, len(members) - len(selected)
 
 
+def _is_near_duplicate(
+    i: int,
+    j: int,
+    items: list[dict],
+    x: np.ndarray | None,
+    *,
+    window_ms: int,
+    threshold: float,
+) -> bool:
+    if items[i]["camera"] != items[j]["camera"]:
+        return False
+    if abs(int(items[i]["wall_ms"]) - int(items[j]["wall_ms"])) > window_ms:
+        return False
+    if x is None:
+        return True
+    return float(x[i] @ x[j]) >= threshold
+
+
+def _suspicious_score(item: dict, members: list[int], items: list[dict],
+                      group_size: int) -> tuple[float, list[str]]:
+    reasons: list[str] = []
+    score = 0.0
+
+    # Cluster centroid distance, when present, is the strongest cold-start signal.
+    distances = [float(items[i].get("distance", 0.0)) for i in members]
+    if distances and max(distances) > min(distances):
+        d = float(item.get("distance", 0.0))
+        norm = (d - min(distances)) / max(1e-6, max(distances) - min(distances))
+        score += 0.70 * norm
+        if norm >= 0.75:
+            reasons.append("far_from_centroid")
+
+    det_score = item.get("score")
+    if det_score is not None:
+        # Softly prioritize detector-borderline crops without requiring them.
+        low = max(0.0, min(1.0, (0.80 - float(det_score)) / 0.30))
+        score += 0.45 * low
+        if low >= 0.35:
+            reasons.append("low_detector_score")
+
+    box = item.get("box") or {}
+    w = float(box.get("w", 0) or 0)
+    h = float(box.get("h", 0) or 0)
+    x0 = float(box.get("x", 0) or 0)
+    y0 = float(box.get("y", 0) or 0)
+    if w <= 2 or h <= 2:
+        score += 0.75
+        reasons.append("bad_or_empty_crop")
+    elif w > 0 and h > 0:
+        aspect = max(w / h, h / w)
+        if aspect >= 2.5:
+            score += 0.20
+            reasons.append("unusual_bbox")
+    if x0 <= 2 or y0 <= 2:
+        score += 0.20
+        reasons.append("bbox_edge")
+
+    if group_size == 1 and len(members) > 3:
+        score += 0.15
+        reasons.append("rare_episode")
+
+    # Stable, compact values for JSON manifests and deterministic sorting.
+    return round(float(score), 6), sorted(set(reasons))
+
+
+def annotate_review_metadata(
+    items: list[dict],
+    cluster_members: dict[int, list[int]],
+    x: np.ndarray | None,
+    *,
+    duplicate_window_sec: float,
+    duplicate_threshold: float,
+    max_visible_per_cluster: int,
+    seed: int,
+) -> dict[str, int]:
+    """Mark review/training sampling metadata without deleting raw crops.
+
+    The manifest remains a lossless list of candidate crops. Review defaults can
+    hide repeated near-neighbours, while bulk labels still apply to every member
+    unless the user explicitly marks exceptions.
+    """
+    for item in items:
+        item["is_duplicate"] = False
+        item["duplicate_group_id"] = None
+        item["representative_rank"] = None
+        item["suspicious_score"] = 0.0
+        item["suspicious_reasons"] = []
+        item["sampling_reason"] = "review_sample"
+        item["review_visible"] = True
+
+    window_ms = int(max(0.0, duplicate_window_sec) * 1000)
+    duplicate_count = 0
+    hidden_count = 0
+
+    for cluster_id, members in sorted(cluster_members.items()):
+        members = list(members)
+        if not members:
+            continue
+
+        group_by_item: dict[int, str] = {}
+        groups: dict[str, list[int]] = {}
+        group_reps: list[int] = []
+        ordered = sorted(members, key=lambda i: (
+            items[i]["camera"], int(items[i]["wall_ms"]), items[i]["crop_id"]
+        ))
+        for i in ordered:
+            matched_group: str | None = None
+            if window_ms > 0 and (x is None or duplicate_threshold > 0):
+                for rep in group_reps:
+                    if _is_near_duplicate(
+                        i, rep, items, x,
+                        window_ms=window_ms,
+                        threshold=duplicate_threshold,
+                    ):
+                        matched_group = group_by_item[rep]
+                        break
+            if matched_group is None:
+                matched_group = f"{cluster_id}:{len(groups)}"
+                groups[matched_group] = []
+                group_reps.append(i)
+            group_by_item[i] = matched_group
+            groups[matched_group].append(i)
+
+        representatives: set[int] = set()
+        group_sizes: dict[str, int] = {}
+        for gid, group in groups.items():
+            group.sort(key=lambda i: (
+                int(items[i]["wall_ms"]), items[i]["crop_id"]
+            ))
+            representatives.add(group[0])
+            group_sizes[gid] = len(group)
+            for pos, i in enumerate(group):
+                items[i]["duplicate_group_id"] = gid
+                if pos > 0:
+                    items[i]["is_duplicate"] = True
+                    duplicate_count += 1
+
+        for i in members:
+            gid = str(items[i].get("duplicate_group_id") or "")
+            score, reasons = _suspicious_score(items[i], members, items, group_sizes.get(gid, 1))
+            items[i]["suspicious_score"] = score
+            items[i]["suspicious_reasons"] = reasons
+
+        visible: set[int] = set(representatives)
+        if max_visible_per_cluster > 0 and len(visible) > max_visible_per_cluster:
+            sampled, _ = thin_cluster_members(
+                sorted(visible),
+                items,
+                max_size=max_visible_per_cluster,
+                seed=seed,
+                cluster_id=cluster_id,
+            )
+            visible = set(sampled)
+        elif max_visible_per_cluster > 0 and len(members) > max_visible_per_cluster:
+            sampled, _ = thin_cluster_members(
+                members,
+                items,
+                max_size=max_visible_per_cluster,
+                seed=seed,
+                cluster_id=cluster_id,
+            )
+            visible.update(sampled)
+
+        suspicious_keep = [
+            i for i in members
+            if float(items[i].get("suspicious_score", 0.0)) >= 0.55
+        ]
+        suspicious_keep.sort(key=lambda i: (
+            -float(items[i].get("suspicious_score", 0.0)),
+            int(items[i]["wall_ms"]),
+            items[i]["crop_id"],
+        ))
+        visible.update(suspicious_keep[: max(4, min(12, max_visible_per_cluster // 8 or 4))])
+
+        visible_order = sorted(visible, key=lambda i: (
+            bool(items[i].get("is_duplicate")),
+            float(items[i].get("distance", 0.0)),
+            int(items[i]["wall_ms"]),
+            items[i]["crop_id"],
+        ))
+        for rank, i in enumerate(visible_order):
+            items[i]["representative_rank"] = rank
+            items[i]["review_visible"] = True
+            if items[i].get("is_duplicate"):
+                items[i]["sampling_reason"] = "suspicious_duplicate"
+            elif float(items[i].get("suspicious_score", 0.0)) >= 0.55:
+                items[i]["sampling_reason"] = "suspicious"
+            else:
+                items[i]["sampling_reason"] = "review_sample"
+
+        for i in members:
+            if i in visible:
+                continue
+            items[i]["review_visible"] = False
+            hidden_count += 1
+            items[i]["sampling_reason"] = (
+                "duplicate_hidden" if items[i].get("is_duplicate") else "sampled_out"
+            )
+
+    return {
+        "duplicate_crops": duplicate_count,
+        "hidden_by_sampling": hidden_count,
+    }
+
+
 def compact_items_to_clusters(
     items: list[dict],
     clusters: list[dict],
@@ -400,12 +605,13 @@ def main() -> None:
     ap.add_argument("--no-store-embeddings", action="store_true",
                     help="smaller manifest, but disables split-cluster in review UI")
     ap.add_argument("--dedupe-window-sec", type=float, default=15.0,
-                    help="drop near-identical crops within this per-camera window; "
-                         "0 disables")
+                    help="mark near-identical crops within this per-camera window "
+                         "for default review collapse; 0 disables")
     ap.add_argument("--dedupe-threshold", type=float, default=0.995,
                     help="cosine similarity threshold for duplicate crops")
     ap.add_argument("--max-cluster-size", type=int, default=96,
-                    help="max crops kept per cluster after clustering; 0 disables")
+                    help="max crops shown by default per cluster after review "
+                         "sampling; raw crops remain in the manifest; 0 disables")
     ap.add_argument("--ignore-config", type=Path, default=ROOT / "cameras.yaml",
                     help="camera config with ignore_regions (default: cameras.yaml)")
     ap.add_argument("--no-ignore-config", action="store_true",
@@ -495,16 +701,6 @@ def main() -> None:
             })
         if not items:
             raise SystemExit("no usable crops after detector-score filtering")
-        # No embeddings → dedup by temporal proximity only.
-        items, _x, deduped = dedupe_nearby(
-            items, None,
-            window_sec=args.dedupe_window_sec,
-            threshold=args.dedupe_threshold,
-        )
-        if not items:
-            raise SystemExit("no usable crops left after duplicate filtering")
-        if deduped:
-            print(f"[cluster] dropped {deduped} near-duplicate crops (time-only)")
         if ignored_by_region:
             print(f"[cluster] dropped {ignored_by_region} crops inside ignore region(s)")
 
@@ -515,6 +711,7 @@ def main() -> None:
         embedding_name = "time-episode"
         embedding_dim_param = 0
         stored_embeddings_param = False
+        x = None
         print(f"[cluster] time mode: {len(cluster_members)} episode(s) "
               f"(per camera, gap >= {args.episode_gap_sec}s)")
     else:
@@ -566,15 +763,6 @@ def main() -> None:
             out_dim=args.embedding_dim,
             seed=args.seed,
         )
-        items, x, deduped = dedupe_nearby(
-            items, x,
-            window_sec=args.dedupe_window_sec,
-            threshold=args.dedupe_threshold,
-        )
-        if not items:
-            raise SystemExit("no usable crops left after duplicate filtering")
-        if deduped:
-            print(f"[cluster] dropped {deduped} near-duplicate crops")
         if ignored_by_region:
             print(f"[cluster] dropped {ignored_by_region} crops inside ignore region(s)")
 
@@ -608,30 +796,61 @@ def main() -> None:
         for i in members:
             items[i]["cluster"] = new
 
+    sampling = annotate_review_metadata(
+        items,
+        remapped,
+        x,
+        duplicate_window_sec=args.dedupe_window_sec,
+        duplicate_threshold=args.dedupe_threshold,
+        max_visible_per_cluster=args.max_cluster_size,
+        seed=args.seed,
+    )
+    if sampling["duplicate_crops"]:
+        print(
+            f"[cluster] marked {sampling['duplicate_crops']} near-duplicate crops "
+            "for review collapse"
+        )
+    if sampling["hidden_by_sampling"]:
+        print(
+            f"[cluster] hides {sampling['hidden_by_sampling']} crops by default "
+            "(still present for labeling/training metadata)"
+        )
+
     clusters = []
-    thinned_by_cluster = 0
+    thinned_by_cluster = int(sampling["hidden_by_sampling"])
     for cluster_id, members in sorted(remapped.items()):
         # Embedding mode sorts by centroid distance; time mode has none, so fall
         # back to 0.0 — a stable sort then preserves the chronological member
         # order build_time_episodes produced.
         members.sort(key=lambda i: items[i].get("distance", 0.0))
-        members, dropped = thin_cluster_members(
-            members,
-            items,
-            max_size=args.max_cluster_size,
-            seed=args.seed,
-            cluster_id=cluster_id,
+        visible_members = [
+            i for i in members
+            if bool(items[i].get("review_visible", True))
+        ]
+        hidden_duplicate_count = sum(
+            1 for i in members
+            if bool(items[i].get("is_duplicate")) and not bool(items[i].get("review_visible", True))
         )
-        thinned_by_cluster += dropped
         clusters.append({
             "cluster_id": cluster_id,
             "size": len(members),
             "item_indices": members,
-            "representatives": [items[i]["crop_id"] for i in members[:24]],
+            "visible_count": len(visible_members),
+            "hidden_duplicate_count": hidden_duplicate_count,
+            "representatives": [
+                items[i]["crop_id"]
+                for i in sorted(
+                    visible_members,
+                    key=lambda j: (
+                        int(items[j].get("representative_rank")
+                            if items[j].get("representative_rank") is not None else 10**9),
+                        -float(items[j].get("suspicious_score", 0.0)),
+                        float(items[j].get("distance", 0.0)),
+                        int(items[j]["wall_ms"]),
+                    ),
+                )[:24]
+            ],
         })
-    if thinned_by_cluster:
-        items, clusters = compact_items_to_clusters(items, clusters)
-        print(f"[cluster] dropped {thinned_by_cluster} excess crops from large clusters")
 
     labels_hint = [v.strip() for v in args.labels.split(",") if v.strip()]
     out = {
@@ -651,7 +870,7 @@ def main() -> None:
             "stored_embeddings": stored_embeddings_param,
             "dedupe_window_sec": args.dedupe_window_sec,
             "dedupe_threshold": args.dedupe_threshold,
-            "deduped": deduped,
+            "deduped": int(sampling["duplicate_crops"]),
             "max_cluster_size": args.max_cluster_size,
             "thinned_by_cluster": thinned_by_cluster,
             "ignored_by_region": ignored_by_region,

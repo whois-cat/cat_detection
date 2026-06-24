@@ -19,7 +19,7 @@ from training.build_cluster_manifest import (
     dedupe_nearby,
     prepare_embeddings,
 )
-from training.reviews import load_reviews
+from training.reviews import load_review_rows, load_reviews
 
 DROP_LABELS = {"discard", "unknown"}
 
@@ -108,7 +108,10 @@ def main() -> None:
 
     from training import CropSource
 
-    reviews = load_reviews(args.reviews_db)
+    review_rows = load_review_rows(args.reviews_db)
+    reviews = {key: row.label for key, row in review_rows.items()}
+    if not reviews:
+        reviews = load_reviews(args.reviews_db)
     if not reviews:
         raise SystemExit(f"no human reviews found in {args.reviews_db}")
 
@@ -161,7 +164,8 @@ def main() -> None:
         key = int(sb.rowid)
         if key in seen_existing:
             continue
-        label = reviews.get(key)
+        review_row = review_rows.get(key)
+        label = review_row.label if review_row is not None else reviews.get(key)
         if label is None or label in DROP_LABELS:
             continue
         row = {
@@ -173,6 +177,11 @@ def main() -> None:
             "score": float(sb.score),
             "path": _rel_crop_path(label, key),
         }
+        if review_row is not None:
+            row["duplicate_group_id"] = review_row.duplicate_group_id
+            row["is_duplicate"] = review_row.is_duplicate
+            row["suspicious_score"] = review_row.suspicious_score
+            row["sampling_reason"] = review_row.sampling_reason
         pending_rows.append(row)
         pending_images.append(sample.image)
         if len(pending_images) >= max(1, args.embedding_batch_size):
@@ -190,7 +199,10 @@ def main() -> None:
         items, emb, window_sec=args.dedupe_window_sec, threshold=args.dedupe_threshold,
     )
     by_key = {int(c.row["src_event_key"]): c for c in candidates}
-    scores = [float(row.get("score", 0.0)) for row in items]
+    scores = [
+        float(row.get("suspicious_score", 0.0)) * 2.0 + float(row.get("score", 0.0))
+        for row in items
+    ]
 
     by_label: dict[str, list[int]] = {}
     for i, row in enumerate(items):
