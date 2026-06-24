@@ -37,7 +37,9 @@ from recordings_index import (
     reconcile_deletions,
 )
 
-RECORDINGS_DIR        = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
+# Repo-root-relative by default (WORKDIR=/app) so stored segment paths match
+# `just recordings-index-rebuild` exactly (the path column is UNIQUE).
+RECORDINGS_DIR        = Path(os.environ.get("RECORDINGS_DIR", "data/recordings"))
 EVENTS_DB             = Path(os.environ.get("EVENTS_DB", "/data/events/events.db"))
 SEGMENT_DURATION_SEC  = float(os.environ.get("SEGMENT_DURATION_SEC", "30"))
 INDEX_INTERVAL_SEC    = float(os.environ.get("INDEX_INTERVAL_SEC", "30"))

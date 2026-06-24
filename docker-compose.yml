@@ -59,10 +59,15 @@ services:
     restart: unless-stopped
     depends_on: [mediamtx]
     volumes:
-      - ./data/recordings:/recordings:ro
+      # Mount at the same relative path the CLI rebuild uses (repo-root-relative
+      # `data/recordings`). WORKDIR is /app, so segment paths are stored as
+      # `data/recordings/<camera>/<file>.mp4`, matching
+      # `just recordings-index-rebuild`. The path column is UNIQUE, so a
+      # mismatch here would duplicate every row across the two writers.
+      - ./data/recordings:/app/data/recordings:ro
       - ./data/events:/data/events
     environment:
-      RECORDINGS_DIR: /recordings
+      RECORDINGS_DIR: data/recordings
       EVENTS_DB: /data/events/events.db
       RECORDING_TZ: ${RECORDING_TZ:-UTC}
       SEGMENT_DURATION_SEC: "30"        # must match mediamtx recordSegmentDuration
