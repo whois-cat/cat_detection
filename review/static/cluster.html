@@ -67,8 +67,19 @@
   .bulk .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   select { background:#1d2230; color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:8px; font:inherit; }
-  button.primary { background:#243b67; border-color:#3f73d9; }
+  button.primary { background:#243b67; border-color:#3f73d9; padding:11px; font-weight:600; }
   button.activeMode { border-color:var(--accent); color:#dbe7ff; }
+  .section { display:grid; gap:8px; }
+  .section > .head { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+  .bulk .sel { color:var(--fg); font-weight:600; }
+  .bulk .grid2 { display:grid; grid-template-columns:auto 1fr; align-items:center; gap:8px; }
+  details.advanced { border-top:1px solid var(--line); padding-top:8px; }
+  details.advanced > summary { cursor:pointer; color:var(--muted); list-style:none; padding:4px 0; }
+  details.advanced > summary::-webkit-details-marker { display:none; }
+  details.advanced > summary::before { content:'▸ '; }
+  details.advanced[open] > summary::before { content:'▾ '; }
+  details.advanced[open] > summary { color:var(--fg); }
+  details.advanced .body { display:grid; gap:8px; padding:8px 0 2px; }
 </style>
 </head>
 <body>
@@ -96,32 +107,48 @@
       <span id="clusterMeta"></span>
       <span id="clusterStatus"></span>
     </div>
-	    <div class="mode">
-	      <button onclick="setMode('representative')">representative</button>
-	      <button onclick="setMode('random')">random</button>
-	      <button onclick="setMode('outliers')">outliers</button>
-	      <button onclick="setMode('suspicious')">suspicious first</button>
-	    </div>
-	    <div class="mode">
-	      <button id="dupToggle" onclick="toggleDuplicates()">show duplicates</button>
-	    </div>
-	    <div class="bulk">
-	      <b>majority with exceptions</b>
-	      <div class="row">
-	        <span class="hint">selected →</span>
-	        <select id="exceptionLabel"></select>
-	        <span class="hint">rest →</span>
-	        <select id="majorityLabel"></select>
-	      </div>
-	      <button class="primary" onclick="labelWithExceptions()">apply selected/rest</button>
-	      <div id="quickBulk" class="row"></div>
-	    </div>
-	    <div class="mode">
-	      <button onclick="splitCluster(2)">split x2</button>
-	      <button onclick="splitCluster(3)">split x3</button>
-	    </div>
-	    <div class="labels" id="buttons"></div>
-	    <div class="hint">keys: click select · shift-click range · a all loaded · i invert · esc clear · 1..N label · x split · m mixed · s skip · ←/→ cluster</div>
+
+    <!-- Primary (and only) labelling path. -->
+    <div class="bulk section">
+      <span class="head">majority with exceptions</span>
+      <div class="sel" id="selSummary">selected: 0 / 0</div>
+      <div class="grid2">
+        <span class="hint">selected →</span>
+        <select id="exceptionLabel"></select>
+        <span class="hint">rest →</span>
+        <select id="majorityLabel"></select>
+      </div>
+      <button class="primary" id="applyBtn" onclick="labelWithExceptions()">apply selected/rest</button>
+    </div>
+
+    <!-- Review navigation — deliberately kept apart from labelling actions. -->
+    <div class="section">
+      <span class="head">review navigation</span>
+      <div class="mode">
+        <button data-mode="representative" onclick="setMode('representative')">representative</button>
+        <button data-mode="random" onclick="setMode('random')">random</button>
+        <button data-mode="outliers" onclick="setMode('outliers')">outliers</button>
+        <button data-mode="suspicious" onclick="setMode('suspicious')">suspicious</button>
+      </div>
+      <div class="mode">
+        <button id="dupToggle" onclick="toggleDuplicates()">show duplicates</button>
+      </div>
+    </div>
+
+    <!-- Split is an advanced, rarely-used path: collapsed by default. -->
+    <details class="advanced">
+      <summary>Advanced: split cluster</summary>
+      <div class="body">
+        <div class="mode">
+          <button onclick="splitCluster(2)">split x2</button>
+          <button onclick="splitCluster(3)">split x3</button>
+        </div>
+        <span class="hint">assign a label to this cluster / split child:</span>
+        <div class="labels" id="buttons"></div>
+      </div>
+    </details>
+
+    <div class="hint">keys: click select · shift-click range · a all loaded · i invert · esc clear · 1..N label · x split · m mixed · s skip · ←/→ cluster</div>
   </aside>
 </main>
 <script>
@@ -184,31 +211,38 @@ function renderBulkControls() {
   const majority = document.getElementById('majorityLabel');
   exception.innerHTML = '';
   majority.innerHTML = '';
-  [...M.labels, ...M.extra_labels].forEach(lab => {
-    const o = document.createElement('option');
-    o.value = lab;
-    o.textContent = lab;
-    exception.appendChild(o);
-  });
-  M.labels.forEach(lab => {
-    const o = document.createElement('option');
-    o.value = lab;
-    o.textContent = lab;
-    majority.appendChild(o);
-  });
-  if ([...M.extra_labels].includes('discard')) exception.value = 'discard';
-  if (M.labels.length) majority.value = M.labels[0];
+  const cats = M.labels;
+  const extras = M.extra_labels;
+  // selected → : service labels first (discard, unknown), then cats. Default discard.
+  const selOrder = ['discard', 'unknown'].filter(l => extras.includes(l)).concat(cats);
+  // rest → : cats first, then service labels (unknown, discard). Default first cat.
+  const restOrder = cats.concat(['unknown', 'discard'].filter(l => extras.includes(l)));
+  selOrder.forEach(lab => exception.add(new Option(lab, lab)));
+  restOrder.forEach(lab => majority.add(new Option(lab, lab)));
+  exception.value = extras.includes('discard') ? 'discard' : selOrder[0];
+  majority.value = cats[0] || restOrder[0];
+  exception.onchange = updateApplySummary;
+  majority.onchange = updateApplySummary;
+}
 
-  const quick = document.getElementById('quickBulk');
-  quick.innerHTML = '';
-  ['discard', 'unknown'].filter(l => M.extra_labels.includes(l)).forEach(exc => {
-    M.labels.forEach(cat => {
-      const b = document.createElement('button');
-      b.textContent = `${exc} / ${cat}`;
-      b.onclick = () => labelWithExceptions(exc, cat);
-      quick.appendChild(b);
-    });
-  });
+// Keep the "selected: N / total" readout and the explicit apply-button text in
+// sync with the current selection and dropdowns.
+function updateApplySummary() {
+  if (!M) return;
+  const c = curr();
+  if (!c) return;
+  const n = selected.size;
+  const rest = Math.max(0, c.size - n);
+  const summary = document.getElementById('selSummary');
+  if (summary) summary.textContent = `selected: ${n} / ${c.size}`;
+  const btn = document.getElementById('applyBtn');
+  if (btn) {
+    const exc = document.getElementById('exceptionLabel').value;
+    const maj = document.getElementById('majorityLabel').value;
+    btn.textContent = n > 0
+      ? `Apply: selected ${n} → ${exc}, rest ${rest} → ${maj}`
+      : `Apply: all ${c.size} → ${maj}`;
+  }
 }
 
 function renderList() {
@@ -250,6 +284,8 @@ function render() {
   document.getElementById('clusterStatus').textContent =
       c.status ? `status: ${c.status.status} ${c.status.label || ''}` : 'status: open';
   document.getElementById('dupToggle').textContent = showDuplicates ? 'hide duplicates' : 'show duplicates';
+  document.querySelectorAll('button[data-mode]').forEach(b =>
+      b.classList.toggle('activeMode', b.dataset.mode === mode));
   renderGrid(c);
 }
 
@@ -377,6 +413,7 @@ function invertSelection() {
 function renderCropbar() {
   document.getElementById('selCount').textContent = selected.size;
   document.getElementById('cropbar').classList.toggle('show', selected.size > 0);
+  updateApplySummary();
 }
 
 async function labelSelected(label) {
@@ -391,27 +428,23 @@ async function labelSelected(label) {
   await load();
 }
 
-async function labelWithExceptions(exceptionLabel, majorityLabel) {
-  if (!selected.size) {
-    alert('select one or more exception crops first');
-    return;
-  }
+async function labelWithExceptions() {
   const c = curr();
-  const exc = exceptionLabel || document.getElementById('exceptionLabel').value;
-  const maj = majorityLabel || document.getElementById('majorityLabel').value;
-  const selectedCount = selected.size;
-  const rest = Math.max(0, c.size - selectedCount);
-  const ok = confirm(`Label ${selectedCount} selected crop(s) as ${exc} and ${rest} remaining crop(s) as ${maj}?`);
-  if (!ok) return;
+  const exc = document.getElementById('exceptionLabel').value;
+  const maj = document.getElementById('majorityLabel').value;
+  const n = selected.size;
+  const rest = Math.max(0, c.size - n);
+  // 0 selected is a valid action: label the whole cluster as the "rest" label.
+  const confirmText = n > 0
+    ? `Label ${n} selected crop(s) as "${exc}" and ${rest} remaining as "${maj}"?`
+    : `Label the entire cluster (${c.size} crops) as "${maj}"?`;
+  if (!confirm(confirmText)) return;
+  const exceptions = n > 0 ? { [exc]: [...selected] } : {};
   const r = await fetch('/api/cluster_label_with_exceptions', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
-      cluster_id:c.cluster_id,
-      majority_label:maj,
-      exceptions:{[exc]: [...selected]},
-    })
+    body:JSON.stringify({ cluster_id:c.cluster_id, majority_label:maj, exceptions })
   });
-  if (!r.ok) { alert('bulk label failed: ' + await r.text()); return; }
+  if (!r.ok) { alert('label failed: ' + await r.text()); return; }
   clearSelection();
   await load();
 }
