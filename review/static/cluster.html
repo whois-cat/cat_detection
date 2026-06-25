@@ -109,17 +109,31 @@
       <span id="clusterStatus"></span>
     </div>
 
-    <!-- Primary (and only) labelling path. -->
+    <!-- Primary (and only) labelling path. Two modes, switched by selection:
+         no selection → label the whole cluster; selection → exceptions. -->
     <div class="bulk section">
-      <span class="head">label with exceptions</span>
-      <div class="sel" id="selSummary">selected: 0 / 0</div>
-      <div class="grid2">
-        <span class="hint">selected →</span>
-        <select id="exceptionLabel"></select>
-        <span class="hint">rest →</span>
-        <select id="majorityLabel"></select>
+      <span class="head" id="bulkTitle">label whole cluster</span>
+
+      <!-- selection == 0 -->
+      <div id="wholeMode">
+        <div class="grid2">
+          <span class="hint">label all as →</span>
+          <select id="wholeLabel"></select>
+        </div>
       </div>
-      <button class="primary" id="applyBtn" onclick="labelWithExceptions()">apply selected/rest</button>
+
+      <!-- selection > 0 -->
+      <div id="exceptionsMode" hidden>
+        <div class="sel" id="selSummary">selected: 0 / 0</div>
+        <div class="grid2">
+          <span class="hint">selected →</span>
+          <select id="exceptionLabel"></select>
+          <span class="hint">rest →</span>
+          <select id="majorityLabel"></select>
+        </div>
+      </div>
+
+      <button class="primary" id="applyBtn" onclick="labelWithExceptions()">Choose label</button>
     </div>
 
     <!-- View mode — deliberately kept apart from labelling actions. -->
@@ -197,54 +211,73 @@ async function loadCounts() {
 
 function curr() { return M.queue[idx]; }
 
+// A disabled "choose label…" placeholder so nothing real is preselected and
+// Apply stays blocked until the user picks explicitly.
+function addPlaceholder(sel) {
+  const ph = new Option('choose label…', '');
+  ph.disabled = true;
+  sel.add(ph);
+}
+
 function renderBulkControls() {
+  const whole = document.getElementById('wholeLabel');
   const exception = document.getElementById('exceptionLabel');
   const majority = document.getElementById('majorityLabel');
-  exception.innerHTML = '';
-  majority.innerHTML = '';
+  [whole, exception, majority].forEach(s => { s.innerHTML = ''; });
   const cats = M.labels;
   const extras = M.extra_labels;
+  // cats first, then service labels (unknown, discard).
+  const restOrder = cats.concat(['unknown', 'discard'].filter(l => extras.includes(l)));
   // selected → : service labels first (discard, unknown), then cats. Default discard.
   const selOrder = ['discard', 'unknown'].filter(l => extras.includes(l)).concat(cats);
-  // rest → : cats first, then service labels (unknown, discard). Default first cat.
-  const restOrder = cats.concat(['unknown', 'discard'].filter(l => extras.includes(l)));
+
+  // "label all as" (whole-cluster mode): placeholder, then cats + service. No real default.
+  addPlaceholder(whole);
+  restOrder.forEach(lab => whole.add(new Option(lab, lab)));
+  whole.value = '';
+
+  // exceptions mode dropdowns
   selOrder.forEach(lab => exception.add(new Option(lab, lab)));
-  // rest has NO real default (never auto-label a whole cluster as a cat): a
-  // disabled placeholder forces an explicit choice; Apply stays disabled until then.
-  const placeholder = new Option('choose label…', '');
-  placeholder.disabled = true;
-  majority.add(placeholder);
-  restOrder.forEach(lab => majority.add(new Option(lab, lab)));
   exception.value = extras.includes('discard') ? 'discard' : selOrder[0];
+  addPlaceholder(majority);
+  restOrder.forEach(lab => majority.add(new Option(lab, lab)));
   majority.value = '';
+
+  whole.onchange = updateApplySummary;
   exception.onchange = updateApplySummary;
   majority.onchange = updateApplySummary;
 }
 
-// Keep the "selected: N / total" readout and the explicit apply-button text in
-// sync with the current selection and dropdowns.
+// Switch the panel between "label whole cluster" (no selection) and "label with
+// exceptions" (selection), and keep the readout + Apply button text/enabled
+// state in sync with the dropdowns. This is the single labelling workflow.
 function updateApplySummary() {
   if (!M) return;
   const c = curr();
   if (!c) return;
   const n = selected.size;
-  const rest = Math.max(0, c.size - n);
-  const summary = document.getElementById('selSummary');
-  if (summary) summary.textContent = `selected: ${n} / ${c.size}`;
   const btn = document.getElementById('applyBtn');
+  document.getElementById('wholeMode').hidden = n > 0;
+  document.getElementById('exceptionsMode').hidden = n === 0;
+  document.getElementById('bulkTitle').textContent =
+      n > 0 ? 'label with exceptions' : 'label whole cluster';
   if (!btn) return;
-  const exc = document.getElementById('exceptionLabel').value;
-  const maj = document.getElementById('majorityLabel').value;
-  if (!maj) {
-    // No rest label chosen yet → labelling is unsafe; block it.
-    btn.disabled = true;
-    btn.textContent = 'Choose rest label';
+
+  if (n === 0) {
+    const maj = document.getElementById('wholeLabel').value;
+    btn.disabled = !maj;
+    btn.textContent = maj ? `Apply: all ${c.size} → ${maj}` : 'Choose label';
     return;
   }
-  btn.disabled = false;
-  btn.textContent = n > 0
+
+  document.getElementById('selSummary').textContent = `selected: ${n} / ${c.size}`;
+  const rest = Math.max(0, c.size - n);
+  const exc = document.getElementById('exceptionLabel').value;
+  const maj = document.getElementById('majorityLabel').value;
+  btn.disabled = !maj;
+  btn.textContent = maj
     ? `Apply: selected ${n} → ${exc}, rest ${rest} → ${maj}`
-    : `Apply: all ${c.size} → ${maj}`;
+    : 'Choose rest label';
 }
 
 function renderList() {
@@ -402,10 +435,11 @@ function syncSelection() {
 
 async function labelWithExceptions() {
   const c = curr();
-  const exc = document.getElementById('exceptionLabel').value;
-  const maj = document.getElementById('majorityLabel').value;
-  if (!maj) return;  // safety: rest label must be explicitly chosen
   const n = selected.size;
+  // Whole-cluster mode reads its own dropdown; exceptions mode reads selected/rest.
+  const exc = document.getElementById('exceptionLabel').value;
+  const maj = (n === 0 ? document.getElementById('wholeLabel') : document.getElementById('majorityLabel')).value;
+  if (!maj) return;  // safety: required label must be explicitly chosen
   const rest = Math.max(0, c.size - n);
   const exceptions = n > 0 ? { [exc]: [...selected] } : {};
   const r = await fetch('/api/cluster_label_with_exceptions', {
