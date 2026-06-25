@@ -57,12 +57,13 @@
   .badge { display:inline-flex; max-width:100%; padding:1px 5px; border-radius:4px;
            background:#20283a; color:#aeb8d0; font:10px/1.4 ui-monospace, monospace; }
   .badge.warn { color:#ffd88a; background:#3a2b16; }
-  #cropbar { display:none; align-items:center; gap:8px; flex-wrap:wrap;
-             padding:8px 10px; margin-bottom:10px; border:1px solid var(--accent);
-             border-radius:7px; background:#16243a; }
-  #cropbar.show { display:flex; }
-  #cropbar .pill { color:var(--muted); }
-  #cropbar button { padding:6px 9px; }
+  button:disabled { opacity:.45; cursor:not-allowed; border-color:var(--line); color:var(--muted); }
+  button.primary:disabled { background:#1d2230; }
+  #toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(8px);
+           background:#1d2230; border:1px solid var(--accent); color:var(--fg);
+           padding:10px 14px; border-radius:8px; box-shadow:0 6px 20px rgba(0,0,0,.45);
+           max-width:80vw; opacity:0; pointer-events:none; transition:opacity .18s, transform .18s; z-index:50; }
+  #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
   .bulk { border-top:1px solid var(--line); border-bottom:1px solid var(--line);
           padding:12px 0; display:grid; gap:8px; }
   .bulk .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
@@ -99,11 +100,6 @@
 <main>
   <nav id="clusters"></nav>
   <section id="stage">
-    <div id="cropbar">
-      <span class="pill"><b id="selCount">0</b> selected · label as:</span>
-      <span id="cropLabels"></span>
-      <button onclick="clearSelection()">clear</button>
-    </div>
     <div id="grid"></div>
   </section>
   <aside>
@@ -148,27 +144,35 @@
 
     <details class="advanced">
       <summary>Keyboard shortcuts</summary>
-      <div class="body hint">click select · shift-click range · a all loaded · i invert · esc clear · 1..N label · x split · m mixed · s skip · ←/→ cluster</div>
+      <div class="body hint">click select · shift-click range · a all loaded · i invert · esc clear · x split · m mixed · s skip · ←/→ cluster</div>
     </details>
   </aside>
 </main>
+<div id="toast" role="status" aria-live="polite"></div>
 <script>
 let M = null;
 let idx = 0;
 let mode = 'representative';
-let ACTIONS = [];
 let renderSeq = 0;
 let selected = new Set();   // per-crop selection (crop_ids) within current cluster
 let currentItems = [];
 let lastClickedIndex = null;
 let showDuplicates = false;
 
+let toastTimer = 0;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+}
+
 async function load() {
   M = await (await fetch('/api/clusters')).json();
-  ACTIONS = [...M.labels, ...M.extra_labels, 'mixed', 'skip'];
   idx = Math.max(0, M.queue.findIndex(c => !c.status));
   if (idx < 0) idx = 0;
-  renderCropLabels();
   renderBulkControls();
   render();
   loadCounts();
@@ -205,9 +209,14 @@ function renderBulkControls() {
   // rest → : cats first, then service labels (unknown, discard). Default first cat.
   const restOrder = cats.concat(['unknown', 'discard'].filter(l => extras.includes(l)));
   selOrder.forEach(lab => exception.add(new Option(lab, lab)));
+  // rest has NO real default (never auto-label a whole cluster as a cat): a
+  // disabled placeholder forces an explicit choice; Apply stays disabled until then.
+  const placeholder = new Option('choose label…', '');
+  placeholder.disabled = true;
+  majority.add(placeholder);
   restOrder.forEach(lab => majority.add(new Option(lab, lab)));
   exception.value = extras.includes('discard') ? 'discard' : selOrder[0];
-  majority.value = cats[0] || restOrder[0];
+  majority.value = '';
   exception.onchange = updateApplySummary;
   majority.onchange = updateApplySummary;
 }
@@ -223,13 +232,19 @@ function updateApplySummary() {
   const summary = document.getElementById('selSummary');
   if (summary) summary.textContent = `selected: ${n} / ${c.size}`;
   const btn = document.getElementById('applyBtn');
-  if (btn) {
-    const exc = document.getElementById('exceptionLabel').value;
-    const maj = document.getElementById('majorityLabel').value;
-    btn.textContent = n > 0
-      ? `Apply: selected ${n} → ${exc}, rest ${rest} → ${maj}`
-      : `Apply: all ${c.size} → ${maj}`;
+  if (!btn) return;
+  const exc = document.getElementById('exceptionLabel').value;
+  const maj = document.getElementById('majorityLabel').value;
+  if (!maj) {
+    // No rest label chosen yet → labelling is unsafe; block it.
+    btn.disabled = true;
+    btn.textContent = 'Choose rest label';
+    return;
   }
+  btn.disabled = false;
+  btn.textContent = n > 0
+    ? `Apply: selected ${n} → ${exc}, rest ${rest} → ${maj}`
+    : `Apply: all ${c.size} → ${maj}`;
 }
 
 function renderList() {
@@ -253,7 +268,7 @@ function render() {
   if (c.cluster_id !== currentClusterId) { selected.clear(); currentClusterId = c.cluster_id; }
   currentItems = [];
   lastClickedIndex = null;
-  renderCropbar();
+  syncSelection();
   renderList();
   document.getElementById('progress').textContent =
       `${M.done_clusters} / ${M.total_clusters} clusters · ${M.reviewed_items} crops`;
@@ -338,18 +353,6 @@ async function renderGrid(c) {
   grid.classList.remove('loading');
 }
 
-function renderCropLabels() {
-  const wrap = document.getElementById('cropLabels');
-  if (!wrap || !M) return;
-  wrap.innerHTML = '';
-  [...M.labels, ...M.extra_labels].forEach(lab => {
-    const b = document.createElement('button');
-    b.textContent = lab;
-    b.onclick = () => labelSelected(lab);
-    wrap.appendChild(b);
-  });
-}
-
 function setCardSelected(cropId, on) {
   if (on) selected.add(cropId);
   else selected.delete(cropId);
@@ -365,19 +368,19 @@ function toggleSelect(cropId, card, range, index) {
     setCardSelected(cropId, !selected.has(cropId));
   }
   lastClickedIndex = index;
-  renderCropbar();
+  syncSelection();
 }
 
 function clearSelection() {
   selected.clear();
   document.querySelectorAll('.crop.selected').forEach(el => el.classList.remove('selected'));
-  renderCropbar();
+  syncSelection();
 }
 
 function selectAllLoaded() {
   currentItems.forEach(item => selected.add(item.crop_id));
   document.querySelectorAll('.crop').forEach(el => el.classList.add('selected'));
-  renderCropbar();
+  syncSelection();
 }
 
 function invertSelection() {
@@ -388,46 +391,34 @@ function invertSelection() {
   document.querySelectorAll('.crop').forEach(el => {
     el.classList.toggle('selected', selected.has(el.dataset.cropId));
   });
-  renderCropbar();
+  syncSelection();
 }
 
-function renderCropbar() {
-  document.getElementById('selCount').textContent = selected.size;
-  document.getElementById('cropbar').classList.toggle('show', selected.size > 0);
+// Selection lives only in the right-panel "label with exceptions" readout now;
+// there is no floating crop toolbar.
+function syncSelection() {
   updateApplySummary();
-}
-
-async function labelSelected(label) {
-  if (!selected.size) return;
-  const crop_ids = [...selected];
-  const r = await fetch('/api/crop_label', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({crop_ids, label})
-  });
-  if (!r.ok) { alert('per-crop label failed: ' + await r.text()); return; }
-  clearSelection();
-  await load();
 }
 
 async function labelWithExceptions() {
   const c = curr();
   const exc = document.getElementById('exceptionLabel').value;
   const maj = document.getElementById('majorityLabel').value;
+  if (!maj) return;  // safety: rest label must be explicitly chosen
   const n = selected.size;
   const rest = Math.max(0, c.size - n);
-  // 0 selected is a valid action: label the whole cluster as the "rest" label.
-  const confirmText = n > 0
-    ? `Label ${n} selected crop(s) as "${exc}" and ${rest} remaining as "${maj}"?`
-    : `Label the entire cluster (${c.size} crops) as "${maj}"?`;
-  if (!confirm(confirmText)) return;
   const exceptions = n > 0 ? { [exc]: [...selected] } : {};
   const r = await fetch('/api/cluster_label_with_exceptions', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({ cluster_id:c.cluster_id, majority_label:maj, exceptions })
   });
-  if (!r.ok) { alert('label failed: ' + await r.text()); return; }
+  if (!r.ok) { showToast('Label failed: ' + await r.text()); return; }
+  const applied = n > 0
+    ? `Applied: selected ${n} → ${exc}, rest ${rest} → ${maj}`
+    : `Applied: all ${c.size} → ${maj}`;
   clearSelection();
   await load();
+  showToast(applied);   // non-blocking confirmation, no modal
 }
 
 	async function choose(label) {
@@ -436,7 +427,7 @@ async function labelWithExceptions() {
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({cluster_id:c.cluster_id, label})
   });
-  if (!r.ok) { alert('save failed'); return; }
+  if (!r.ok) { showToast('Save failed'); return; }
 	  await load();
 	}
 
@@ -447,8 +438,7 @@ async function labelWithExceptions() {
 	    body:JSON.stringify({cluster_id:c.cluster_id, parts})
 	  });
 	  if (!r.ok) {
-	    const msg = await r.text();
-	    alert(`split failed: ${msg}`);
+	    showToast(`Split failed: ${await r.text()}`);
 	    return;
 	  }
 	  await load();
@@ -470,16 +460,8 @@ document.addEventListener('keydown', e => {
 	  if (e.key === 'x') return splitCluster(2);
 	  if (e.key === 'm') return choose('mixed');
   if (e.key === 's') return choose('skip');
-  const n = parseInt(e.key, 10);
-  if (Number.isNaN(n)) return;
-  // With a per-crop selection active, number keys label the SELECTION (fallback
-  // for mixed clusters); otherwise they label the whole cluster.
-  if (selected.size > 0) {
-    const labelOnly = [...M.labels, ...M.extra_labels];
-    if (n >= 1 && n <= labelOnly.length) labelSelected(labelOnly[n - 1]);
-    return;
-  }
-  if (n >= 1 && n <= ACTIONS.length) choose(ACTIONS[n - 1]);
+  // Number keys intentionally do NOT label: labelling only happens through the
+  // right-panel selected/rest workflow, so there is a single source of truth.
 });
 
 load();
