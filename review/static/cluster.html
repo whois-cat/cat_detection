@@ -82,6 +82,13 @@
   details.advanced[open] > summary::before { content:'▾ '; }
   details.advanced[open] > summary { color:var(--fg); }
   details.advanced .body { display:grid; gap:8px; padding:8px 0 2px; }
+  /* Help is pushed to the very bottom and kept deliberately faint. */
+  details.help { margin-top:auto; }
+  details.help > summary { cursor:pointer; list-style:none; font-size:11px; color:var(--muted); opacity:.65; padding:2px 0; }
+  details.help > summary::-webkit-details-marker { display:none; }
+  details.help > summary::before { content:'▸ '; }
+  details.help[open] > summary::before { content:'▾ '; }
+  details.help .body { padding:6px 0 0; font-size:11px; }
   .hgroup { display:flex; align-items:center; gap:10px; }
   .hgroup.sep { border-left:1px solid var(--line); padding-left:16px; }
 </style>
@@ -156,9 +163,9 @@
       </div>
     </details>
 
-    <details class="advanced">
-      <summary>Keyboard shortcuts</summary>
-      <div class="body hint">click select · shift-click range · a all loaded · i invert · esc clear · x split · m mixed · s skip · ←/→ cluster</div>
+    <details class="help">
+      <summary>Help / shortcuts</summary>
+      <div class="body hint">click select · shift-click range · a all loaded · i invert · esc clear · x split · ←/→ cluster</div>
     </details>
   </aside>
 </main>
@@ -455,16 +462,6 @@ async function labelWithExceptions() {
   showToast(applied);   // non-blocking confirmation, no modal
 }
 
-	async function choose(label) {
-  const c = curr();
-  const r = await fetch('/api/cluster_review', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({cluster_id:c.cluster_id, label})
-  });
-  if (!r.ok) { showToast('Save failed'); return; }
-	  await load();
-	}
-
 	async function splitCluster(parts) {
 	  const c = curr();
 	  const r = await fetch('/api/cluster_split', {
@@ -492,10 +489,9 @@ document.addEventListener('keydown', e => {
   if (e.key === 'a') { e.preventDefault(); return selectAllLoaded(); }
   if (e.key === 'i') { e.preventDefault(); return invertSelection(); }
 	  if (e.key === 'x') return splitCluster(2);
-	  if (e.key === 'm') return choose('mixed');
-  if (e.key === 's') return choose('skip');
-  // Number keys intentionally do NOT label: labelling only happens through the
-  // right-panel selected/rest workflow, so there is a single source of truth.
+  // No key labels a cluster directly (number keys, m=mixed, s=skip all removed):
+  // labelling only happens through the right-panel workflow, so there is a
+  // single source of truth.
 });
 
 load();
