@@ -44,6 +44,13 @@ from typing import Iterator
 
 import numpy as np
 
+from training.augment import (
+    LEVELS as AUG_LEVELS,
+    augment_spec,
+    build_train_transform,
+    save_augmentation_preview,
+)
+
 log = logging.getLogger("training.train_classifier")
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -212,6 +219,83 @@ def check_split_leakage(episodes: list[list[int]],
             f"episode {ep_n} leaks across splits {sorted(homes)} "
             f"(crops {episode[:5]})"
         )
+
+
+def summarize_split(episodes: list[list[int]],
+                    train_idx, val_idx, test_idx,
+                    metas: list,
+                    *, identities=None) -> dict:
+    """Compute leakage/distribution facts for the train/val/test split.
+
+    ``identities[i]`` (optional) is a hashable per-crop image identity (e.g. the
+    detector event rowid) used for the path/image-overlap check; falls back to
+    the crop index itself, which still detects index reuse.
+    """
+    splits = {"train": list(train_idx), "val": list(val_idx), "test": list(test_idx)}
+    idx_to_split: dict[int, str] = {}
+    for name, idxs in splits.items():
+        for i in idxs:
+            idx_to_split[i] = name
+    if identities is None:
+        identities = list(range(len(metas)))
+
+    group_counts = {name: set() for name in splits}
+    group_overlap: list[tuple[int, list[str]]] = []
+    for ep_n, ep in enumerate(episodes):
+        homes = {idx_to_split[i] for i in ep if i in idx_to_split}
+        for h in homes:
+            group_counts[h].add(ep_n)
+        if len(homes) > 1:
+            group_overlap.append((ep_n, sorted(homes)))
+
+    class_dist = {}
+    for name, idxs in splits.items():
+        d: dict[str, int] = defaultdict(int)
+        for i in idxs:
+            d[metas[i].label] += 1
+        class_dist[name] = dict(sorted(d.items()))
+
+    id_by_split = {name: {identities[i] for i in idxs} for name, idxs in splits.items()}
+    path_overlap = 0
+    path_examples: list[tuple[str, str, object]] = []
+    for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
+        inter = id_by_split[a] & id_by_split[b]
+        path_overlap += len(inter)
+        for x in list(inter)[:3]:
+            path_examples.append((a, b, x))
+
+    return {
+        "sample_counts": {n: len(s) for n, s in splits.items()},
+        "group_counts": {n: len(s) for n, s in group_counts.items()},
+        "class_dist": class_dist,
+        "group_overlap_count": len(group_overlap),
+        "group_overlap_examples": group_overlap[:5],
+        "path_overlap_count": path_overlap,
+        "path_overlap_examples": path_examples,
+    }
+
+
+def print_split_report(summary: dict, *, episode_gap_sec: float) -> None:
+    """Loud, explicit leakage report (acceptance: zero group/path overlap)."""
+    print("\n=== train/val/test split report ===")
+    print("split method: episode-grouped (whole visit → one split, never per-crop)")
+    print(f"group key:    camera_id + consecutive wall_ms gap <= {episode_gap_sec:g}s")
+    sc, gc = summary["sample_counts"], summary["group_counts"]
+    for name in ("train", "val", "test"):
+        print(f"  {name:<5} samples={sc[name]:<6} groups={gc[name]:<5} "
+              f"classes={summary['class_dist'][name]}")
+    print(f"group overlap (episodes spanning splits): {summary['group_overlap_count']}")
+    if summary["group_overlap_examples"]:
+        print(f"  examples: {summary['group_overlap_examples']}")
+    print(f"path/image overlap (same crop in two splits): {summary['path_overlap_count']}")
+    if summary["path_overlap_examples"]:
+        print(f"  examples: {summary['path_overlap_examples']}")
+    if summary["group_overlap_count"] or summary["path_overlap_count"]:
+        raise SystemExit(
+            "LEAKAGE DETECTED: train/val/test share groups or crops — refusing to "
+            "train on a contaminated split (see report above)."
+        )
+    print("leakage check: OK (0 group overlap, 0 path overlap)\n")
 
 
 def _evenly_spaced(indices: list[int], quota: int) -> list[int]:
@@ -515,9 +599,11 @@ def main() -> None:
                     help="reviews.db with human corrections (strongly recommended)")
     ap.add_argument("--camera", default=None)
     ap.add_argument("--model", default=None, help="detector model filter (default: all)")
-    ap.add_argument("--confuse", default="",
-                    help="OPTIONAL pair to highlight in the confusion matrix "
-                         "(e.g. alisa,felisis); does NOT affect trust or split")
+    ap.add_argument("--confuse", default="alisa,felisis",
+                    help="pair whose directional confusion is reported and used to "
+                         "break ties in model selection (feeder safety: felisis→alisa is "
+                         "critical). Default alisa,felisis; ignored if absent from labels. "
+                         "Does NOT affect trust or split")
     ap.add_argument("--trust-classifier", action="store_true",
                     help="also use classifier labels for unreviewed crops (OFF by "
                         "default — human labels only for cold start)")
@@ -583,6 +669,13 @@ def main() -> None:
     ap.add_argument("--num-workers", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--min-recall", type=float, default=0.9,
                     help="PASS/FAIL gate: every class (incl. confuse) needs val recall >= this")
+    ap.add_argument("--augment", choices=list(AUG_LEVELS), default="light",
+                    help="on-the-fly TRAIN augmentation level (val/test stay clean): "
+                         "off = deterministic (no augmentation); light (default) / medium "
+                         "= mild, identity-preserving jitter (no flips, no 90/180, no hard crop)")
+    ap.add_argument("--preview-augmentations", type=Path, default=None,
+                    help="debug only: save a grid of original + augmented versions of a few "
+                         "train crops to this dir, then continue. Never written into the dataset")
     ap.add_argument("--out-root", type=Path, default=ROOT / "models/trained")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -790,6 +883,18 @@ def main() -> None:
             len(test_idx), raw_split_sizes[2],
         )
 
+    # Loud, explicit leakage/distribution report; raises if any overlap is found.
+    def _crop_identity(item, i):
+        box = getattr(getattr(item, "ref", None), "box", None)
+        return getattr(box, "rowid", None) if box is not None else f"idx:{i}"
+    print_split_report(
+        summarize_split(
+            episodes, train_idx, val_idx, test_idx, fresh_metas,
+            identities=[_crop_identity(it, i) for i, it in enumerate(fresh_items)],
+        ),
+        episode_gap_sec=args.episode_gap_sec,
+    )
+
     # --- cross-source leakage guard: replay crops must not duplicate val/test ---
     # Replay memory is train-only, but a replay crop is an old fresh crop; if the
     # same event (or a near-duplicate) is in val/test, training on it leaks. We
@@ -865,15 +970,20 @@ def main() -> None:
     if not val_idx:
         raise SystemExit("validation split is empty; reduce --test-frac or add more episodes")
 
-    # --- transforms: train augments; val is byte-identical to runtime ---
-    train_pipe = T.Compose([
-        T.RandomResizedCrop(224, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-        T.RandomHorizontalFlip(),
-        T.RandomRotation(10),
-        T.ColorJitter(brightness=0.2, contrast=0.2),   # no hue/sat: IR is ~grayscale
-        T.ToTensor(),
-        T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
+    # --- transforms: TRAIN augments on-the-fly; VAL/TEST stay clean & deterministic ---
+    # Augmentation is identity-preserving (no flips, no 90/180, no hard crop) so it
+    # can't erase the left/right markings that separate look-alike cats. See
+    # training/augment.py. Eval is byte-identical to the detector runtime.
+    spec = augment_spec(args.augment)
+    log.info(
+        "augmentation: level=%s random=%s (rotation=%.0f° translate=%.0f%% scale=%.2f-%.2f "
+        "brightness=%.2f contrast=%.2f noise=%.3f blur_p=%.2f; flips=OFF quarter_turns=OFF "
+        "hard_crop=OFF)",
+        spec.level, spec.is_random, spec.rotation_deg, spec.translate_frac * 100,
+        spec.scale_min, spec.scale_max, spec.brightness, spec.contrast,
+        spec.noise_std, spec.blur_prob,
+    )
+    train_pipe = build_train_transform(args.augment, IMAGENET_MEAN, IMAGENET_STD)
 
     def train_tf(img_bgr):
         from PIL import Image
@@ -921,6 +1031,41 @@ def main() -> None:
         if not xs:
             return None
         return torch.stack(xs), torch.tensor(ys, dtype=torch.long)
+
+    # --- optional augmentation preview (debug only; never written to dataset) ---
+    if args.preview_augmentations:
+        from training.augment import build_eval_transform
+        sample = train_idx[:6]
+        bgr_by_pos: dict[int, np.ndarray] = {}
+        pending_refs, pending_pos = [], []
+        for pos, j in enumerate(sample):
+            it = items[j]
+            if it.image is not None:
+                bgr_by_pos[pos] = it.image
+            elif getattr(it, "replay", None) is not None:
+                img = decode_replay_image(it.replay, missing_ok=True)
+                if img is not None:
+                    bgr_by_pos[pos] = img
+            elif getattr(it, "ref", None) is not None:
+                pending_refs.append(it.ref)
+                pending_pos.append(pos)
+        if pending_refs:
+            for pos, img in zip(pending_pos, decode_crop_batch(
+                    pending_refs, args.recordings, pad_frac=args.pad_frac,
+                    indices=segment_indices)):
+                if img is not None:
+                    bgr_by_pos[pos] = img
+        crops_rgb = [np.ascontiguousarray(bgr_by_pos[p][..., ::-1])
+                     for p in range(len(sample)) if p in bgr_by_pos]
+        if crops_rgb:
+            written = save_augmentation_preview(
+                args.preview_augmentations, crops_rgb, train_pipe,
+                build_eval_transform(IMAGENET_MEAN, IMAGENET_STD),
+            )
+            log.info("wrote %d augmentation preview grid(s) to %s",
+                     len(written), args.preview_augmentations)
+        else:
+            log.warning("preview-augmentations: could not decode any sample crops")
 
     def predict_indices(indices: list[int]):
         y_true: list[int] = []

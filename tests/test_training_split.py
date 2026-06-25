@@ -5,9 +5,13 @@ from training.train_classifier import (
     Meta,
     build_episodes,
     check_split_leakage,
+    confuse_cross_errors,
+    confusion,
     decide_label,
+    print_report,
     sample_indices_for_training,
     split_episodes,
+    summarize_split,
     supported_macro_recall,
 )
 
@@ -106,3 +110,56 @@ def test_discard_and_unknown_are_not_classifier_labels():
     assert decide_label(None, None, "unknown", False, 0.9) is None
     assert decide_label("alisa", 0.99, None, False, 0.9) is None
     assert decide_label("alisa", 0.99, None, True, 0.9) == "alisa"
+
+
+def test_summarize_split_reports_zero_overlap_for_clean_split():
+    metas = [
+        Meta("alisa", "grey", 1_000),
+        Meta("alisa", "grey", 2_000),
+        Meta("chuzh", "grey", 200_000),
+        Meta("chuzh", "grey", 201_000),
+        Meta("ellie", "other", 1_000),
+        Meta("ellie", "other", 2_000),
+    ]
+    episodes = build_episodes(metas, gap_ms=60_000)
+    # whole episodes to distinct splits → clean
+    s = summarize_split(
+        episodes, train_idx=[0, 1], val_idx=[2, 3], test_idx=[4, 5], metas=metas,
+        identities=[f"row{i}" for i in range(len(metas))],
+    )
+    assert s["group_overlap_count"] == 0
+    assert s["path_overlap_count"] == 0
+    assert s["sample_counts"] == {"train": 2, "val": 2, "test": 2}
+    assert s["group_counts"] == {"train": 1, "val": 1, "test": 1}
+    assert s["class_dist"]["train"] == {"alisa": 2}
+
+
+def test_summarize_split_detects_group_and_path_overlap():
+    metas = [Meta("alisa", "grey", 1_000), Meta("alisa", "grey", 2_000)]
+    episodes = [[0, 1]]
+    # Same episode straddles train/val AND the same identity is reused.
+    s = summarize_split(
+        episodes, train_idx=[0], val_idx=[1], test_idx=[], metas=metas,
+        identities=["dup", "dup"],
+    )
+    assert s["group_overlap_count"] == 1
+    assert s["path_overlap_count"] >= 1
+
+
+def test_metrics_report_alisa_felisis_directional_confusion(capsys):
+    classes = ["alisa", "chuzh", "felisis"]
+    # 2 true alisa predicted felisis; 1 true felisis predicted alisa.
+    y_true = [0, 0, 0, 2, 2]
+    y_pred = [0, 2, 2, 0, 2]
+    cm = confusion(y_true, y_pred, len(classes))
+    confuse = {"alisa", "felisis"}
+
+    out = print_report(cm, classes, confuse)
+    printed = capsys.readouterr().out
+
+    # directional cells: alisa→felisis = 2, felisis→alisa = 1
+    assert cm[0, 2] == 2 and cm[2, 0] == 1
+    assert confuse_cross_errors(cm, classes, confuse) == 3
+    assert "alisa" in printed and "felisis" in printed
+    assert "cross-errors=3" in printed
+    assert out["confusion_matrix"] == cm.tolist()
