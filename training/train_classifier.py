@@ -50,6 +50,7 @@ from training.augment import (
     build_train_transform,
     save_augmentation_preview,
 )
+from training.mltracking import start_run
 
 log = logging.getLogger("training.train_classifier")
 
@@ -1124,6 +1125,34 @@ def main() -> None:
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
     criterion = nn.CrossEntropyLoss(weight=ce_weight)
 
+    # --- experiment tracking (MLflow if installed; transparent no-op otherwise) ---
+    run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run = start_run(
+        "cat_classifier",
+        run_name=run_stamp,
+        params={
+            "augment": args.augment,
+            "epochs": args.epochs, "lr": lr, "batch_size": args.batch_size,
+            "val_frac": args.val_frac, "test_frac": args.test_frac,
+            "episode_gap_sec": args.episode_gap_sec, "seed": args.seed,
+            "finetune_mode": finetune_mode, "model": "efficientnet_b0",
+            "classes": ",".join(classes), "num_classes": len(classes),
+            "confuse": ",".join(sorted(confuse)),
+            "trust_classifier": args.trust_classifier,
+            "min_recall_gate": args.min_recall,
+            "train_crops": len(train_idx), "val_crops": len(val_idx),
+            "test_crops": len(test_idx), "n_episodes": len(episodes),
+            "replay_count": len(replay_metas),
+            **{f"aug_{k}": v for k, v in vars(spec).items()},
+        },
+        tags={
+            "split_method": "episode-grouped (camera + wall_ms gap)",
+            "group_key": f"camera_id + wall_ms gap <= {args.episode_gap_sec:g}s",
+            "augment_random": spec.is_random,
+        },
+    )
+    run.log_metrics({f"train_count_{c}": int(n) for c, n in zip(classes, counts)})
+
     # --- train loop with best-by-(macro-recall, fewest confuse cross-errors) ---
     best = {"macro_recall": -1.0, "cross": 10**9, "state": None, "metrics": None, "epoch": -1}
     since_improved = 0
@@ -1158,6 +1187,11 @@ def main() -> None:
         cross = confuse_cross_errors(cm, classes, confuse)
         log.info("epoch %02d  train_loss=%.4f  val_macro_recall=%.3f  confuse_cross=%d",
                  epoch, running / max(1, seen), macro, cross)
+        run.log_metrics({
+            "train_loss": running / max(1, seen),
+            "val_macro_recall": macro,
+            "val_confuse_cross_errors": cross,
+        }, step=epoch)
 
         improved = (macro > best["macro_recall"] + 1e-6 or
                     (abs(macro - best["macro_recall"]) <= 1e-6 and cross < best["cross"]))
@@ -1225,6 +1259,34 @@ def main() -> None:
     print(f"\nsaved best model -> {pt_path}")
     print(f"metadata         -> {out_dir / 'metadata.json'}")
 
+    # --- log final metrics + artifacts to the experiment tracker ---
+    def _log_eval(prefix: str, mtr: dict | None, cmat) -> None:
+        if not mtr:
+            return
+        flat = {
+            f"{prefix}_overall_accuracy": mtr["overall_accuracy"],
+            f"{prefix}_macro_recall": mtr["macro_recall"],
+        }
+        for c, v in mtr["recall"].items():
+            flat[f"{prefix}_recall_{c}"] = v
+        for c, v in mtr["precision"].items():
+            flat[f"{prefix}_precision_{c}"] = v
+        cs = [c for c in sorted(confuse) if c in classes]
+        if len(cs) == 2:
+            a, b = classes.index(cs[0]), classes.index(cs[1])
+            flat[f"{prefix}_{cs[0]}_to_{cs[1]}"] = int(cmat[a, b])
+            flat[f"{prefix}_{cs[1]}_to_{cs[0]}"] = int(cmat[b, a])
+        run.log_metrics(flat)
+
+    _log_eval("val", metrics, cm)
+    if test_metrics is not None:
+        _log_eval("test", test_metrics, test_cm)
+    run.log_metric("best_epoch", best["epoch"])
+    run.log_artifact(pt_path)
+    run.log_artifact(out_dir / "metadata.json")
+    if args.preview_augmentations and Path(args.preview_augmentations).exists():
+        run.log_artifact(args.preview_augmentations, artifact_path="aug_preview")
+
     # --- PASS/FAIL guard (loud warning on FAIL; do NOT crash) ---
     _, rec = per_class_pr(cm)
     support = cm.sum(axis=1)
@@ -1255,6 +1317,10 @@ def main() -> None:
     else:
         print(f"\nPASS — every class recall >= {args.min_recall} (incl. the confuse pair). "
               "Model is a production candidate (export + swap is a separate step).")
+
+    run.log_metric("val_pass", 0.0 if failing else 1.0)
+    run.set_tags({"result": "FAIL" if failing else "PASS"})
+    run.end()
 
 
 if __name__ == "__main__":

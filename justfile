@@ -198,6 +198,13 @@ train-run *ARGS:
         --reviews-db "{{review_db}}" \
         {{ARGS}}
 
+# Browse MLflow experiment runs from the local file store (./data/mlflow).
+# Alternatively `just up` runs the `mlflow` container UI on $MLFLOW_PORT (5000).
+[group('train')]
+mlflow-ui PORT="5000":
+    {{CLASSIFIER_RUN}} python -m mlflow ui \
+        --backend-store-uri "data/mlflow" --port {{PORT}}
+
 # Build/update compact replay memory from human-reviewed crops.
 [group('train')]
 train-replay-set *ARGS:

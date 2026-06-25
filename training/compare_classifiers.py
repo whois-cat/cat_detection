@@ -303,6 +303,48 @@ def main() -> None:
         args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"wrote {args.out}")
 
+    # --- experiment tracking: parent run + one nested run per candidate ---
+    from training.mltracking import start_run
+    parent = start_run(
+        "compare_classifiers",
+        params={
+            "n": len(primary_true),
+            "classes": ",".join(sorted(set(primary_true))),
+            "baseline": args.baseline or "",
+            "thresholds": args.thresholds,
+            "report_threshold": threshold_key,
+            "candidates": ",".join(name for name, _ in args.candidate),
+            "replay_n": len(replay_true),
+        },
+    )
+    try:
+        for name, m in results.items():
+            cand = start_run("compare_classifiers", run_name=name, nested=True,
+                             params={"candidate": name})
+            try:
+                flat = {
+                    "accuracy": m["accuracy"],
+                    "macro_recall": m["macro_recall"],
+                    "min_recall": m["min_recall"],
+                }
+                t = m["thresholds"].get(threshold_key)
+                if t:
+                    flat["coverage_at_thr"] = t["coverage"]
+                    flat["acc_when_conf_at_thr"] = t["accuracy_when_confident"]
+                    flat["high_conf_wrong_at_thr"] = t["high_conf_wrong"]
+                rm = replay_results.get(name)
+                if rm:
+                    flat["replay_accuracy"] = rm["accuracy"]
+                    flat["replay_macro_recall"] = rm["macro_recall"]
+                    flat["replay_min_recall"] = rm["min_recall"]
+                cand.log_metrics(flat)
+            finally:
+                cand.end()
+        if args.out:
+            parent.log_artifact(args.out)
+    finally:
+        parent.end()
+
 
 if __name__ == "__main__":
     main()

@@ -16,6 +16,10 @@ mediamtx/mediamtx.yml
 webui/nginx.conf
 webui/public/cameras.json
 
+# MLflow tracking. The default store lives under data/ (already ignored above);
+# mlruns/ guards against a run started from a different cwd.
+mlruns/
+
 # Python
 __pycache__/
 *.py[cod]

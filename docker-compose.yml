@@ -80,6 +80,24 @@ services:
       # "beidge" from ever being re-indexed. Override via env if cameras change.
       RECORDINGS_CAMERAS: ${RECORDINGS_CAMERAS:-beige,grey}
 
+  # MLflow experiment-tracking UI over the local file store that the training
+  # scripts write to (./data/mlflow). Training itself runs on the host and logs
+  # straight to that dir by default; this service is just the browser UI. To
+  # route training THROUGH the server (so artifacts resolve in the web UI too),
+  # run training with MLFLOW_TRACKING_URI=http://localhost:${MLFLOW_PORT:-5000}.
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.17.2
+    restart: unless-stopped
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - ./data/mlflow:/mlflow
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri file:/mlflow
+      --artifacts-destination file:/mlflow/artifacts
+      --serve-artifacts
+
   webui:
     build: ./webui
     restart: unless-stopped

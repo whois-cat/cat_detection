@@ -26,7 +26,7 @@ yolo       = ["ultralytics"]
 # Linux-only CPU-index build (e.g. torchvision==X+<hash>) which has no macOS
 # wheel and the install fails. torch 2.5.1 / torchvision 0.20.1 ship both
 # macOS-arm64 (PyPI) and Linux CPU-index wheels.
-classifier = ["torch==2.5.1", "torchvision==0.20.1", "scikit-learn"]
+classifier = ["torch==2.5.1", "torchvision==0.20.1", "scikit-learn", "mlflow>=2.14"]
 # Stage B label-review web app (see ../review/requirements.txt). Decode-only —
 # deliberately no openvino/torch; av+numpy come from the base deps above.
 review     = ["fastapi", "uvicorn", "Pillow"]
