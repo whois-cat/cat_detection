@@ -35,7 +35,8 @@
   .crop img { width:100%; aspect-ratio:1/1; object-fit:contain; display:block; border-radius:4px; background:#08090d; }
   .crop small { color:var(--muted); font:11px/1.2 ui-monospace, monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #grid.loading { opacity:.35; }
-  .mode { display:flex; gap:8px; }
+  .mode { display:flex; gap:8px; flex-wrap:wrap; }
+  .mode button { flex:1 1 auto; }
   button { background:#1d2230; color:var(--fg); border:1px solid var(--line); border-radius:7px;
            padding:9px 11px; cursor:pointer; font:inherit; }
   button:hover { border-color:var(--accent); }
@@ -80,16 +81,20 @@
   details.advanced[open] > summary::before { content:'▾ '; }
   details.advanced[open] > summary { color:var(--fg); }
   details.advanced .body { display:grid; gap:8px; padding:8px 0 2px; }
+  .hgroup { display:flex; align-items:center; gap:10px; }
+  .hgroup.sep { border-left:1px solid var(--line); padding-left:16px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>cat cluster review</h1>
-  <span id="title" class="hint"></span>
+  <div class="hgroup">
+    <h1>cat cluster review</h1>
+    <span id="title" class="hint"></span>
+  </div>
   <div class="grow"></div>
-  <div id="bar"><i></i></div>
-  <span id="progress" class="hint">0 / 0</span>
-  <span id="counts" class="hint counts"></span>
+  <div class="hgroup sep"><div id="bar"><i></i></div></div>
+  <div class="hgroup sep"><span id="progress" class="hint">0 / 0</span></div>
+  <div class="hgroup sep"><span id="counts" class="hint counts"></span></div>
 </header>
 <main>
   <nav id="clusters"></nav>
@@ -110,7 +115,7 @@
 
     <!-- Primary (and only) labelling path. -->
     <div class="bulk section">
-      <span class="head">majority with exceptions</span>
+      <span class="head">label with exceptions</span>
       <div class="sel" id="selSummary">selected: 0 / 0</div>
       <div class="grid2">
         <span class="hint">selected →</span>
@@ -121,17 +126,12 @@
       <button class="primary" id="applyBtn" onclick="labelWithExceptions()">apply selected/rest</button>
     </div>
 
-    <!-- Review navigation — deliberately kept apart from labelling actions. -->
+    <!-- View mode — deliberately kept apart from labelling actions. -->
     <div class="section">
-      <span class="head">review navigation</span>
+      <span class="head">view mode</span>
       <div class="mode">
         <button data-mode="representative" onclick="setMode('representative')">representative</button>
-        <button data-mode="random" onclick="setMode('random')">random</button>
         <button data-mode="outliers" onclick="setMode('outliers')">outliers</button>
-        <button data-mode="suspicious" onclick="setMode('suspicious')">suspicious</button>
-      </div>
-      <div class="mode">
-        <button id="dupToggle" onclick="toggleDuplicates()">show duplicates</button>
       </div>
     </div>
 
@@ -143,12 +143,13 @@
           <button onclick="splitCluster(2)">split x2</button>
           <button onclick="splitCluster(3)">split x3</button>
         </div>
-        <span class="hint">assign a label to this cluster / split child:</span>
-        <div class="labels" id="buttons"></div>
       </div>
     </details>
 
-    <div class="hint">keys: click select · shift-click range · a all loaded · i invert · esc clear · 1..N label · x split · m mixed · s skip · ←/→ cluster</div>
+    <details class="advanced">
+      <summary>Keyboard shortcuts</summary>
+      <div class="body hint">click select · shift-click range · a all loaded · i invert · esc clear · 1..N label · x split · m mixed · s skip · ←/→ cluster</div>
+    </details>
   </aside>
 </main>
 <script>
@@ -167,7 +168,6 @@ async function load() {
   ACTIONS = [...M.labels, ...M.extra_labels, 'mixed', 'skip'];
   idx = Math.max(0, M.queue.findIndex(c => !c.status));
   if (idx < 0) idx = 0;
-  renderButtons();
   renderCropLabels();
   renderBulkControls();
   render();
@@ -192,19 +192,6 @@ async function loadCounts() {
 }
 
 function curr() { return M.queue[idx]; }
-
-function renderButtons() {
-  const wrap = document.getElementById('buttons');
-  wrap.innerHTML = '';
-  ACTIONS.forEach((lab, i) => {
-    const b = document.createElement('button');
-    b.className = 'label' + (lab === 'discard' || lab === 'skip' ? ' discard' : '')
-                         + (lab === 'mixed' ? ' mixed' : '');
-    b.innerHTML = `<span class="k">${i + 1}</span><span>${lab}</span>`;
-    b.onclick = () => choose(lab);
-    wrap.appendChild(b);
-  });
-}
 
 function renderBulkControls() {
   const exception = document.getElementById('exceptionLabel');
@@ -283,18 +270,12 @@ function render() {
 	      + (c.parent_id == null ? '' : ` · split from #${c.parent_id}`);
   document.getElementById('clusterStatus').textContent =
       c.status ? `status: ${c.status.status} ${c.status.label || ''}` : 'status: open';
-  document.getElementById('dupToggle').textContent = showDuplicates ? 'hide duplicates' : 'show duplicates';
   document.querySelectorAll('button[data-mode]').forEach(b =>
       b.classList.toggle('activeMode', b.dataset.mode === mode));
   renderGrid(c);
 }
 
 function setMode(next) { mode = next; render(); }
-
-function toggleDuplicates() {
-  showDuplicates = !showDuplicates;
-  render();
-}
 
 async function renderGrid(c) {
   const seq = ++renderSeq;
