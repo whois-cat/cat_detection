@@ -200,14 +200,18 @@ def _review_rows(client):
 
 
 def test_cluster_label_with_exceptions_labels_selected_and_rest(client):
+    # include_hidden=true: selected/rest over the WHOLE cluster (all 6).
     r = client.post("/api/cluster_label_with_exceptions", json={
         "cluster_id": 0,
         "majority_label": "felisis",
         "exceptions": {"discard": ["grey:0", "grey:5"], "chuzh": ["grey:3"]},
+        "include_hidden": True,
     })
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["total_cluster_crops"] == 6
+    assert data["labeled_count"] == 6
+    assert data["include_hidden"] is True
     assert data["majority_labeled_count"] == 3
     assert data["exception_counts"] == {"discard": 2, "chuzh": 1}
 
@@ -221,6 +225,40 @@ def test_cluster_label_with_exceptions_labels_selected_and_rest(client):
     status = client.get("/api/clusters").json()["queue"][0]["status"]
     assert status["status"] == "labeled"
     assert status["label"] == "felisis"
+
+
+def test_label_defaults_to_visible_only(client):
+    # No include_hidden → only the visible crops (grey:0, grey:3) get labelled;
+    # the 4 hidden crops are left untouched.
+    r = client.post("/api/cluster_label_with_exceptions", json={
+        "cluster_id": 0,
+        "majority_label": "felisis",
+        "exceptions": {},
+    })
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["include_hidden"] is False
+    assert data["visible_count"] == 2
+    assert data["hidden_count"] == 4
+    assert data["labeled_count"] == 2
+
+    rows = dict(_review_rows(client))
+    assert rows == {"grey:0": "felisis", "grey:3": "felisis"}
+    for hidden in ("grey:1", "grey:2", "grey:4", "grey:5"):
+        assert hidden not in rows
+
+
+def test_label_include_hidden_labels_every_crop(client):
+    r = client.post("/api/cluster_label_with_exceptions", json={
+        "cluster_id": 0,
+        "majority_label": "felisis",
+        "exceptions": {},
+        "include_hidden": True,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["labeled_count"] == 6
+    rows = dict(_review_rows(client))
+    assert all(rows[f"grey:{k}"] == "felisis" for k in range(6))
 
 
 def test_cluster_label_with_exceptions_rejects_invalid_label_and_camera_names(client):
@@ -288,6 +326,9 @@ def test_items_hide_duplicates_by_default_and_suspicious_mode_orders(client):
 
 
 def test_hidden_duplicate_can_be_overridden_as_exception(client):
+    # grey:2 is a HIDDEN duplicate. Selecting it as an exception still labels it,
+    # even under the default visible-only scope; the other hidden crops (grey:1)
+    # remain untouched.
     r = client.post("/api/cluster_label_with_exceptions", json={
         "cluster_id": 0,
         "majority_label": "alisa",
@@ -295,5 +336,7 @@ def test_hidden_duplicate_can_be_overridden_as_exception(client):
     })
     assert r.status_code == 200, r.text
     rows = dict(_review_rows(client))
-    assert rows["grey:2"] == "discard"
-    assert rows["grey:1"] == "alisa"
+    assert rows["grey:2"] == "discard"          # explicitly selected → labelled
+    assert rows["grey:0"] == "alisa"            # visible → majority
+    assert rows["grey:3"] == "alisa"            # visible → majority
+    assert "grey:1" not in rows                 # hidden, not selected → untouched

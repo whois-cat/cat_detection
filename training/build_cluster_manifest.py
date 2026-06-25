@@ -563,6 +563,26 @@ def default_cluster_count(n: int) -> int:
     return max(8, min(96, round(math.sqrt(n / 4))))
 
 
+def drop_hidden_crops(items: list[dict], clusters: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Return (items, clusters) keeping only ``review_visible`` crops, with
+    cluster ``item_indices`` reindexed into the filtered item list. This is the
+    default for the review manifest (the UI only shows/labels visible crops);
+    ``--keep-hidden-crops`` opts out to keep a lossless manifest."""
+    keep = [i for i, it in enumerate(items) if bool(it.get("review_visible", True))]
+    old_to_new = {old: new for new, old in enumerate(keep)}
+    new_items = [items[i] for i in keep]
+    new_clusters = []
+    for c in clusters:
+        idxs = [old_to_new[i] for i in c["item_indices"] if i in old_to_new]
+        nc = dict(c)
+        nc["item_indices"] = idxs
+        nc["size"] = len(idxs)
+        nc["visible_count"] = len(idxs)
+        nc["hidden_duplicate_count"] = 0
+        new_clusters.append(nc)
+    return new_items, new_clusters
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", type=Path, required=True, help="events.db")
@@ -612,6 +632,11 @@ def main() -> None:
     ap.add_argument("--max-cluster-size", type=int, default=96,
                     help="max crops shown by default per cluster after review "
                          "sampling; raw crops remain in the manifest; 0 disables")
+    ap.add_argument("--keep-hidden-crops", action="store_true",
+                    help="keep hidden/collapsed/near-duplicate crops in clusters.json "
+                         "(lossless manifest). By DEFAULT they are dropped, so the "
+                         "review manifest contains only the crops the UI actually "
+                         "shows and labels.")
     ap.add_argument("--ignore-config", type=Path, default=ROOT / "cameras.yaml",
                     help="camera config with ignore_regions (default: cameras.yaml)")
     ap.add_argument("--no-ignore-config", action="store_true",
@@ -882,11 +907,31 @@ def main() -> None:
         "clusters": clusters,
     }
 
+    # Crop accounting (before any visible-only filtering).
+    total_crops = len(items)
+    visible_crops = sum(1 for it in items if bool(it.get("review_visible", True)))
+    hidden_crops = total_crops - visible_crops
+
+    # Default: the review manifest carries ONLY the crops the UI shows/labels.
+    # Hidden/collapsed/near-duplicate crops are dropped unless --keep-hidden-crops.
+    drop_hidden = not args.keep_hidden_crops
+    if drop_hidden:
+        items, clusters = drop_hidden_crops(items, clusters)
+        out["items"] = items
+        out["clusters"] = clusters
+    out["params"]["visible_only"] = drop_hidden
+
+    written = len(items)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out, separators=(",", ":")), encoding="utf-8")
     print(
-        f"wrote {len(items)} crops in {len(clusters)} clusters to {args.out} "
+        f"wrote {written} crops in {len(clusters)} clusters to {args.out} "
         f"(detector min_score={args.min_score})"
+    )
+    print(
+        f"[cluster] crops: source={total_crops} visible={visible_crops} "
+        f"hidden={hidden_crops} written={written} "
+        f"hidden_crops={'DROPPED (review manifest = visible only)' if drop_hidden else 'kept (--keep-hidden-crops)'}"
     )
 
 

@@ -547,15 +547,18 @@ async def api_cluster_review(payload: dict) -> JSONResponse:
 @app.post("/api/cluster_label_with_exceptions")
 async def api_cluster_label_with_exceptions(payload: dict) -> JSONResponse:
     """Atomically label selected exception crops as X and every remaining crop
-    in the cluster as Y.
+    as Y.
 
-    This is the main review workflow for mostly-clean clusters: users select a
-    few wrong/garbage crops, give those concrete labels, then label the rest as
-    the majority cat in one transaction.
+    By default this only touches the cluster's **visible** crops (plus any crop
+    explicitly selected as an exception): the reviewer eyeballed the visible
+    crops, so we never silently label the hidden/collapsed ones. Pass
+    ``include_hidden: true`` to also label the hidden crops — the UI gates that
+    behind a separate, confirmed secondary action.
     """
     cluster_id = int(payload.get("cluster_id"))
     majority_label = payload.get("majority_label")
     exceptions = payload.get("exceptions") or {}
+    include_hidden = bool(payload.get("include_hidden", False))
     cluster = _cluster_by_id(cluster_id)
     if cluster is None:
         raise HTTPException(status_code=404, detail="unknown cluster")
@@ -586,13 +589,23 @@ async def api_cluster_label_with_exceptions(payload: dict) -> JSONResponse:
             exception_label_by_crop[crop_id] = label
         exception_counts[label] = exception_counts.get(label, 0) + len(crop_ids)
 
+    # Target set: visible crops only by default, plus any explicitly selected
+    # exception crop (which may be a revealed duplicate). include_hidden widens
+    # it to every member.
+    exc_crops = set(exception_label_by_crop)
+    target_items = [
+        item for item in members
+        if include_hidden
+        or bool(item.get("review_visible", True))
+        or item["crop_id"] in exc_crops
+    ]
+
     now = datetime.now(timezone.utc).isoformat()
     majority_count = 0
     with _db_lock:
         try:
             _conn.execute("BEGIN")
-            for idx in cluster["item_indices"]:
-                item = ITEMS[idx]
+            for item in target_items:
                 label = exception_label_by_crop.get(item["crop_id"], majority_label)
                 if label == majority_label:
                     majority_count += 1
@@ -609,11 +622,16 @@ async def api_cluster_label_with_exceptions(payload: dict) -> JSONResponse:
         except Exception:
             _conn.rollback()
             raise
+    counts = _cluster_counts(cluster)
     return JSONResponse({
         "ok": True,
         "cluster_id": cluster_id,
         "majority_label": majority_label,
+        "include_hidden": include_hidden,
         "total_cluster_crops": len(members),
+        "visible_count": counts["visible_count"],
+        "hidden_count": counts["hidden_count"],
+        "labeled_count": len(target_items),
         "majority_labeled_count": majority_count,
         "exception_counts": exception_counts,
         "status": "labeled",

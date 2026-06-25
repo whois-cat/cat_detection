@@ -3,8 +3,41 @@ import numpy as np
 from training.build_cluster_manifest import (
     annotate_review_metadata,
     compact_items_to_clusters,
+    drop_hidden_crops,
     thin_cluster_members,
 )
+
+
+def test_drop_hidden_crops_keeps_visible_and_reindexes():
+    items = [
+        {"crop_id": "a", "review_visible": True},
+        {"crop_id": "b", "review_visible": False},   # hidden
+        {"crop_id": "c", "review_visible": True},
+        {"crop_id": "d", "review_visible": False, "is_duplicate": True},  # hidden dup
+    ]
+    clusters = [{
+        "cluster_id": 0, "size": 4, "item_indices": [0, 1, 2, 3],
+        "visible_count": 2, "hidden_duplicate_count": 1,
+        "representatives": ["a", "c"],
+    }]
+
+    new_items, new_clusters = drop_hidden_crops(items, clusters)
+
+    assert [it["crop_id"] for it in new_items] == ["a", "c"]
+    nc = new_clusters[0]
+    assert nc["item_indices"] == [0, 1]          # reindexed into the filtered list
+    assert nc["size"] == 2 and nc["visible_count"] == 2
+    assert nc["hidden_duplicate_count"] == 0
+    assert nc["representatives"] == ["a", "c"]   # representatives are visible → kept
+
+
+def test_drop_hidden_crops_defaults_missing_flag_to_visible():
+    items = [{"crop_id": "a"}, {"crop_id": "b", "review_visible": False}]
+    clusters = [{"cluster_id": 0, "size": 2, "item_indices": [0, 1],
+                 "visible_count": 1, "hidden_duplicate_count": 0, "representatives": ["a"]}]
+    new_items, new_clusters = drop_hidden_crops(items, clusters)
+    assert [it["crop_id"] for it in new_items] == ["a"]
+    assert new_clusters[0]["item_indices"] == [0]
 
 
 def test_thin_cluster_members_keeps_center_outlier_and_time_spread():
