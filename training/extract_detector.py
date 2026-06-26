@@ -13,7 +13,7 @@ Output layout (drop-in for Ultralytics' YOLO trainer):
 
 `data.yaml` is written with the classes seen in the events DB (or those
 passed via --classes). A single class "cat" is the common case; with
-fine-tuned per-cat labels you'd pass --classes alisa,chuzh,ellie,felisis.
+fine-tuned per-cat labels you'd pass --classes cat_a,cat_b,cat_c.
 
 Train a fine-tuned YOLO on it:
 

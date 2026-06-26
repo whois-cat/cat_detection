@@ -48,8 +48,8 @@ RECONCILE_INTERVAL_SEC = float(os.environ.get("RECONCILE_INTERVAL_SEC", "300")) 
 STARTUP_LOOKBACK_SEC  = float(os.environ.get("STARTUP_LOOKBACK_SEC", str(24 * 3600)))
 MIN_STABLE_AGE_SEC    = float(os.environ.get("MIN_STABLE_AGE_SEC", str(DEFAULT_MIN_STABLE_AGE_MS / 1000)))
 
-# Optional allow-list. Empty => index every camera dir found. Defends against a
-# deleted/typo camera dir ever being re-indexed (e.g. the old "beidge" typo).
+# Optional allow-list. Empty => index every camera dir found. Set it to defend
+# against a stale/typo camera dir ever being re-indexed (e.g. a renamed camera).
 RECORDINGS_CAMERAS = {
     c.strip() for c in os.environ.get("RECORDINGS_CAMERAS", "").split(",") if c.strip()
 } or None
@@ -131,8 +131,8 @@ def catchup_since_ms(conn, camera: str, now_ms: int) -> int:
 def resolve_cameras(conn) -> list[str]:
     """Cameras to catch up at startup. Prefer the explicit allow-list; otherwise
     fall back to the union of on-disk camera dirs and already-indexed cameras.
-    With the allow-list set (RECORDINGS_CAMERAS=beige,grey) a deleted typo dir
-    like ``beidge`` is never touched."""
+    With the allow-list set (RECORDINGS_CAMERAS=cam1,cam2) a stale/renamed dir
+    outside it is never touched."""
     if RECORDINGS_CAMERAS:
         return sorted(RECORDINGS_CAMERAS)
     cams: set[str] = set()

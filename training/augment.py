@@ -2,10 +2,10 @@
 
 This is *identity* classification, not generic object classification: left/right
 coat markings, tail shape, ear/head visibility and texture carry the signal that
-separates visually similar cats (e.g. alisa vs felisis). So the augmentation
-here is deliberately conservative — it must not flip, quarter-turn, hard-crop or
-heavily recolour a crop, because any of those can erase the very cues the model
-needs and make alisa↔felisis confusion *worse*.
+separates visually similar individuals. So the augmentation here is deliberately
+conservative — it must not flip, quarter-turn, hard-crop or heavily recolour a
+crop, because any of those can erase the very cues the model needs and make
+confusion between look-alike individuals *worse*.
 
 Two layers, on purpose:
 

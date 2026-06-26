@@ -4,15 +4,14 @@ Output layout (drop-in for torchvision.datasets.ImageFolder):
 
     out_dir/
         train/
-            alisa/ ... .jpg
-            chuzh/ ... .jpg
-            ellie/ ... .jpg
-            felisis/ ... .jpg
+            cat_a/ ... .jpg
+            cat_b/ ... .jpg
+            cat_c/ ... .jpg
         val/
-            alisa/ ... .jpg
+            cat_a/ ... .jpg
             ...
         test/
-            alisa/ ... .jpg
+            cat_a/ ... .jpg
             ...
 
 Filename: <wall_ms>_<camera>_<model>_<track_id>.jpg. wall_ms first so a sort

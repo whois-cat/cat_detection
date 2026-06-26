@@ -2,12 +2,18 @@ import numpy as np
 import pytest
 
 from training.train_classifier import (
+    DangerousConfusion,
     Meta,
     build_episodes,
     check_split_leakage,
-    confuse_cross_errors,
     confusion,
+    dangerous_confusion_report,
+    dangerous_from_confuse,
     decide_label,
+    per_camera_confusion,
+    per_class_f1,
+    per_class_pr,
+    per_group_accuracy,
     print_report,
     sample_indices_for_training,
     split_episodes,
@@ -146,20 +152,96 @@ def test_summarize_split_detects_group_and_path_overlap():
     assert s["path_overlap_count"] >= 1
 
 
-def test_metrics_report_alisa_felisis_directional_confusion(capsys):
-    classes = ["alisa", "chuzh", "felisis"]
-    # 2 true alisa predicted felisis; 1 true felisis predicted alisa.
-    y_true = [0, 0, 0, 2, 2]
-    y_pred = [0, 2, 2, 0, 2]
+def test_confusion_matrix_is_dynamic_nxn():
+    # Arbitrary class count → NxN matrix from the label list, never fixed 4x4.
+    for n in (2, 3, 5, 7):
+        classes = [f"cat_{i}" for i in range(n)]
+        cm = confusion([0] * n, list(range(n)), len(classes))
+        assert cm.shape == (n, n)
+
+
+def test_per_class_precision_recall_f1():
+    classes = ["cat_a", "cat_b", "cat_c"]
+    # cat_a: 2 correct, cat_c: 2 true (1 correct, 1 -> cat_a)
+    y_true = [0, 0, 2, 2]
+    y_pred = [0, 0, 2, 0]
     cm = confusion(y_true, y_pred, len(classes))
-    confuse = {"alisa", "felisis"}
+    prec, rec = per_class_pr(cm)
+    f1 = per_class_f1(prec, rec)
+    # cat_a precision = 2/3, recall = 1.0 → F1 = 0.8
+    assert round(float(f1[0]), 3) == 0.8
+    out = print_report(cm, classes)
+    assert set(out["f1"]) == set(classes)
+    assert "macro_f1" in out
 
-    out = print_report(cm, classes, confuse)
+
+def test_dangerous_confusions_reported_generically(capsys):
+    classes = ["cat_a", "cat_b", "cat_c"]
+    # 2 true cat_b predicted cat_a (the dangerous direction); 1 true cat_a -> cat_b.
+    y_true = [1, 1, 1, 0, 0]
+    y_pred = [0, 0, 1, 1, 0]
+    cm = confusion(y_true, y_pred, len(classes))
+    dangerous = [DangerousConfusion(predicted="cat_a", actual="cat_b",
+                                    reason="cat_a feeder must not open for cat_b")]
+
+    total, details = dangerous_confusion_report(cm, classes, dangerous)
+    assert total == 2
+    assert details[0]["count"] == 2 and details[0]["actual"] == "cat_b"
+
+    out = print_report(cm, classes, dangerous=dangerous)
     printed = capsys.readouterr().out
+    assert out["dangerous_errors"] == 2
+    assert "cat_b → cat_a: 2" in printed
+    assert "feeder must not open" in printed
+    assert "F1" in printed                 # per-class F1 is reported
 
-    # directional cells: alisa→felisis = 2, felisis→alisa = 1
-    assert cm[0, 2] == 2 and cm[2, 0] == 1
-    assert confuse_cross_errors(cm, classes, confuse) == 3
-    assert "alisa" in printed and "felisis" in printed
-    assert "cross-errors=3" in printed
-    assert out["confusion_matrix"] == cm.tolist()
+
+def test_load_dangerous_confusions_from_yaml(tmp_path):
+    from training.train_classifier import load_dangerous_confusions
+    p = tmp_path / "danger.yaml"
+    p.write_text(
+        "dangerous_confusions:\n"
+        "  - predicted: cat_a\n"
+        "    actual: cat_b\n"
+        "    reason: \"cat_a feeder must not open for cat_b\"\n",
+        encoding="utf-8",
+    )
+    dcs = load_dangerous_confusions(p)
+    assert len(dcs) == 1
+    assert dcs[0].predicted == "cat_a" and dcs[0].actual == "cat_b"
+    assert "feeder must not open" in dcs[0].reason
+
+
+def test_load_dangerous_confusions_from_json_list(tmp_path):
+    from training.train_classifier import load_dangerous_confusions
+    p = tmp_path / "danger.json"
+    p.write_text('[{"predicted":"x","actual":"y"}]', encoding="utf-8")  # JSON is valid YAML
+    dcs = load_dangerous_confusions(p)
+    assert len(dcs) == 1 and dcs[0].predicted == "x" and dcs[0].reason == ""
+
+
+def test_dangerous_from_confuse_is_symmetric():
+    dcs = dangerous_from_confuse({"cat_a", "cat_b"})
+    pairs = {(d.actual, d.predicted) for d in dcs}
+    assert pairs == {("cat_a", "cat_b"), ("cat_b", "cat_a")}
+    assert dangerous_from_confuse({"cat_a"}) == []   # needs exactly two
+
+
+def test_per_camera_and_per_group_breakdowns():
+    classes = ["cat_a", "cat_b"]
+    y_true = [0, 0, 1, 1]
+    y_pred = [0, 1, 1, 1]
+    cams = ["cam1", "cam1", "cam2", "cam2"]
+    groups = [10, 10, 20, 20]
+
+    pc = per_camera_confusion(y_true, y_pred, classes, cams)
+    assert set(pc) == {"cam1", "cam2"}
+    assert pc["cam1"]["accuracy"] == 0.5 and pc["cam2"]["accuracy"] == 1.0
+
+    pg = per_group_accuracy(y_true, y_pred, groups)
+    assert pg["n_groups"] == 2
+    assert pg["worst"][0]["group"] == 10        # cam1 group is the worst
+
+    # No metadata → empty, no crash.
+    assert per_camera_confusion(y_true, y_pred, classes, []) == {}
+    assert per_group_accuracy(y_true, y_pred, []) == {}

@@ -14,7 +14,9 @@ events_db   := env_var_or_default("EVENTS_DB",        "data/events/events.db")
 recordings  := env_var_or_default("RECORDINGS_ROOT",  "data/recordings")
 review_db   := env_var_or_default("REVIEW_DB",        "data/review/reviews.db")
 manifest    := env_var_or_default("CLUSTER_MANIFEST", "data/review/clusters.json")
-labels      := env_var_or_default("REVIEW_LABELS",    "alisa,chuzh,ellie,felisis")
+# No hardcoded cat names: set REVIEW_LABELS=name1,name2,... for your cats.
+# When empty, the review UI falls back to the labels baked into the manifest.
+labels      := env_var_or_default("REVIEW_LABELS",    "")
 rec_tz      := env_var_or_default("RECORDING_TZ",     "UTC")
 journal_db  := env_var_or_default("FEED_JOURNAL_DB",  "data/feed_journal/journal.db")
 replay_set  := env_var_or_default("REPLAY_SET",       "data/replay")
@@ -233,7 +235,7 @@ train-compare *ARGS:
 # ──────────────────────────── journal ────────────────────────────
 
 # Show how a cat has been eating (door-open sessions) over the last N days.
-# Example: `just journal-feed alisa 7`
+# Example: `just journal-feed <cat-name> 7`
 [group('journal')]
 journal-feed CAT DAYS="3":
     python3 tools/feed_log.py {{CAT}} --days {{DAYS}} --db {{journal_db}}

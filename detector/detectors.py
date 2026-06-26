@@ -40,7 +40,13 @@ class BrightBlobDetector(Detector):
     density looks like one cat per visit. Reset on no-detection."""
 
     model_name = "blob-dummy"
-    KNOWN_CATS = ["alisa", "chuzh", "ellie", "felisis"]
+    # Synthetic identities for this dev/test detector only. NOT product logic —
+    # override with BLOB_DUMMY_CATS=foo,bar; the generic default keeps real cat
+    # names out of the codebase.
+    KNOWN_CATS = [
+        c.strip() for c in os.environ.get("BLOB_DUMMY_CATS", "cat_a,cat_b,cat_c").split(",")
+        if c.strip()
+    ] or ["cat_a", "cat_b", "cat_c"]
 
     def __init__(self, threshold: int = 240, min_area: int = 500):
         import cv2

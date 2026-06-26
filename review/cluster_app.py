@@ -62,7 +62,10 @@ MAN = _load_manifest()
 ITEMS = MAN["items"]
 BASE_CLUSTERS = MAN["clusters"]
 BY_ID = {it["crop_id"]: it for it in ITEMS}
-LABELS = LABELS_ENV or MAN.get("labels") or ["alisa", "chuzh", "ellie", "felisis"]
+# Labels come from configuration only: REVIEW_LABELS env, else the manifest's
+# own labels. No hardcoded cat names — an empty list here means "set
+# REVIEW_LABELS or rebuild the manifest with --labels".
+LABELS = LABELS_ENV or MAN.get("labels") or []
 
 _db_lock = threading.Lock()
 REVIEW_DB.parent.mkdir(parents=True, exist_ok=True)

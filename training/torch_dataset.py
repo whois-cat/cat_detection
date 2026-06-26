@@ -29,7 +29,7 @@ Usage sketch (per-cat classifier):
     from training import CropSource
     from training.torch_dataset import TorchCachedDataset
 
-    classes = ["alisa", "chuzh", "ellie", "felisis"]
+    classes = ["cat_a", "cat_b", "cat_c"]
     label_idx = {c: i for i, c in enumerate(classes)}
 
     src = CropSource(db_path="data/events/events.db",

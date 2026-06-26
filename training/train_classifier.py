@@ -26,7 +26,7 @@ best epoch; test is held out for the final honest report.
 
 Run:  python -m training.train_classifier --db data/events/events.db \
           --recordings data/recordings --reviews-db data/review/reviews.db \
-          --confuse alisa,felisis
+          --confuse NAME_A,NAME_B      # optional: your look-alike pair
 """
 from __future__ import annotations
 
@@ -400,6 +400,12 @@ def per_class_pr(cm: np.ndarray):
     return precision, recall
 
 
+def per_class_f1(precision: np.ndarray, recall: np.ndarray) -> np.ndarray:
+    denom = precision + recall
+    return np.divide(2 * precision * recall, denom,
+                     out=np.zeros_like(precision), where=denom > 0)
+
+
 def present_class_mask(cm: np.ndarray) -> np.ndarray:
     """Classes with at least one true sample in this eval split."""
     return cm.sum(axis=1) > 0
@@ -414,41 +420,112 @@ def supported_macro_recall(cm: np.ndarray) -> float:
     return float(rec[present].mean())
 
 
-def print_report(cm: np.ndarray, classes: list[str], confuse: set[str]) -> dict:
+@dataclass(frozen=True)
+class DangerousConfusion:
+    """A user-configured confusion that matters (e.g. a feeder safety risk).
+    `predicted` mistaken for the model's output, `actual` the true label."""
+    predicted: str
+    actual: str
+    reason: str = ""
+
+
+def load_dangerous_confusions(path: Path) -> list[DangerousConfusion]:
+    """Load dangerous confusion pairs from a YAML or JSON file. Accepts either a
+    top-level list or a mapping with a ``dangerous_confusions`` key:
+
+        dangerous_confusions:
+          - predicted: cat_a
+            actual: cat_b
+            reason: "cat_a feeder must not open for cat_b"
+    """
+    import yaml  # available in the training env; parses JSON too
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = data.get("dangerous_confusions", [])
+    out: list[DangerousConfusion] = []
+    for item in data or []:
+        out.append(DangerousConfusion(
+            predicted=str(item["predicted"]),
+            actual=str(item["actual"]),
+            reason=str(item.get("reason", "")),
+        ))
+    return out
+
+
+def dangerous_from_confuse(confuse) -> list[DangerousConfusion]:
+    """Back-compat: treat a `--confuse a,b` pair as dangerous in BOTH directions."""
+    cs = sorted(c for c in confuse if c)
+    if len(cs) != 2:
+        return []
+    a, b = cs
+    return [DangerousConfusion(a, b, "configured via --confuse"),
+            DangerousConfusion(b, a, "configured via --confuse")]
+
+
+def dangerous_confusion_report(cm: np.ndarray, classes: list[str],
+                               dangerous) -> tuple[int, list[dict]]:
+    """Count, per configured dangerous pair, how many true-`actual` crops were
+    predicted `predicted`. Returns (total_errors, per-pair details)."""
+    idx = {c: i for i, c in enumerate(classes)}
+    total = 0
+    details: list[dict] = []
+    for dc in dangerous:
+        if dc.predicted not in idx or dc.actual not in idx:
+            continue
+        a, p = idx[dc.actual], idx[dc.predicted]
+        count = int(cm[a, p])
+        support = int(cm[a].sum())
+        total += count
+        details.append({
+            "predicted": dc.predicted, "actual": dc.actual,
+            "count": count, "support": support,
+            "rate": (count / support) if support else 0.0,
+            "reason": dc.reason,
+        })
+    return total, details
+
+
+def print_report(cm: np.ndarray, classes: list[str], confuse: set[str] = frozenset(),
+                 *, dangerous=()) -> dict:
     prec, rec = per_class_pr(cm)
+    f1 = per_class_f1(prec, rec)
     support = cm.sum(axis=1)
     present = present_class_mask(cm)
     macro_recall = supported_macro_recall(cm)
+    macro_f1 = float(f1[present].mean()) if bool(present.any()) else 0.0
     overall = float(np.diag(cm).sum() / max(1, cm.sum()))
 
-    width = max(len(c) for c in classes) + 1
+    width = max((len(c) for c in classes), default=1) + 1
+    # Dynamic N×N confusion matrix — built from the class list, never a fixed size.
     print("\nconfusion matrix (rows=true, cols=pred):")
     print(" " * width + "".join(f"{c[:7]:>8}" for c in classes))
     for i, c in enumerate(classes):
         print(f"{c:<{width}}" + "".join(f"{cm[i, j]:>8d}" for j in range(len(classes))))
 
-    print("\nper-class precision / recall:")
+    print("\nper-class precision / recall / F1:")
     for i, c in enumerate(classes):
         flag = "  <-- confuse" if c in confuse else ""
         if support[i] == 0:
-            print(f"  {c:<{width}} precision=NA     recall=NA   support=0{flag}")
+            print(f"  {c:<{width}} precision=NA     recall=NA     F1=NA     support=0{flag}")
         else:
             print(
-                f"  {c:<{width}} precision={prec[i]:.3f}  "
-                f"recall={rec[i]:.3f}  support={int(support[i])}{flag}"
+                f"  {c:<{width}} precision={prec[i]:.3f}  recall={rec[i]:.3f}  "
+                f"F1={f1[i]:.3f}  support={int(support[i])}{flag}"
             )
     print(
         f"\noverall accuracy = {overall:.3f}   "
-        f"macro recall = {macro_recall:.3f} (present classes only)"
+        f"macro recall = {macro_recall:.3f}   macro F1 = {macro_f1:.3f} "
+        f"(present classes only)"
     )
 
-    # The confusion cells we care about most.
-    conf_list = sorted(confuse)
-    if len(conf_list) == 2 and all(c in classes for c in conf_list):
-        a, b = (classes.index(conf_list[0]), classes.index(conf_list[1]))
-        print(f"alisa↔felisis cell: {classes[a]}→{classes[b]}={cm[a, b]}  "
-              f"{classes[b]}→{classes[a]}={cm[b, a]}  "
-              f"(cross-errors={int(cm[a, b] + cm[b, a])})")
+    dangerous_total, dangerous_details = dangerous_confusion_report(cm, classes, dangerous)
+    if dangerous_details:
+        print("\ndangerous confusions (true → predicted):")
+        for d in dangerous_details:
+            tail = f"  — {d['reason']}" if d["reason"] else ""
+            print(f"  {d['actual']} → {d['predicted']}: {d['count']}/{d['support']} "
+                  f"({d['rate'] * 100:.1f}%){tail}")
+        print(f"  total dangerous errors = {dangerous_total}")
 
     return {
         "classes": classes,
@@ -456,19 +533,61 @@ def print_report(cm: np.ndarray, classes: list[str], confuse: set[str]) -> dict:
         "missing_eval_classes": [classes[i] for i, ok in enumerate(present) if not ok],
         "precision": {c: float(prec[i]) for i, c in enumerate(classes)},
         "recall": {c: float(rec[i]) for i, c in enumerate(classes)},
+        "f1": {c: float(f1[i]) for i, c in enumerate(classes)},
         "support": {c: int(support[i]) for i, c in enumerate(classes)},
         "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
         "overall_accuracy": overall,
         "confusion_matrix": cm.tolist(),
+        "dangerous_confusions": dangerous_details,
+        "dangerous_errors": dangerous_total,
     }
 
 
-def confuse_cross_errors(cm: np.ndarray, classes: list[str], confuse: set[str]) -> int:
-    cs = [c for c in sorted(confuse) if c in classes]
-    if len(cs) != 2:
-        return 0
-    a, b = classes.index(cs[0]), classes.index(cs[1])
-    return int(cm[a, b] + cm[b, a])
+def per_camera_confusion(y_true, y_pred, classes, cameras) -> dict:
+    """Per-camera confusion + accuracy, when camera metadata is available."""
+    if not cameras:
+        return {}
+    by_cam: dict[str, tuple[list, list]] = defaultdict(lambda: ([], []))
+    for t, p, cam in zip(y_true, y_pred, cameras):
+        by_cam[cam][0].append(t)
+        by_cam[cam][1].append(p)
+    out = {}
+    print("\nper-camera accuracy:")
+    for cam in sorted(by_cam, key=str):
+        yt, yp = by_cam[cam]
+        cmc = confusion(yt, yp, len(classes))
+        acc = float(np.diag(cmc).sum() / max(1, cmc.sum()))
+        print(f"  camera {cam}: n={len(yt)} accuracy={acc:.3f}")
+        out[str(cam)] = {"n": len(yt), "accuracy": acc, "confusion_matrix": cmc.tolist()}
+    return out
+
+
+def per_group_accuracy(y_true, y_pred, groups, *, worst: int = 5) -> dict:
+    """Per-group/episode accuracy summary, when group metadata is available.
+    Prints the mean and the worst few groups rather than every group."""
+    if not groups:
+        return {}
+    tally: dict[object, list[int]] = defaultdict(lambda: [0, 0])  # group -> [correct, total]
+    for t, p, g in zip(y_true, y_pred, groups):
+        if g is None:
+            continue
+        tally[g][1] += 1
+        if t == p:
+            tally[g][0] += 1
+    accs = [(g, c / n, n) for g, (c, n) in tally.items() if n > 0]
+    if not accs:
+        return {}
+    mean = sum(a for _, a, _ in accs) / len(accs)
+    accs.sort(key=lambda x: (x[1], -x[2]))  # worst accuracy first
+    print(f"\nper-group/episode accuracy: groups={len(accs)} mean={mean:.3f}")
+    for g, a, n in accs[:worst]:
+        print(f"  worst group {g}: accuracy={a:.3f} (n={n})")
+    return {
+        "n_groups": len(accs),
+        "mean_group_accuracy": mean,
+        "worst": [{"group": g, "accuracy": a, "n": n} for g, a, n in accs[:worst]],
+    }
 
 
 def shrink_bgr_for_batch(img: np.ndarray, max_side: int) -> np.ndarray:
@@ -600,11 +719,15 @@ def main() -> None:
                     help="reviews.db with human corrections (strongly recommended)")
     ap.add_argument("--camera", default=None)
     ap.add_argument("--model", default=None, help="detector model filter (default: all)")
-    ap.add_argument("--confuse", default="alisa,felisis",
-                    help="pair whose directional confusion is reported and used to "
-                         "break ties in model selection (feeder safety: felisis→alisa is "
-                         "critical). Default alisa,felisis; ignored if absent from labels. "
-                         "Does NOT affect trust or split")
+    ap.add_argument("--confuse", default="",
+                    help="OPTIONAL pair of labels (e.g. NAME_A,NAME_B) whose directional "
+                         "confusion is reported and used to break ties in model selection "
+                         "— set this to your safety-critical look-alike pair. Empty by "
+                         "default; ignored if absent from labels. Does NOT affect trust or split")
+    ap.add_argument("--dangerous-confusions", type=Path, default=None,
+                    help="OPTIONAL YAML/JSON file of dangerous confusion pairs "
+                         "(list of {predicted, actual, reason}). Their counts are "
+                         "reported and summed into the model-selection tiebreak.")
     ap.add_argument("--trust-classifier", action="store_true",
                     help="also use classifier labels for unreviewed crops (OFF by "
                         "default — human labels only for cold start)")
@@ -720,6 +843,14 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     confuse = {c.strip() for c in args.confuse.split(",") if c.strip()}
+    # Dangerous confusions: the --confuse pair (both directions) plus any from a
+    # YAML/JSON config. No hardcoded label pairs.
+    dangerous = dangerous_from_confuse(confuse)
+    if args.dangerous_confusions:
+        dangerous += load_dangerous_confusions(args.dangerous_confusions)
+    if dangerous:
+        log.info("dangerous confusions configured: %s",
+                 ", ".join(f"{d.actual}->{d.predicted}" for d in dangerous))
 
     # --- collect crop refs/metadata only; pixels are decoded per batch later ---
     review_rows = load_review_rows(args.reviews_db) if args.reviews_db else {}
@@ -1024,14 +1155,16 @@ def main() -> None:
 
         xs = []
         ys = []
+        kept: list[int] = []   # source item indices, aligned with xs/ys
         for item_index, img in zip(batch_indices, batch_images):
             if img is None:
                 continue
             xs.append(tf(img))
             ys.append(cls_to_idx[metas[item_index].label])
+            kept.append(item_index)
         if not xs:
             return None
-        return torch.stack(xs), torch.tensor(ys, dtype=torch.long)
+        return torch.stack(xs), torch.tensor(ys, dtype=torch.long), kept
 
     # --- optional augmentation preview (debug only; never written to dataset) ---
     if args.preview_augmentations:
@@ -1071,16 +1204,18 @@ def main() -> None:
     def predict_indices(indices: list[int]):
         y_true: list[int] = []
         y_pred: list[int] = []
+        kept: list[int] = []   # source item indices aligned with y_true/y_pred
         with torch.no_grad():
             for batch_indices in index_batches(indices, args.batch_size):
                 batch = make_batch(batch_indices, eval_tf)
                 if batch is None:
                     continue
-                x, y = batch
+                x, y, batch_kept = batch
                 pred = model(x).argmax(1)
                 y_true.extend(y.tolist())
                 y_pred.extend(pred.tolist())
-        return y_true, y_pred
+                kept.extend(batch_kept)
+        return y_true, y_pred, kept
 
     # --- class-imbalance weighting (inverse frequency on TRAIN) ---
     counts = np.bincount([cls_to_idx[metas[j].label] for j in train_idx],
@@ -1138,6 +1273,7 @@ def main() -> None:
             "finetune_mode": finetune_mode, "model": "efficientnet_b0",
             "classes": ",".join(classes), "num_classes": len(classes),
             "confuse": ",".join(sorted(confuse)),
+            "dangerous_confusions": ";".join(f"{d.actual}->{d.predicted}" for d in dangerous),
             "trust_classifier": args.trust_classifier,
             "min_recall_gate": args.min_recall,
             "train_crops": len(train_idx), "val_crops": len(val_idx),
@@ -1167,7 +1303,7 @@ def main() -> None:
             batch = make_batch(batch_indices, train_tf, max_side=args.batch_max_side)
             if batch is None:
                 continue
-            x, y = batch
+            x, y, _ = batch
             optim.zero_grad()
             loss = criterion(model(x), y)
             loss.backward()
@@ -1181,16 +1317,16 @@ def main() -> None:
         log_rss(log, "after-epoch", epoch=epoch)
 
         model.eval()
-        y_true, y_pred = predict_indices(val_idx)
+        y_true, y_pred, _ = predict_indices(val_idx)
         cm = confusion(y_true, y_pred, len(classes))
         macro = supported_macro_recall(cm)
-        cross = confuse_cross_errors(cm, classes, confuse)
-        log.info("epoch %02d  train_loss=%.4f  val_macro_recall=%.3f  confuse_cross=%d",
+        cross = dangerous_confusion_report(cm, classes, dangerous)[0]
+        log.info("epoch %02d  train_loss=%.4f  val_macro_recall=%.3f  dangerous_errors=%d",
                  epoch, running / max(1, seen), macro, cross)
         run.log_metrics({
             "train_loss": running / max(1, seen),
             "val_macro_recall": macro,
-            "val_confuse_cross_errors": cross,
+            "val_dangerous_errors": cross,
         }, step=epoch)
 
         improved = (macro > best["macro_recall"] + 1e-6 or
@@ -1210,16 +1346,25 @@ def main() -> None:
     assert best["state"] is not None
     model.load_state_dict(best["state"])
     model.eval()
-    y_true, y_pred = predict_indices(val_idx)
-    cm = confusion(y_true, y_pred, len(classes))
+    idx_to_episode = {i: ep for ep, crops in enumerate(episodes) for i in crops}
+
+    def full_report(indices):
+        yt, yp, kept = predict_indices(indices)
+        cmx = confusion(yt, yp, len(classes))
+        m = print_report(cmx, classes, confuse, dangerous=dangerous)
+        # Per-camera / per-group breakdowns when that metadata exists.
+        cams = [getattr(metas[i], "camera", None) for i in kept]
+        grps = [idx_to_episode.get(i) for i in kept]
+        m["per_camera"] = per_camera_confusion(yt, yp, classes, cams)
+        m["per_group"] = per_group_accuracy(yt, yp, grps)
+        return cmx, m
+
     print(f"\n===== BEST model (epoch {best['epoch']}) on val =====")
-    metrics = print_report(cm, classes, confuse)
+    cm, metrics = full_report(val_idx)
 
     if test_idx:
-        y_true, y_pred = predict_indices(test_idx)
-        test_cm = confusion(y_true, y_pred, len(classes))
         print("\n===== Held-out TEST set =====")
-        test_metrics = print_report(test_cm, classes, confuse)
+        test_cm, test_metrics = full_report(test_idx)
     else:
         test_metrics = None
 
@@ -1260,27 +1405,32 @@ def main() -> None:
     print(f"metadata         -> {out_dir / 'metadata.json'}")
 
     # --- log final metrics + artifacts to the experiment tracker ---
-    def _log_eval(prefix: str, mtr: dict | None, cmat) -> None:
+    def _log_eval(prefix: str, mtr: dict | None) -> None:
         if not mtr:
             return
         flat = {
             f"{prefix}_overall_accuracy": mtr["overall_accuracy"],
             f"{prefix}_macro_recall": mtr["macro_recall"],
+            f"{prefix}_macro_f1": mtr.get("macro_f1", 0.0),
+            f"{prefix}_dangerous_errors": mtr.get("dangerous_errors", 0),
         }
         for c, v in mtr["recall"].items():
             flat[f"{prefix}_recall_{c}"] = v
         for c, v in mtr["precision"].items():
             flat[f"{prefix}_precision_{c}"] = v
-        cs = [c for c in sorted(confuse) if c in classes]
-        if len(cs) == 2:
-            a, b = classes.index(cs[0]), classes.index(cs[1])
-            flat[f"{prefix}_{cs[0]}_to_{cs[1]}"] = int(cmat[a, b])
-            flat[f"{prefix}_{cs[1]}_to_{cs[0]}"] = int(cmat[b, a])
+        for c, v in mtr.get("f1", {}).items():
+            flat[f"{prefix}_f1_{c}"] = v
+        # Each configured dangerous confusion as its own metric.
+        for d in mtr.get("dangerous_confusions", []):
+            flat[f"{prefix}_danger_{d['actual']}_to_{d['predicted']}"] = d["count"]
+        # Per-camera accuracy, when present.
+        for cam, cstats in (mtr.get("per_camera") or {}).items():
+            flat[f"{prefix}_acc_camera_{cam}"] = cstats["accuracy"]
         run.log_metrics(flat)
 
-    _log_eval("val", metrics, cm)
+    _log_eval("val", metrics)
     if test_metrics is not None:
-        _log_eval("test", test_metrics, test_cm)
+        _log_eval("test", test_metrics)
     run.log_metric("best_epoch", best["epoch"])
     run.log_artifact(pt_path)
     run.log_artifact(out_dir / "metadata.json")

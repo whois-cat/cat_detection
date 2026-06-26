@@ -3,7 +3,7 @@
 Standalone, stdlib-only (mirrors tools/configure.py — no project imports), so it
 runs anywhere with python3 and a path to the shared feed journal. Read-only.
 
-    python3 tools/feed_log.py alisa --days 7 --db data/feed_journal/journal.db
+    python3 tools/feed_log.py <cat-name> --days 7 --db data/feed_journal/journal.db
 
 Columns: opened (local time), feeder, dur (duration_sec; "open"/"interrupted"
 when the session has no clean close), meal (meal_sec), counted (✓ if the meal was

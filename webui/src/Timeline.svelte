@@ -34,16 +34,16 @@
 
   const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
-  // Per-cat colour palette. Stacking order (bottom → top) is dark → light.
-  const CAT_COLORS = {
-    felisis: '#555555',
-    alisa:   '#a04935',
-    ellie:   '#cccccc',
-    chuzh:   '#ffffff',
-  };
-  const CAT_ORDER = Object.keys(CAT_COLORS);
+  // Colour per identity label, derived deterministically from the (arbitrary)
+  // label string — stable per name, distinct across names, no hardcoded cat
+  // names/classes. Null/empty (no identity) uses the neutral default.
   const DEFAULT_CAT_COLOR = '#00ff88';
-  function catColor(c) { return CAT_COLORS[c] ?? DEFAULT_CAT_COLOR; }
+  function catColor(c) {
+    if (!c) return DEFAULT_CAT_COLOR;
+    let h = 0;
+    for (let i = 0; i < c.length; i++) h = (h * 31 + c.charCodeAt(i)) >>> 0;
+    return `hsl(${h % 360} ${55 + (h >> 9) % 25}% ${50 + (h >> 17) % 20}%)`;
+  }
 
   // ---- DOM + reactive state ----
   let canvas;
@@ -219,10 +219,17 @@
         const bucketMs = Math.max(1, Math.round(targetBucketPx * msPerPx));
         const alignedFloor = Math.floor(viewFromMs / bucketMs) * bucketMs;
         const numBuckets = Math.ceil((viewToMs - alignedFloor) / bucketMs) + 1;
-        const numCats = CAT_ORDER.length + 1;
+        // Build a stable cat index from whatever labels are present in view —
+        // no hardcoded class list. Sorted for deterministic stacking/colours.
+        const present = new Set();
+        for (let i = startIdx; i < endIdx; i++) {
+          if (eventsSorted[i].cat) present.add(eventsSorted[i].cat);
+        }
+        const order = [...present].sort();
         const catIdx = Object.create(null);
-        for (let i = 0; i < CAT_ORDER.length; i++) catIdx[CAT_ORDER[i]] = i;
-        const UNK = CAT_ORDER.length;
+        for (let i = 0; i < order.length; i++) catIdx[order[i]] = i;
+        const UNK = order.length;
+        const numCats = order.length + 1;
         const buckets = new Uint16Array(numBuckets * numCats);
         const totals  = new Uint16Array(numBuckets);
         let maxCount = 1;
@@ -236,7 +243,7 @@
           if (totals[bIdx] > maxCount) maxCount = totals[bIdx];
         }
         const barW = bucketMs / msPerPx;
-        const colors = CAT_ORDER.map(catColor).concat([DEFAULT_CAT_COLOR]);
+        const colors = order.map(catColor).concat([DEFAULT_CAT_COLOR]);
         for (let b = 0; b < numBuckets; b++) {
           const t = totals[b];
           if (!t) continue;
