@@ -191,35 +191,72 @@ then cluster visually similar crops and label whole clusters. This writes no
 crop files: crops are decoded from recordings on demand and labels go into the
 separate `data/review/reviews.db`.
 
+Quick review workflow (copy-paste):
+
+```bash
+cd ~/compose-services/cat_detection_current
+
+# Start a clean review pass (MOVES the old reviews.db + clusters.json aside).
+CONFIRM=1 just label-reset
+
+# Build a compact, review-only manifest (one episode = one cluster, deduped,
+# hard-capped at 16 crops per cluster).
+REVIEW_LABELS=alisa,chuzh,ellie,felisis \
+RECORDING_TZ=UTC \
+just label-build \
+  --min-score 0.5 \
+  --mode time \
+  --episode-gap-sec 30 \
+  --dedupe-window-sec 10 \
+  --max-cluster-size 16
+
+# Bulk-label in the browser at http://localhost:8095
+REVIEW_LABELS=alisa,chuzh,ellie,felisis \
+RECORDING_TZ=UTC \
+just label-review 8095
+```
+
+The detailed stages below explain each step and its options.
+
 **Stage A — build the cluster manifest** (runs in a detector image because it
-already has PyAV/OpenCV/Numpy, and often torch via ultralytics). Low YOLO
-detector-confidence boxes are dropped first (`--min-score`, default 0.7).
-The manifest stores compact embeddings so mixed clusters can be split later in
-the browser.
+already has PyAV/OpenCV/Numpy, and often torch via ultralytics). Low-confidence
+boxes are dropped first (`--min-score`, default 0.7).
+
+`--min-score` is the **detector** confidence ("there is probably a cat in this
+box"), NOT identity confidence — at cold start there is no trusted identity
+model yet, so the detector score is used only as a gate for which crops enter
+review. The manifest stores compact embeddings so mixed clusters can be split
+later in the browser.
 
 ```bash
 REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-just cluster-manifest --min-score 0.7
+just label-build --min-score 0.7
 ```
 
 If the live detector event pool is polluted by static false positives, rebuild
 review-only events from the recordings with the non-quantized YOLO path:
 
 ```bash
-just rescan-recordings --conf 0.3 --imgsz 512 --sample-interval-sec 1
-just cluster-manifest --model offline-yolov8n --min-score 0.5 --clusters 100
+just train-rescan --conf 0.3 --imgsz 512 --sample-interval-sec 1
+just label-build --model offline-yolov8n --min-score 0.5 --clusters 100
 ```
 
-`just cluster-manifest` writes `data/review/clusters.json` by default. Useful
+`just label-build` writes `data/review/clusters.json` by default. Useful
 overrides: `EVENTS_DB`, `RECORDINGS_ROOT`, `CLUSTER_MANIFEST`, `RECORDING_TZ`,
 `--camera`, `--model`, `--clusters`, `--default-rotate-deg`.
 
-The manifest builder intentionally keeps the review set compact. By default it
-drops near-identical crops within a 15-second per-camera window and caps each
-cluster at 96 diverse examples (`--dedupe-window-sec`, `--dedupe-threshold`,
-`--max-cluster-size`). This avoids browser-heavy clusters with hundreds of
-nearly identical feeder frames. Use `--max-cluster-size 0` only when you really
-want every crop in the review UI.
+The manifest is review-only and compact: `--max-cluster-size` is a **hard cap**
+on the crops actually written per cluster (the rest are dropped, not hidden),
+and near-identical crops are deduped within a per-camera window first
+(`--dedupe-window-sec`, `--dedupe-threshold`, `--max-cluster-size`). So the
+manifest size is bounded by `clusters × max-cluster-size`: with ~600 clusters
+and `--max-cluster-size 16` expect roughly **5k–10k crops**, not the ~200k of
+the old "keep everything, hide most" manifests. The review UI shows and labels
+exactly the crops in the manifest. Use `--max-cluster-size 0` only when you
+really want every (deduped) crop in the review UI.
+
+Validate a generated manifest with `just label-validate` (hard cap respected,
+indices valid, no hidden/collapsed fields).
 
 Static false positives can be masked before review. Add tight
 `ignore_regions` to `cameras.yaml` only for hard false-positive objects such as
@@ -253,9 +290,9 @@ recording filenames in the server's EDT/EST timezone.
 **Stage B — bulk-label clusters** (host: needs `av` + FastAPI/Pillow).
 
 ```bash
-just review-setup                                  # once
+just setup label                                  # once
 REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-just cluster-review 8095                           # http://localhost:8095
+just label-review 8095                           # http://localhost:8095
 ```
 
 The page shows contact sheets per cluster. Label a pure cluster as one cat, mark
@@ -311,8 +348,8 @@ corrections and writes the **best-by-val** model to a NEW path. It does **not**
 touch the runtime model — swapping is a later, separate step.
 
 ```bash
-just training-setup
-just train-classifier \
+just setup train
+just train-run \
     --confuse alisa,felisis \
     --pad-frac 0.15 \
     --min-recall 0.9
@@ -327,12 +364,12 @@ trainable params, and trainable/frozen param counts are logged at startup):
 - `--head-only` — **CPU-friendly**: only the classifier head trains; the backbone
   is a frozen feature extractor. Recommended low-RAM CPU combo:
   ```bash
-  just train-classifier --head-only --batch-size 4 --batch-max-side 320 --num-workers 0
+  just train-run --head-only --batch-size 4 --batch-max-side 320 --num-workers 0
   ```
 - `--full-finetune` — the whole backbone (low LR). Passing `--head-only` with
   `--full-finetune` is rejected.
 
-`just train-classifier` runs through the training uv project with the classifier
+`just train-run` runs through the training uv project with the classifier
 extra, so `numpy`, `av`, `torch`, and `torchvision` are installed by uv instead
 of being manually added to the system Python. On Linux, `torch` and
 `torchvision` are resolved from PyTorch's CPU-only wheel index; CUDA /
@@ -348,7 +385,7 @@ CPU); raise it when you have RAM headroom. If the machine is still tight, lower
 both:
 
 ```bash
-just train-classifier --min-recall 0.85 --batch-size 4 --batch-max-side 320
+just train-run --min-recall 0.85 --batch-size 4 --batch-max-side 320
 ```
 
 RSS is logged before the dataset, after the first batch, and after each epoch.
@@ -431,7 +468,7 @@ python detector/export_classifier.py \
 human-reviewed crops, with closed-set metrics and thresholded runtime behavior:
 
 ```bash
-just compare-classifiers \
+just train-compare \
     --candidate current=/opt/models/cat_classifier_openvino \
     --candidate new=models/trained/<stamp>/cat_classifier.pt \
     --baseline current \
@@ -452,7 +489,7 @@ active-learning queues, not as truth. Each week:
 1. Build/review new clusters for the recent time range.
 2. Update compact replay memory from human-reviewed crops.
 3. Train from fresh human labels plus replay memory.
-4. Compare current vs candidate with `compare-classifiers`.
+4. Compare current vs candidate with `train-compare`.
 5. Export/swap only after comparison is clean.
 
 Replay memory stores a small balanced set of compressed numpy crops (`.npz`),
@@ -460,7 +497,7 @@ not JPGs. It is train-only memory: it prevents forgetting, but it is not a
 replacement for a held-out test set.
 
 ```bash
-just build-replay-set --per-class 500
+just train-replay-set --per-class 500
 ```
 
 The command merges the existing replay set with currently available reviewed
@@ -471,7 +508,7 @@ To continue from the previous weekly classifier rather than ImageNet-only
 initialization, pass:
 
 ```bash
-just train-classifier \
+just train-run \
     --init-from models/trained/<previous>/cat_classifier.pt \
     --replay-set data/replay
 ```
@@ -479,7 +516,7 @@ just train-classifier \
 For regression checking against old memory:
 
 ```bash
-just compare-classifiers \
+just train-compare \
     --candidate current=/opt/models/cat_classifier_openvino \
     --candidate new=models/trained/<stamp>/cat_classifier.pt \
     --baseline current \
@@ -577,7 +614,7 @@ training/
 ├── build_cluster_manifest.py (cold-start clustering manifest)
 └── train_classifier.py       (train identity classifier; best-by-val → models/trained/)
 
-../review/            (FastAPI bulk label-review app; `just cluster-review`)
+../review/            (FastAPI bulk label-review app; `just label-review`)
 ├── cluster_app.py    (bulk cluster labels; corrections → reviews.db)
 ├── static/cluster.html
 └── requirements.txt  (fastapi/uvicorn/av/numpy/Pillow — no openvino/torch)

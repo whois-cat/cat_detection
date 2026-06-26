@@ -134,9 +134,9 @@ Example:
 export REVIEW_LABELS=alisa,chuzh,ellie,felisis
 export RECORDING_TZ=America/New_York
 
-just cluster-manifest detector-grey --default-rotate-deg 90 --min-score 0.7 --clusters 80
-just review-setup
-just cluster-review 8095
+just label-build detector-grey --default-rotate-deg 90 --min-score 0.7 --clusters 80
+just setup label
+just label-review 8095
 ```
 
 What happens:
@@ -198,7 +198,7 @@ Human labels are stored in `data/review/reviews.db`, keyed by source event.
 Train only from reviewed human labels by default:
 
 ```bash
-just train-classifier \
+just train-run \
   --default-rotate-deg 90 \
   --confuse alisa,felisis \
   --val-frac 0.2 \
@@ -244,9 +244,9 @@ The recommended weekly loop:
 Example fine-tune:
 
 ```bash
-just build-replay-set --per-class 500
+just train-replay-set --per-class 500
 
-just train-classifier \
+just train-run \
   --init-from models/trained/<previous>/cat_classifier.pt \
   --replay-set data/replay \
   --val-frac 0.2 \
@@ -264,7 +264,7 @@ turning the repo into a JPG archive.
 `training.build_replay_set` creates/updates a compact training memory:
 
 ```bash
-just build-replay-set --per-class 500
+just train-replay-set --per-class 500
 ```
 
 It stores compressed crop arrays under `data/replay`, plus a manifest. This is
@@ -281,7 +281,7 @@ Use replay for weekly training so the model sees:
 Compare models on the same reviewed data before promoting a candidate:
 
 ```bash
-just compare-classifiers \
+just train-compare \
   --candidate current=/opt/models/cat_classifier_openvino \
   --candidate new=models/trained/<stamp>/cat_classifier.pt \
   --baseline current \

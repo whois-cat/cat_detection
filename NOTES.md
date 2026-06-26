@@ -231,7 +231,7 @@ entry produces:
   startup to populate the camera picker.
 
 `tools/configure.py` renders all five derived files. `just configure`
-runs it; `just devserver` / `just almostprod` run configure first
+runs it; `just dev` / `just up` run configure first
 automatically. Generated files are committed so diffs are inspectable.
 
 Networking topology:
@@ -394,7 +394,7 @@ browser dials for WebRTC ICE — usually the docker host's LAN IP).
 
 ## 6. Dev / prod workflow
 
-### `just devserver`
+### `just dev`
 
 Vite HMR + `watchfiles`-wrapped detector. Svelte and Python edits reload
 without container restarts. mediamtx + pruner unchanged from production.
@@ -405,13 +405,13 @@ Dev overlay ([`docker-compose.dev.yml`](docker-compose.dev.yml)) mounts
 `./detector` at `/app`, which would mask the baked-in OpenVINO model dir
 — so the model lives at `/opt/models/`, OUTSIDE the bind mount.
 
-### `just almostprod`
+### `just up`
 
 Production-shaped: nginx serves baked Svelte assets; detector runs
 straight `python -u main.py`. Same backend proxies. Used for sanity
 checks before a release; not actually deployed anywhere.
 
-### `just down` / `just logs [SERVICE]` / `just status` / `just rebuild-{webui,detector}`
+### `just down` / `just logs [SERVICE]` / `just ps` (rebuild via `just up`, which passes `--build`)
 
 ---
 
