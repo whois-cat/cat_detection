@@ -116,6 +116,12 @@ label-build-time *ARGS:
             --episode-gap-sec "${EPISODE_GAP_SEC:-30}" \
             {{ARGS}}
 
+# Validate a review cluster manifest: hard cap, valid indices, no hidden fields.
+[group('label')]
+label-validate MAX="16":
+    python3 -m training.validate_cluster_manifest \
+        --manifest "{{manifest}}" --max-cluster-size {{MAX}}
+
 # Bulk-label clusters in the browser.
 [group('label')]
 label-review PORT="8095":
