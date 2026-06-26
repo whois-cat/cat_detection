@@ -70,17 +70,11 @@
   select { background:#1d2230; color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:8px; font:inherit; }
   button.primary { background:#243b67; border-color:#3f73d9; padding:11px; font-weight:600; }
-  /* Secondary "include hidden" action: deliberately faint — it labels crops the
-     user never directly reviewed, so it must not look like the default. */
-  button.secondary { background:transparent; border:1px solid var(--line);
-                     color:var(--muted); font-size:12px; padding:7px 9px; }
-  button.secondary:hover { border-color:var(--warn); color:var(--warn); }
   button.activeMode { border-color:var(--accent); color:#dbe7ff; }
   .section { display:grid; gap:8px; }
   .section > .head { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
   .bulk .vis { font-size:12px; }
   .bulk .vis b { color:var(--fg); }
-  .bulk .vis .hid { color:var(--warn); }     /* hidden count: never let it feel invisible */
   .bulk .sel { color:var(--fg); font-weight:600; }
   .bulk .grid2 { display:grid; grid-template-columns:auto 1fr; align-items:center; gap:8px; }
   details.advanced { border-top:1px solid var(--line); padding-top:8px; }
@@ -128,8 +122,7 @@
          no selection → label the whole cluster; selection → exceptions. -->
     <div class="bulk section">
       <span class="head" id="bulkTitle">label whole cluster</span>
-      <!-- Explicit visible/hidden breakdown so hidden crops never feel invisible. -->
-      <div class="vis" id="visibilityLine"></div>
+      <div class="vis" id="visibilityLine"></div>     <!-- simple "N crops" count -->
 
       <!-- selection == 0 -->
       <div id="wholeMode">
@@ -150,10 +143,7 @@
         </div>
       </div>
 
-      <!-- Default action: visible crops only. -->
-      <button class="primary" id="applyBtn" onclick="labelWithExceptions(false)">Choose label</button>
-      <!-- Separate, faint, confirmed action: also label hidden crops. -->
-      <button class="secondary" id="applyHiddenBtn" onclick="labelWithExceptions(true)" hidden>Apply incl. hidden</button>
+      <button class="primary" id="applyBtn" onclick="labelWithExceptions()">Choose label</button>
     </div>
 
     <!-- View mode — deliberately kept apart from labelling actions. -->
@@ -271,31 +261,16 @@ function renderBulkControls() {
 // Switch the panel between "label whole cluster" (no selection) and "label with
 // exceptions" (selection), and keep the readout + Apply button text/enabled
 // state in sync with the dropdowns. This is the single labelling workflow.
-function clusterCounts(c) {
-  const total = c.size;
-  const visible = (c.visible_count == null) ? total : c.visible_count;
-  const hidden = Math.max(0, (c.hidden_count == null) ? total - visible : c.hidden_count);
-  return { total, visible, hidden };
-}
-
 function updateApplySummary() {
   if (!M) return;
   const c = curr();
   if (!c) return;
   const n = selected.size;
-  const { total, visible, hidden } = clusterCounts(c);
+  const total = c.size;                 // manifest crops; nothing is hidden
   const btn = document.getElementById('applyBtn');
-  const hiddenBtn = document.getElementById('applyHiddenBtn');
 
-  // Crop readout. The manifest is visible-only by default (hidden==0), so keep
-  // it terse then; if a lossless manifest is used, make the hidden count loud so
-  // it never feels invisible.
   const vis = document.getElementById('visibilityLine');
-  if (vis) {
-    vis.innerHTML = hidden > 0
-      ? `<b>${visible}</b> visible · <span class="hid"><b>${hidden}</b> hidden</span> · <b>${total}</b> total`
-      : `<b>${total}</b> crops`;
-  }
+  if (vis) vis.innerHTML = `<b>${total}</b> crops`;
 
   document.getElementById('wholeMode').hidden = n > 0;
   document.getElementById('exceptionsMode').hidden = n === 0;
@@ -303,42 +278,21 @@ function updateApplySummary() {
       n > 0 ? 'label with exceptions' : 'label whole cluster';
   if (!btn) return;
 
-  // The faint "include hidden" action only appears when there are hidden crops
-  // AND a target label is chosen.
-  const showHidden = (chosen) => {
-    if (!hiddenBtn) return;
-    const on = hidden > 0 && !!chosen;
-    hiddenBtn.hidden = !on;
-  };
-
   if (n === 0) {
     const maj = document.getElementById('wholeLabel').value;
     btn.disabled = !maj;
-    // Default applies to the shown (visible) crops only.
-    const word = hidden > 0 ? 'visible ' : '';
-    btn.textContent = maj ? `Apply ${word}${visible} → ${maj}` : 'Choose label';
-    showHidden(maj);
-    if (hiddenBtn && !hiddenBtn.hidden) {
-      hiddenBtn.textContent = `Apply all ${total} incl. ${hidden} hidden → ${maj}`;
-    }
+    btn.textContent = maj ? `Apply: all ${total} → ${maj}` : 'Choose label';
     return;
   }
 
-  document.getElementById('selSummary').textContent =
-      hidden > 0 ? `selected: ${n} / ${visible} visible` : `selected: ${n} / ${visible}`;
-  const restVisible = Math.max(0, visible - n);
-  const restAll = Math.max(0, total - n);
+  document.getElementById('selSummary').textContent = `selected: ${n} / ${total}`;
+  const rest = Math.max(0, total - n);
   const exc = document.getElementById('exceptionLabel').value;
   const maj = document.getElementById('majorityLabel').value;
   btn.disabled = !maj;
   btn.textContent = maj
-    ? `Apply: selected ${n} → ${exc}, rest ${restVisible} → ${maj}`
+    ? `Apply: selected ${n} → ${exc}, rest ${rest} → ${maj}`
     : 'Choose rest label';
-  showHidden(maj);
-  if (hiddenBtn && !hiddenBtn.hidden) {
-    hiddenBtn.textContent =
-        `Apply incl. ${hidden} hidden: selected ${n} → ${exc}, rest ${restAll} → ${maj}`;
-  }
 }
 
 function renderList() {
@@ -372,10 +326,7 @@ function render() {
       `detector min_score ${M.params.min_score ?? 'n/a'}`;
 	  document.getElementById('clusterName').textContent = `cluster #${c.cluster_id}`;
 	  document.getElementById('clusterMeta').textContent =
-	      `${c.size} crops · ${c.visible_count ?? c.size} shown`
-	      + (c.hidden_duplicate_count ? ` · ${c.hidden_duplicate_count} near-duplicates hidden` : '')
-	      + (c.hidden_count && c.hidden_count !== c.hidden_duplicate_count ? ` · ${c.hidden_count} total hidden` : '')
-	      + ` · ${c.reviewed_items} labelled`
+	      `${c.size} crops · ${c.reviewed_items} labelled`
 	      + (c.parent_id == null ? '' : ` · split from #${c.parent_id}`);
   document.getElementById('clusterStatus').textContent =
       c.status ? `status: ${c.status.status} ${c.status.label || ''}` : 'status: open';
@@ -437,12 +388,6 @@ async function renderGrid(c) {
     card.appendChild(badges);
     frag.appendChild(card);
   });
-  if (data.hidden_duplicate_count && !showDuplicates) {
-    const note = document.createElement('div');
-    note.className = 'hint';
-    note.textContent = `${data.total} crops, ${data.shown_count} shown, ${data.hidden_duplicate_count} near-duplicates hidden`;
-    frag.appendChild(note);
-  }
   grid.appendChild(frag);
   grid.classList.remove('loading');
 }
@@ -494,42 +439,30 @@ function syncSelection() {
   updateApplySummary();
 }
 
-async function labelWithExceptions(includeHidden = false) {
+async function labelWithExceptions() {
   const c = curr();
   const n = selected.size;
-  const { total, visible, hidden } = clusterCounts(c);
+  const total = c.size;
+  const rest = Math.max(0, total - n);
   // Whole-cluster mode reads its own dropdown; exceptions mode reads selected/rest.
   const exc = document.getElementById('exceptionLabel').value;
   const maj = (n === 0 ? document.getElementById('wholeLabel') : document.getElementById('majorityLabel')).value;
   if (!maj) return;  // safety: required label must be explicitly chosen
 
-  // Including hidden crops labels crops the user never directly reviewed → confirm.
-  if (includeHidden && hidden > 0) {
-    const restAll = Math.max(0, total - n);
-    const msg = n > 0
-      ? `Also label ${hidden} HIDDEN crops you didn't review? `
-        + `selected ${n} → ${exc}, rest ${restAll} → ${maj} (total ${total}).`
-      : `Label ALL ${total} crops as ${maj}, including ${hidden} HIDDEN crops `
-        + `you didn't directly review?`;
-    if (!confirm(msg)) return;
-  }
-
+  // Operate only on the crops in this manifest: selected become exceptions, the
+  // rest get the majority label. No modal — a toast confirms after.
   const exceptions = n > 0 ? { [exc]: [...selected] } : {};
   const r = await fetch('/api/cluster_label_with_exceptions', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ cluster_id:c.cluster_id, majority_label:maj, exceptions,
-                          include_hidden: includeHidden })
+    body:JSON.stringify({ cluster_id:c.cluster_id, majority_label:maj, exceptions })
   });
   if (!r.ok) { showToast('Label failed: ' + await r.text()); return; }
-  const data = await r.json().catch(() => ({}));
-  const count = data.labeled_count != null ? data.labeled_count : (includeHidden ? total : visible);
-  const scope = includeHidden ? 'incl. hidden' : 'visible only';
   const applied = n > 0
-    ? `Applied (${scope}): selected ${n} → ${exc}, +${Math.max(0, count - n)} → ${maj}`
-    : `Applied (${scope}): ${count} → ${maj}`;
+    ? `Applied: selected ${n} → ${exc}, rest ${rest} → ${maj}`
+    : `Applied: all ${total} → ${maj}`;
   clearSelection();
   await load();
-  showToast(applied);   // non-blocking confirmation, no modal
+  showToast(applied);
 }
 
 	async function splitCluster(parts) {
