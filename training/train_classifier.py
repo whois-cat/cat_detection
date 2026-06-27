@@ -590,6 +590,57 @@ def per_group_accuracy(y_true, y_pred, groups, *, worst: int = 5) -> dict:
     }
 
 
+# --- experiment artifacts (everything sized/keyed from the class list) --------
+
+def labels_payload(classes: list[str]) -> dict:
+    """Run-level label metadata — class list, count, and both index mappings."""
+    return {
+        "classes": list(classes),
+        "num_classes": len(classes),
+        "label_to_index": {c: i for i, c in enumerate(classes)},
+        "index_to_label": {str(i): c for i, c in enumerate(classes)},
+    }
+
+
+def write_labels_json(path: Path, classes: list[str]) -> None:
+    Path(path).write_text(json.dumps(labels_payload(classes), indent=2), encoding="utf-8")
+
+
+def write_confusion_csv(path: Path, cm, classes: list[str]) -> None:
+    """Dynamic N×N confusion matrix as a labelled CSV (rows=true, cols=pred)."""
+    import csv
+    cm = np.asarray(cm)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([r"true\pred", *classes])
+        for i, c in enumerate(classes):
+            w.writerow([c, *(int(cm[i, j]) for j in range(len(classes)))])
+
+
+def write_confusion_png(path: Path, cm, classes: list[str], *, title: str = "confusion matrix") -> None:
+    """Confusion-matrix heatmap; figure size scales with the number of classes."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    cm = np.asarray(cm)
+    n = len(classes)
+    side = max(4.0, 0.6 * n + 2.0)
+    fig, ax = plt.subplots(figsize=(side, side))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks(range(n)); ax.set_xticklabels(classes, rotation=45, ha="right")
+    ax.set_yticks(range(n)); ax.set_yticklabels(classes)
+    ax.set_xlabel("predicted"); ax.set_ylabel("true"); ax.set_title(title)
+    thresh = (cm.max() / 2) if cm.size else 0
+    for i in range(n):
+        for j in range(n):
+            ax.text(j, i, int(cm[i, j]), ha="center", va="center", fontsize=8,
+                    color="white" if cm[i, j] > thresh else "black")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
 def shrink_bgr_for_batch(img: np.ndarray, max_side: int) -> np.ndarray:
     """Cap a decoded crop before turning the current batch into tensors.
 
@@ -1436,6 +1487,36 @@ def main() -> None:
     run.log_artifact(out_dir / "metadata.json")
     if args.preview_augmentations and Path(args.preview_augmentations).exists():
         run.log_artifact(args.preview_augmentations, artifact_path="aug_preview")
+
+    # --- dynamic metrics artifacts (sized/keyed from the class list, nothing fixed) ---
+    try:
+        write_labels_json(out_dir / "labels.json", classes)
+        (out_dir / "classification_report.json").write_text(
+            json.dumps({"val": metrics, "test": test_metrics}, indent=2), encoding="utf-8")
+        write_confusion_csv(out_dir / "confusion_matrix.csv", cm, classes)
+        write_confusion_png(out_dir / "confusion_matrix.png", cm, classes,
+                            title="val confusion matrix")
+        artifacts = ["labels.json", "classification_report.json",
+                     "confusion_matrix.csv", "confusion_matrix.png"]
+        if test_metrics is not None:
+            write_confusion_csv(out_dir / "test_confusion_matrix.csv", test_cm, classes)
+            write_confusion_png(out_dir / "test_confusion_matrix.png", test_cm, classes,
+                                title="test confusion matrix")
+            artifacts += ["test_confusion_matrix.csv", "test_confusion_matrix.png"]
+        # Only when dangerous confusions were actually configured.
+        if dangerous:
+            (out_dir / "dangerous_confusions.json").write_text(json.dumps({
+                "configured": [{"actual": d.actual, "predicted": d.predicted, "action": d.action}
+                               for d in dangerous],
+                "val": metrics.get("dangerous_confusions", []),
+                "test": (test_metrics or {}).get("dangerous_confusions", []),
+            }, indent=2), encoding="utf-8")
+            artifacts.append("dangerous_confusions.json")
+        for name in artifacts:
+            run.log_artifact(out_dir / name)
+        print(f"metrics artifacts -> {out_dir} ({', '.join(artifacts)})")
+    except Exception as e:  # never let artifact/plotting issues fail a finished run
+        log.warning("failed to write/log metrics artifacts: %r", e)
 
     # --- PASS/FAIL guard (loud warning on FAIL; do NOT crash) ---
     _, rec = per_class_pr(cm)

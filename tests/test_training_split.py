@@ -10,6 +10,7 @@ from training.train_classifier import (
     dangerous_confusion_report,
     dangerous_from_confuse,
     decide_label,
+    labels_payload,
     per_camera_confusion,
     per_class_f1,
     per_class_pr,
@@ -19,6 +20,9 @@ from training.train_classifier import (
     split_episodes,
     summarize_split,
     supported_macro_recall,
+    write_confusion_csv,
+    write_confusion_png,
+    write_labels_json,
 )
 
 
@@ -194,6 +198,37 @@ def test_dangerous_confusions_reported_generically(capsys):
     assert "cat_b → cat_a: 2" in printed
     assert "feeder must not open" in printed
     assert "F1" in printed                 # per-class F1 is reported
+
+
+def test_labels_payload_has_dynamic_mappings():
+    classes = ["cat_a", "cat_b", "cat_c"]
+    p = labels_payload(classes)
+    assert p["classes"] == classes
+    assert p["num_classes"] == 3
+    assert p["label_to_index"] == {"cat_a": 0, "cat_b": 1, "cat_c": 2}
+    assert p["index_to_label"] == {"0": "cat_a", "1": "cat_b", "2": "cat_c"}
+
+
+def test_artifact_writers_are_class_count_agnostic(tmp_path):
+    import csv
+    import json as _json
+    for n in (2, 5, 9):
+        classes = [f"id_{i}" for i in range(n)]
+        cm = confusion(list(range(n)), list(range(n)), n)  # diagonal
+
+        lp = tmp_path / f"labels_{n}.json"
+        write_labels_json(lp, classes)
+        assert _json.loads(lp.read_text())["num_classes"] == n
+
+        cp = tmp_path / f"cm_{n}.csv"
+        write_confusion_csv(cp, cm, classes)
+        rows = list(csv.reader(cp.read_text().splitlines()))
+        assert rows[0] == [r"true\pred", *classes]          # header sized to N
+        assert len(rows) == n + 1                            # header + N rows
+
+        pp = tmp_path / f"cm_{n}.png"
+        write_confusion_png(pp, cm, classes, title="t")
+        assert pp.exists() and pp.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 def test_load_dangerous_confusions_from_yaml(tmp_path):
