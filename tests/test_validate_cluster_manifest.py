@@ -88,6 +88,58 @@ def test_bool_index_is_rejected():
     assert any("out of range" in e for e in errors)
 
 
+# --- optional, config-driven label validation (no fixed class list) ----------
+
+def test_no_label_assumptions_arbitrary_names_pass():
+    # Any names, any count — valid without --labels.
+    m = _manifest()
+    m["labels"] = ["whiskers", "mittens", "id_7"]
+    m["items"][0]["label"] = "whiskers"
+    errors, stats, _ = validate(m, max_cluster_size=16)
+    assert errors == []
+    assert "whiskers" in stats["distinct_labels"]
+
+
+def test_manifest_labels_must_be_strings():
+    m = _manifest()
+    m["labels"] = ["ok", 123]
+    errors, _, _ = validate(m, max_cluster_size=16)
+    assert any("'labels' must be a list of strings" in e for e in errors)
+
+
+def test_labels_checked_against_configured_list_when_passed():
+    m = _manifest()
+    m["labels"] = ["cat_a", "cat_x"]
+    m["items"][0]["label"] = "cat_z"
+    errors, _, _ = validate(m, max_cluster_size=16, labels=["cat_a", "cat_b"])
+    assert any("manifest 'labels' not in configured list" in e for e in errors)
+    assert any("item label(s) not in configured list" in e for e in errors)
+
+
+def test_item_label_optional_and_unlabeled_states_allowed():
+    m = _manifest()
+    m["items"][0]["label"] = "unknown"   # service state
+    m["items"][1]["label"] = ""          # unlabeled
+    m["items"][2]["label"] = None        # unlabeled
+    # item 3 has no label field at all — fine
+    errors, _, _ = validate(m, max_cluster_size=16, labels=["cat_a"])
+    assert errors == []
+
+
+def test_item_label_must_be_string():
+    m = _manifest()
+    m["items"][0]["label"] = 5
+    errors, _, _ = validate(m, max_cluster_size=16)
+    assert any("not strings" in e for e in errors)
+
+
+def test_no_labels_anywhere_is_valid():
+    # Manifest with no label fields at all → no label errors.
+    errors, stats, _ = validate(_manifest(), max_cluster_size=16, labels=["cat_a"])
+    assert errors == []
+    assert stats["distinct_labels"] == []
+
+
 # --- CLI exit codes ----------------------------------------------------------
 
 def test_main_returns_0_on_valid(tmp_path):

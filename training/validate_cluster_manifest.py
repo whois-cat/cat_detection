@@ -10,9 +10,15 @@ exactly one cluster (k-means assigns one cluster per crop; time mode puts each
 detection in one episode), so an index must be referenced by at most one
 cluster. The validator therefore flags any cross-cluster duplicate reference.
 
+It makes NO assumption about the class list — any label names and any number of
+classes are valid. Label fields are validated only if present: they must be
+strings, and (only if --labels is passed) must belong to that configured list;
+unlabeled/service states (None, "", unknown, discard) are always allowed.
+
 Usage:
     python -m training.validate_cluster_manifest \
-        --manifest data/review/clusters.json --max-cluster-size 16
+        --manifest data/review/clusters.json --max-cluster-size 16 \
+        [--labels name1,name2,...]
 """
 from __future__ import annotations
 
@@ -37,9 +43,57 @@ FORBIDDEN_ITEM_FIELDS = (
 # Cluster-level counters that implied a hidden/collapsed model — not in new ones.
 LEGACY_CLUSTER_FIELDS = ("visible_count", "hidden_duplicate_count")
 
+# Label-like values that mean "unlabeled / service state". Always allowed and
+# never required to be in a configured label list.
+UNLABELED_STATES = (None, "", "unknown", "discard")
 
-def validate(manifest, *, max_cluster_size: int) -> tuple[list[str], dict, list[str]]:
-    """Return (errors, stats, warnings). Empty errors == valid."""
+
+def _validate_labels(manifest, items, configured, errors, warnings) -> dict:
+    """Optional label validation. No fixed class list is assumed: labels are
+    checked only where present. ``configured`` (or None) is the allowed label
+    set passed via --labels."""
+    seen: set[str] = set()
+
+    # Manifest-level label hint (build_cluster_manifest writes it), if any.
+    man_labels = manifest.get("labels")
+    if man_labels is not None:
+        if not isinstance(man_labels, list) or not all(isinstance(x, str) for x in man_labels):
+            errors.append("manifest 'labels' must be a list of strings")
+        else:
+            seen.update(man_labels)
+            if configured is not None:
+                unknown = sorted({x for x in man_labels if x not in configured})
+                if unknown:
+                    errors.append(f"manifest 'labels' not in configured list: {unknown[:8]}")
+
+    # Per-item 'label' is optional — validate only the items that carry one.
+    bad_type = 0
+    unknown_item = Counter()
+    for it in items:
+        if not isinstance(it, dict) or "label" not in it:
+            continue
+        lab = it["label"]
+        if lab in UNLABELED_STATES:
+            continue
+        if not isinstance(lab, str):
+            bad_type += 1
+            continue
+        seen.add(lab)
+        if configured is not None and lab not in configured:
+            unknown_item[lab] += 1
+    if bad_type:
+        errors.append(f"{bad_type} item 'label' value(s) are not strings")
+    if unknown_item:
+        errors.append("item label(s) not in configured list: "
+                      + ", ".join(f"{lab}×{n}" for lab, n in sorted(unknown_item.items())))
+    return {"distinct_labels": sorted(seen)}
+
+
+def validate(manifest, *, max_cluster_size: int, labels=None) -> tuple[list[str], dict, list[str]]:
+    """Return (errors, stats, warnings). Empty errors == valid.
+
+    ``labels`` is an optional configured label allow-list; when None, label
+    *values* are still type-checked but not membership-checked."""
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -126,6 +180,9 @@ def validate(manifest, *, max_cluster_size: int) -> tuple[list[str], dict, list[
     if unreferenced:
         warnings.append(f"{unreferenced} item(s) not referenced by any cluster")
 
+    configured = set(labels) if labels else None
+    label_stats = _validate_labels(manifest, items, configured, errors, warnings)
+
     sizes = [len(c["item_indices"]) for c in clusters
              if isinstance(c, dict) and isinstance(c.get("item_indices"), list)]
     stats = {
@@ -134,6 +191,7 @@ def validate(manifest, *, max_cluster_size: int) -> tuple[list[str], dict, list[
         "max_cluster_size_seen": max(sizes) if sizes else 0,
         "avg_cluster_size": round(sum(sizes) / len(sizes), 2) if sizes else 0.0,
         "suspicious_fields": dict(field_hits),
+        "distinct_labels": label_stats["distinct_labels"],
     }
     return errors, stats, warnings
 
@@ -144,7 +202,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--manifest", type=Path, default=Path("data/review/clusters.json"))
     ap.add_argument("--max-cluster-size", type=int, default=16,
                     help="hard cap each cluster must respect (default 16)")
+    ap.add_argument("--labels", default="",
+                    help="OPTIONAL comma-separated configured label allow-list. If "
+                         "given, any labels in the manifest must belong to it "
+                         "(unlabeled/unknown/discard always allowed). No class list "
+                         "is assumed when omitted.")
     args = ap.parse_args(argv)
+    configured_labels = [c.strip() for c in args.labels.split(",") if c.strip()]
 
     try:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
@@ -155,7 +219,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: manifest is not valid JSON: {exc}", file=sys.stderr)
         return 2
 
-    errors, stats, warnings = validate(manifest, max_cluster_size=args.max_cluster_size)
+    errors, stats, warnings = validate(
+        manifest, max_cluster_size=args.max_cluster_size, labels=configured_labels)
 
     print(f"manifest: {args.manifest}")
     if stats:
@@ -164,6 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"max cluster size:    {stats['max_cluster_size_seen']} (cap {args.max_cluster_size})")
         print(f"average cluster size:{stats['avg_cluster_size']:>6}")
         print(f"suspicious fields:   {stats['suspicious_fields'] or 'none'}")
+        print(f"distinct labels:     {stats['distinct_labels'] or 'none'}"
+              f"{' (checked vs --labels)' if configured_labels else ''}")
     for w in warnings:
         print(f"WARN: {w}")
 
