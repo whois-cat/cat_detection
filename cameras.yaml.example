@@ -113,6 +113,11 @@
 #     allowed_cats   — list of cat names allowed to open this feeder. Names must
 #                      match class_names in the classifier model. Nothing hardcoded
 #                      here — add/remove names freely.
+#     dangerous_confusions — optional list of {actual, predicted, action} safety
+#                      rules. action "block_open" (default) refuses to open when the
+#                      resolved (allowed) identity could really be a NON-allowed cat,
+#                      e.g. - {actual: cat_b, predicted: cat_a} means "if the model
+#                      says cat_a but might be cat_b, don't open". Default: none.
 #     door_close_timeout_sec — seconds without detection before door closes (default 30).
 #                             Tolerates missed frames and pose changes.
 #     min_meal_sec           — min meal duration (sec) (default 10).

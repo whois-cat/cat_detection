@@ -1,7 +1,9 @@
 """Decision-layer guarantees: the feeder never opens on a single frame, an
 unstable identity, or an unknown cat, and DOES open for a stable allowed cat.
 Exercises the real pipeline (ZoneState -> decide -> DoorFSM), not one frame."""
-from decision import decide
+import pytest
+
+from decision import DangerousConfusion, decide, parse_dangerous_confusions
 from door_fsm import DoorFSM
 from zone_state import ZoneState, ZoneSummary
 
@@ -67,3 +69,66 @@ def test_not_allowed_cat_closes():
     action, reason = decide(_present("chuzh"), ["alisa"])
     assert action == "close"
     assert reason == "not_allowed:chuzh"
+
+
+# ---- config-driven dangerous confusions (generic fixtures) ----
+
+def test_dangerous_confusion_blocks_open():
+    # feeder allows cat_a; config says cat_b can be mistaken for cat_a (forbidden)
+    # → refuse to open even though the resolved identity is the allowed cat_a.
+    dcs = [DangerousConfusion(actual="cat_b", predicted="cat_a", action="block_open")]
+    action, reason = decide(_present("cat_a"), ["cat_a"], dcs)
+    assert action == "close"
+    assert reason == "dangerous_confusion:cat_b~cat_a"
+
+
+def test_dangerous_confusion_ignored_when_actual_is_allowed():
+    # If the confusable "actual" is itself allowed, there's no safety risk → open.
+    dcs = [DangerousConfusion(actual="cat_b", predicted="cat_a", action="block_open")]
+    action, reason = decide(_present("cat_a"), ["cat_a", "cat_b"], dcs)
+    assert action == "open" and reason == "cat_a"
+
+
+def test_dangerous_confusion_only_for_matching_prediction():
+    dcs = [DangerousConfusion(actual="cat_b", predicted="cat_a", action="block_open")]
+    # resolved identity is cat_c (allowed), not the dangerous "predicted" → open.
+    action, reason = decide(_present("cat_c"), ["cat_a", "cat_c"], dcs)
+    assert action == "open" and reason == "cat_c"
+
+
+def test_no_dangerous_config_is_unchanged():
+    action, reason = decide(_present("cat_a"), ["cat_a"])
+    assert action == "open" and reason == "cat_a"
+
+
+@pytest.mark.parametrize("n", [1, 2, 4, 10])
+def test_decision_is_class_count_agnostic(n):
+    # Arbitrary number of identity classes with arbitrary (non-local) names.
+    classes = [f"id_{i}" for i in range(n)]
+    allowed = classes[: max(1, n // 2)]
+    # An allowed identity opens; a non-allowed one closes — for ANY class count.
+    assert decide(_present(allowed[-1]), allowed) == ("open", allowed[-1])
+    if n > len(allowed):
+        outsider = classes[-1]
+        assert decide(_present(outsider), allowed) == ("close", f"not_allowed:{outsider}")
+
+
+def test_decision_handles_unknown_and_unresolved_identity():
+    # "unknown" never reaches decide() as an identity (zone_state filters it), but
+    # an unresolved vote surfaces as identity=None → no_identity.
+    assert decide(_present(None), ["greycat", "spot"]) == ("close", "no_identity")
+    # Non-local names work the same as any other.
+    assert decide(_present("greycat"), ["greycat", "spot"]) == ("open", "greycat")
+
+
+def test_parse_dangerous_confusions():
+    assert parse_dangerous_confusions("") == []
+    assert parse_dangerous_confusions("   ") == []
+    dcs = parse_dangerous_confusions(
+        '[{"actual":"cat_b","predicted":"cat_a","action":"block_open"},'
+        ' {"actual":"cat_d","predicted":"cat_c"}]'
+    )
+    assert dcs[0] == DangerousConfusion("cat_b", "cat_a", "block_open")
+    assert dcs[1].action == "block_open"   # default
+    with pytest.raises(ValueError):
+        parse_dangerous_confusions("{not json")

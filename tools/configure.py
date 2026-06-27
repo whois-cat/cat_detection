@@ -196,6 +196,13 @@ def load_config() -> dict:
             allowed = feeder.get("allowed_cats", [])
             if not isinstance(allowed, list) or not allowed:
                 sys.exit(f"camera {cid}: feeder.allowed_cats must be a non-empty list")
+            dcs = feeder.get("dangerous_confusions", [])
+            if not isinstance(dcs, list):
+                sys.exit(f"camera {cid}: feeder.dangerous_confusions must be a list")
+            for d in dcs:
+                if not isinstance(d, dict) or "actual" not in d or "predicted" not in d:
+                    sys.exit(f"camera {cid}: each feeder.dangerous_confusions entry "
+                             "needs 'actual' and 'predicted'")
     return cfg
 
 
@@ -333,6 +340,8 @@ def render_compose(cfg: dict) -> str:
                 "FEEDER_API_BASE_URL":     feeder["api_base_url"],
                 "FEEDER_SERIAL_NUMBER":    feeder["serial_number"],
                 "ALLOWED_CATS":            allowed_cats,
+                # Optional dangerous confusions as a JSON string (feeder parses it).
+                "DANGEROUS_CONFUSIONS":    json.dumps(feeder.get("dangerous_confusions", [])),
                 "DOOR_CLOSE_TIMEOUT_SEC":  str(feeder.get("door_close_timeout_sec", 30)),
                 "MIN_MEAL_SEC":            str(feeder.get("min_meal_sec", 10)),
                 "PRESENCE_WINDOW_SEC":     str(feeder.get("presence_window_sec", 5)),

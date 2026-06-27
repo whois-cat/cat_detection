@@ -28,7 +28,12 @@ Env vars (all from configure.py — nothing hardcoded):
   FEEDER_ID               this feeder's identifier (for logs)
   FEEDER_API_BASE_URL     base URL of the feeder REST API
   FEEDER_SERIAL_NUMBER    feeder hardware serial
-  ALLOWED_CATS            comma-separated list of allowed cat names
+  ALLOWED_CATS            comma-separated list of allowed cat names (this feeder's
+                          target identities) — empty means open for none
+  DANGEROUS_CONFUSIONS    optional JSON list of {actual, predicted, action} pairs;
+                          action "block_open" refuses to open when the predicted
+                          (allowed) identity could really be a non-allowed cat.
+                          Default empty. e.g. [{"actual":"cat_b","predicted":"cat_a"}]
   DOOR_CLOSE_TIMEOUT_SEC  seconds without detection before door closes (default 30)
   MIN_MEAL_SEC            min meal duration (sec) (default 10)
   PRESENCE_WINDOW_SEC     sliding window (sec) for n_cats / identity smoothing (default 5)
@@ -73,7 +78,7 @@ import time
 
 import websockets
 
-from decision import decide
+from decision import decide, parse_dangerous_confusions
 from door_fsm import CLOSED, CLOSING, OPEN, DoorFSM
 from feed_control import FeedController
 from feeder_client import FeederClient
@@ -90,6 +95,14 @@ FEEDER_SERIAL_NUMBER = os.environ["FEEDER_SERIAL_NUMBER"]
 ALLOWED_CATS: list[str] = [
     c.strip() for c in os.environ.get("ALLOWED_CATS", "").split(",") if c.strip()
 ]
+# Optional config-driven dangerous confusions (JSON list of
+# {actual, predicted, action}). Default empty → no change in behavior. A bad
+# value fails closed (empty) with a warning rather than crashing the feeder.
+try:
+    DANGEROUS_CONFUSIONS = parse_dangerous_confusions(os.environ.get("DANGEROUS_CONFUSIONS", ""))
+except Exception as e:  # noqa: BLE001 — never let bad config kill the feeder
+    print(f"[feeder] WARNING: invalid DANGEROUS_CONFUSIONS ({e!r}); ignoring", flush=True)
+    DANGEROUS_CONFUSIONS = []
 DOOR_CLOSE_TIMEOUT_SEC = float(os.environ.get("DOOR_CLOSE_TIMEOUT_SEC", "30"))
 MIN_MEAL_SEC           = float(os.environ.get("MIN_MEAL_SEC", "10"))
 PRESENCE_WINDOW_SEC    = float(os.environ.get("PRESENCE_WINDOW_SEC", "5"))
@@ -286,7 +299,7 @@ def _handle_event(
         _zone.update(wall_t, ev.get("cat"), ev.get("cat_score"), bool(box.get("in_action")))
 
     snap = _zone.snapshot(wall_t)
-    action, reason = decide(snap, ALLOWED_CATS)
+    action, reason = decide(snap, ALLOWED_CATS, DANGEROUS_CONFUSIONS)
 
     # Diagnostic: a cat is present but the door isn't being opened (no_identity /
     # not_allowed / multi_cat). Edge-triggered so it can't flood the log: write
