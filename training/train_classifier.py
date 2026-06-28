@@ -1159,12 +1159,12 @@ def main() -> None:
     # training/augment.py. Eval is byte-identical to the detector runtime.
     spec = augment_spec(args.augment)
     log.info(
-        "augmentation: level=%s random=%s (rotation=%.0f° translate=%.0f%% scale=%.2f-%.2f "
-        "brightness=%.2f contrast=%.2f noise=%.3f blur_p=%.2f; flips=OFF quarter_turns=OFF "
-        "hard_crop=OFF)",
+        "augmentation: level=%s random=%s (rotation=±%.0f° translate=%.0f%% scale=%.2f-%.2f "
+        "brightness=%.2f contrast=%.2f gamma=%.2f noise=%.3f blur_p=%.2f pad=%.0f%%; "
+        "flips=OFF quarter_turns=OFF hard_crop=OFF)",
         spec.level, spec.is_random, spec.rotation_deg, spec.translate_frac * 100,
         spec.scale_min, spec.scale_max, spec.brightness, spec.contrast,
-        spec.noise_std, spec.blur_prob,
+        spec.gamma, spec.noise_std, spec.blur_prob, spec.pad_frac * 100,
     )
     train_pipe = build_train_transform(args.augment, IMAGENET_MEAN, IMAGENET_STD)
 
