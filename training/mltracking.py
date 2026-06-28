@@ -56,6 +56,8 @@ class _NoopRun:
     """Stand-in returned when MLflow is unavailable. Every method is a no-op."""
 
     active = False
+    run_id = None
+    tracking_uri = None
 
     def log_params(self, params: dict) -> None: ...
     def log_metrics(self, metrics: dict, step: int | None = None) -> None: ...
@@ -73,6 +75,20 @@ class _MlflowRun:
     def __init__(self, mlflow, run):
         self._mlflow = mlflow
         self._run = run
+
+    @property
+    def run_id(self):
+        try:
+            return self._run.info.run_id
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    @property
+    def tracking_uri(self):
+        try:
+            return self._mlflow.get_tracking_uri()
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def log_params(self, params: dict) -> None:
         try:

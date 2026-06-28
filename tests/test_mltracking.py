@@ -79,6 +79,21 @@ def _use_fake(monkeypatch, fake):
     monkeypatch.setattr(mltracking, "_import_mlflow", lambda: fake)
 
 
+def test_run_exposes_run_id_and_tracking_uri(monkeypatch):
+    fake = _FakeMlflow()
+    fake.get_tracking_uri = lambda: "file:/tmp/mlruns"
+    _use_fake(monkeypatch, fake)
+    run = mltracking.start_run("e", run_name="r")
+    assert run.run_id == "rid"
+    assert run.tracking_uri == "file:/tmp/mlruns"
+
+
+def test_noop_run_id_and_uri_are_none(monkeypatch):
+    monkeypatch.setattr(mltracking, "_import_mlflow", lambda: None)
+    run = mltracking.start_run("e")
+    assert run.run_id is None and run.tracking_uri is None
+
+
 def test_start_run_logs_params_and_starts(monkeypatch):
     fake = _FakeMlflow()
     _use_fake(monkeypatch, fake)

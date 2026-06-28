@@ -1070,13 +1070,11 @@ def main() -> None:
     def _crop_identity(item, i):
         box = getattr(getattr(item, "ref", None), "box", None)
         return getattr(box, "rowid", None) if box is not None else f"idx:{i}"
-    print_split_report(
-        summarize_split(
-            episodes, train_idx, val_idx, test_idx, fresh_metas,
-            identities=[_crop_identity(it, i) for i, it in enumerate(fresh_items)],
-        ),
-        episode_gap_sec=args.episode_gap_sec,
+    split_summary = summarize_split(
+        episodes, train_idx, val_idx, test_idx, fresh_metas,
+        identities=[_crop_identity(it, i) for i, it in enumerate(fresh_items)],
     )
+    print_split_report(split_summary, episode_gap_sec=args.episode_gap_sec)
 
     # --- cross-source leakage guard: replay crops must not duplicate val/test ---
     # Replay memory is train-only, but a replay crop is an old fresh crop; if the
@@ -1253,20 +1251,25 @@ def main() -> None:
             log.warning("preview-augmentations: could not decode any sample crops")
 
     def predict_indices(indices: list[int]):
+        """Returns (y_true, y_pred, kept_indices, mean_loss). Loss uses the same
+        weighted criterion as training, for an honest val/test loss curve."""
         y_true: list[int] = []
         y_pred: list[int] = []
         kept: list[int] = []   # source item indices aligned with y_true/y_pred
+        loss_sum, n_seen = 0.0, 0
         with torch.no_grad():
             for batch_indices in index_batches(indices, args.batch_size):
                 batch = make_batch(batch_indices, eval_tf)
                 if batch is None:
                     continue
                 x, y, batch_kept = batch
-                pred = model(x).argmax(1)
+                logits = model(x)
+                loss_sum += float(criterion(logits, y)) * x.size(0)
+                n_seen += x.size(0)
                 y_true.extend(y.tolist())
-                y_pred.extend(pred.tolist())
+                y_pred.extend(logits.argmax(1).tolist())
                 kept.extend(batch_kept)
-        return y_true, y_pred, kept
+        return y_true, y_pred, kept, loss_sum / max(1, n_seen)
 
     # --- class-imbalance weighting (inverse frequency on TRAIN) ---
     counts = np.bincount([cls_to_idx[metas[j].label] for j in train_idx],
@@ -1317,20 +1320,36 @@ def main() -> None:
         "cat_classifier",
         run_name=run_stamp,
         params={
-            "augment": args.augment,
-            "epochs": args.epochs, "lr": lr, "batch_size": args.batch_size,
-            "val_frac": args.val_frac, "test_frac": args.test_frac,
-            "episode_gap_sec": args.episode_gap_sec, "seed": args.seed,
-            "finetune_mode": finetune_mode, "model": "efficientnet_b0",
+            # dataset source / reproducibility
+            "events_db": str(args.db), "recordings": str(args.recordings),
+            "reviews_db": str(args.reviews_db) if args.reviews_db else "",
+            # labels/classes (dynamic — never hardcoded)
             "classes": ",".join(classes), "num_classes": len(classes),
+            "label_to_index": json.dumps(cls_to_idx),
+            # split
+            "split_method": "episode-grouped (camera + wall_ms gap)",
+            "group_key": f"camera_id + wall_ms gap <= {args.episode_gap_sec:g}s",
+            "episode_gap_sec": args.episode_gap_sec,
+            "train_crops": len(train_idx), "val_crops": len(val_idx),
+            "test_crops": len(test_idx), "n_episodes": len(episodes),
+            "train_groups": split_summary["group_counts"]["train"],
+            "val_groups": split_summary["group_counts"]["val"],
+            "test_groups": split_summary["group_counts"]["test"],
+            "val_frac": args.val_frac, "test_frac": args.test_frac,
+            "replay_count": len(replay_metas),
+            # model / optimisation
+            "model": "efficientnet_b0", "image_size": INPUT_SIZE,
+            "optimizer": "AdamW", "weight_decay": 1e-4,
+            "lr": lr, "epochs": args.epochs, "batch_size": args.batch_size,
+            "finetune_mode": finetune_mode, "seed": args.seed,
+            # augmentation (mode + full config)
+            "augment": args.augment,
+            **{f"aug_{k}": v for k, v in vars(spec).items()},
+            # confusion config
             "confuse": ",".join(sorted(confuse)),
             "dangerous_confusions": ";".join(f"{d.actual}->{d.predicted}" for d in dangerous),
             "trust_classifier": args.trust_classifier,
             "min_recall_gate": args.min_recall,
-            "train_crops": len(train_idx), "val_crops": len(val_idx),
-            "test_crops": len(test_idx), "n_episodes": len(episodes),
-            "replay_count": len(replay_metas),
-            **{f"aug_{k}": v for k, v in vars(spec).items()},
         },
         tags={
             "split_method": "episode-grouped (camera + wall_ms gap)",
@@ -1338,6 +1357,11 @@ def main() -> None:
             "augment_random": spec.is_random,
         },
     )
+    if run.active:
+        log.info("mlflow ENABLED: uri=%s experiment=cat_classifier run_id=%s run_name=%s",
+                 run.tracking_uri, run.run_id, run_stamp)
+    else:
+        log.info("mlflow DISABLED (package not installed / no tracking) — training continues")
     run.log_metrics({f"train_count_{c}": int(n) for c, n in zip(classes, counts)})
 
     # --- train loop with best-by-(macro-recall, fewest confuse cross-errors) ---
@@ -1368,14 +1392,16 @@ def main() -> None:
         log_rss(log, "after-epoch", epoch=epoch)
 
         model.eval()
-        y_true, y_pred, _ = predict_indices(val_idx)
+        y_true, y_pred, _, val_loss = predict_indices(val_idx)
         cm = confusion(y_true, y_pred, len(classes))
         macro = supported_macro_recall(cm)
         cross = dangerous_confusion_report(cm, classes, dangerous)[0]
-        log.info("epoch %02d  train_loss=%.4f  val_macro_recall=%.3f  dangerous_errors=%d",
-                 epoch, running / max(1, seen), macro, cross)
+        train_loss = running / max(1, seen)
+        log.info("epoch %02d  train_loss=%.4f  val_loss=%.4f  val_macro_recall=%.3f  "
+                 "dangerous_errors=%d", epoch, train_loss, val_loss, macro, cross)
         run.log_metrics({
-            "train_loss": running / max(1, seen),
+            "train_loss": train_loss,
+            "val_loss": val_loss,
             "val_macro_recall": macro,
             "val_dangerous_errors": cross,
         }, step=epoch)
@@ -1400,9 +1426,10 @@ def main() -> None:
     idx_to_episode = {i: ep for ep, crops in enumerate(episodes) for i in crops}
 
     def full_report(indices):
-        yt, yp, kept = predict_indices(indices)
+        yt, yp, kept, loss = predict_indices(indices)
         cmx = confusion(yt, yp, len(classes))
         m = print_report(cmx, classes, confuse, dangerous=dangerous)
+        m["loss"] = loss
         # Per-camera / per-group breakdowns when that metadata exists.
         cams = [getattr(metas[i], "camera", None) for i in kept]
         grps = [idx_to_episode.get(i) for i in kept]
@@ -1463,6 +1490,7 @@ def main() -> None:
             f"{prefix}_overall_accuracy": mtr["overall_accuracy"],
             f"{prefix}_macro_recall": mtr["macro_recall"],
             f"{prefix}_macro_f1": mtr.get("macro_f1", 0.0),
+            f"{prefix}_loss": mtr.get("loss", 0.0),
             f"{prefix}_dangerous_errors": mtr.get("dangerous_errors", 0),
         }
         for c, v in mtr["recall"].items():
@@ -1477,6 +1505,10 @@ def main() -> None:
         # Per-camera accuracy, when present.
         for cam, cstats in (mtr.get("per_camera") or {}).items():
             flat[f"{prefix}_acc_camera_{cam}"] = cstats["accuracy"]
+        # Per-group/episode mean accuracy, when present.
+        pg = mtr.get("per_group") or {}
+        if "mean_group_accuracy" in pg:
+            flat[f"{prefix}_mean_group_accuracy"] = pg["mean_group_accuracy"]
         run.log_metrics(flat)
 
     _log_eval("val", metrics)
@@ -1493,10 +1525,24 @@ def main() -> None:
         write_labels_json(out_dir / "labels.json", classes)
         (out_dir / "classification_report.json").write_text(
             json.dumps({"val": metrics, "test": test_metrics}, indent=2), encoding="utf-8")
+        (out_dir / "split_report.json").write_text(json.dumps(split_summary, indent=2),
+                                                   encoding="utf-8")
+        (out_dir / "augmentation_config.json").write_text(
+            json.dumps({"level": args.augment, **vars(spec)}, indent=2), encoding="utf-8")
+        (out_dir / "training_config.json").write_text(json.dumps({
+            "model": "efficientnet_b0", "image_size": INPUT_SIZE, "optimizer": "AdamW",
+            "weight_decay": 1e-4, "lr": lr, "epochs": args.epochs,
+            "batch_size": args.batch_size, "seed": args.seed,
+            "finetune_mode": finetune_mode, "augment": args.augment,
+            "events_db": str(args.db), "recordings": str(args.recordings),
+            "reviews_db": str(args.reviews_db) if args.reviews_db else None,
+            "classes": classes, "num_classes": len(classes),
+        }, indent=2), encoding="utf-8")
         write_confusion_csv(out_dir / "confusion_matrix.csv", cm, classes)
         write_confusion_png(out_dir / "confusion_matrix.png", cm, classes,
                             title="val confusion matrix")
-        artifacts = ["labels.json", "classification_report.json",
+        artifacts = ["labels.json", "classification_report.json", "split_report.json",
+                     "augmentation_config.json", "training_config.json",
                      "confusion_matrix.csv", "confusion_matrix.png"]
         if test_metrics is not None:
             write_confusion_csv(out_dir / "test_confusion_matrix.csv", test_cm, classes)
@@ -1551,6 +1597,22 @@ def main() -> None:
 
     run.log_metric("val_pass", 0.0 if failing else 1.0)
     run.set_tags({"result": "FAIL" if failing else "PASS"})
+
+    # --- concise run summary ---
+    print("\n===== run summary =====")
+    if run.active:
+        print(f"  mlflow run_id : {run.run_id}  (uri {run.tracking_uri})")
+    else:
+        print("  mlflow        : disabled")
+    print(f"  model         : {pt_path}")
+    print(f"  val accuracy  : {metrics['overall_accuracy']:.3f}   "
+          f"macro F1 : {metrics.get('macro_f1', 0.0):.3f}")
+    print(f"  confusion     : {out_dir / 'confusion_matrix.png'}")
+    if dangerous:
+        dt = metrics.get("dangerous_errors", 0)
+        print(f"  dangerous     : {dt} error(s) across {len(dangerous)} configured pair(s)")
+    print(f"  result        : {'FAIL' if failing else 'PASS'}")
+
     run.end()
 
 
