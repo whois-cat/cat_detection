@@ -261,11 +261,14 @@ def _is_near_duplicate(
     return float(x[i] @ x[j]) >= threshold
 
 
+# Crop-record fields that imply a hidden/collapsed model — never written.
 REVIEW_ONLY_FIELDS = (
     "review_visible", "is_duplicate", "duplicate_group_id",
     "representative_rank", "sampling_reason", "suspicious_score",
-    "suspicious_reasons",
+    "suspicious_reasons", "hidden", "collapsed",
 )
+# Cluster-record fields that count shown/hidden crops — never written.
+HIDDEN_CLUSTER_FIELDS = ("visible_count", "hidden_duplicate_count")
 
 
 def _strip_review_fields(item: dict) -> None:
@@ -273,6 +276,41 @@ def _strip_review_fields(item: dict) -> None:
     manifests carry only what the UI shows, so these must never be written."""
     for key in REVIEW_ONLY_FIELDS:
         item.pop(key, None)
+
+
+def assert_review_manifest_invariants(items: list[dict], clusters: list[dict],
+                                      max_per_cluster: int) -> None:
+    """Fail loudly (before writing) if the manifest is not review-exact. Encodes
+    the acceptance criteria so a non-compliant clusters.json can never be written:
+    hard cap respected, compact in-range item_indices, size == len(item_indices),
+    and no hidden/collapsed crop or cluster fields."""
+    n = len(items)
+    for item in items:
+        bad = set(item) & set(REVIEW_ONLY_FIELDS)
+        if bad:
+            raise SystemExit(f"manifest invariant: item {item.get('crop_id')!r} "
+                             f"still has hidden/collapsed field(s): {sorted(bad)}")
+    seen: set[int] = set()
+    for c in clusters:
+        idxs = c["item_indices"]
+        if max_per_cluster > 0 and len(idxs) > max_per_cluster:
+            raise SystemExit(f"manifest invariant: cluster {c['cluster_id']} has "
+                             f"{len(idxs)} crops > --max-cluster-size {max_per_cluster}")
+        if c.get("size") != len(idxs):
+            raise SystemExit(f"manifest invariant: cluster {c['cluster_id']} size "
+                             f"{c.get('size')} != len(item_indices) {len(idxs)}")
+        bad_c = set(c) & set(HIDDEN_CLUSTER_FIELDS)
+        if bad_c:
+            raise SystemExit(f"manifest invariant: cluster {c['cluster_id']} has "
+                             f"shown/hidden counter(s): {sorted(bad_c)}")
+        for i in idxs:
+            if not (0 <= i < n):
+                raise SystemExit(f"manifest invariant: cluster {c['cluster_id']} "
+                                 f"item index {i} out of range [0,{n})")
+            if i in seen:
+                raise SystemExit(f"manifest invariant: item index {i} referenced by "
+                                 "more than one cluster")
+            seen.add(i)
 
 
 def select_review_crops(
@@ -743,6 +781,10 @@ def main() -> None:
         "items": items,
         "clusters": clusters,
     }
+
+    # Enforce the review-exact invariants before writing — a non-compliant
+    # manifest is never written, even if a future change regresses the pipeline.
+    assert_review_manifest_invariants(items, clusters, args.max_cluster_size)
 
     written = len(items)
     dropped = source_crops - written

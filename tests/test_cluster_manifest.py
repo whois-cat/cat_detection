@@ -1,12 +1,46 @@
 import numpy as np
 
+import pytest
+
 from training.build_cluster_manifest import (
     REVIEW_ONLY_FIELDS,
     _strip_review_fields,
+    assert_review_manifest_invariants,
     compact_items_to_clusters,
     select_review_crops,
     thin_cluster_members,
 )
+
+
+def test_invariants_pass_for_compliant_manifest():
+    items = [{"crop_id": f"c{i}"} for i in range(3)]
+    clusters = [{"cluster_id": 0, "size": 2, "item_indices": [0, 1]},
+                {"cluster_id": 1, "size": 1, "item_indices": [2]}]
+    assert_review_manifest_invariants(items, clusters, max_per_cluster=16)  # no raise
+
+
+def test_invariants_reject_over_cap():
+    items = [{"crop_id": f"c{i}"} for i in range(5)]
+    clusters = [{"cluster_id": 0, "size": 5, "item_indices": [0, 1, 2, 3, 4]}]
+    with pytest.raises(SystemExit, match="max-cluster-size"):
+        assert_review_manifest_invariants(items, clusters, max_per_cluster=4)
+
+
+def test_invariants_reject_hidden_item_field():
+    items = [{"crop_id": "c0", "review_visible": True}]
+    clusters = [{"cluster_id": 0, "size": 1, "item_indices": [0]}]
+    with pytest.raises(SystemExit, match="hidden/collapsed"):
+        assert_review_manifest_invariants(items, clusters, max_per_cluster=16)
+
+
+def test_invariants_reject_hidden_cluster_field_and_bad_index():
+    items = [{"crop_id": "c0"}]
+    with pytest.raises(SystemExit, match="counter"):
+        assert_review_manifest_invariants(
+            items, [{"cluster_id": 0, "size": 1, "item_indices": [0], "visible_count": 1}], 16)
+    with pytest.raises(SystemExit, match="out of range"):
+        assert_review_manifest_invariants(
+            items, [{"cluster_id": 0, "size": 1, "item_indices": [9]}], 16)
 
 
 def _distinct_items(n, camera="grey", *, gap_ms=10_000):
