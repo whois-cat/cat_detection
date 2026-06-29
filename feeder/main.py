@@ -38,6 +38,10 @@ Env vars (all from configure.py — nothing hardcoded):
   MIN_MEAL_SEC            min meal duration (sec) (default 10)
   PRESENCE_WINDOW_SEC     sliding window (sec) for n_cats / identity smoothing (default 5)
   CLASSIFIER_MIN_CONF     min cat_score to participate in identity vote (default 0.9)
+  OPEN_MIN_CONFIDENCE     decision gate: block ("low_confidence") if the winning
+                          identity's mean score is below this (default 0 = off)
+  OPEN_MIN_MARGIN         decision gate: block ("low_margin") if top1-top2 margin is
+                          below this — inert until the detector emits top-2 (default 0)
   OPEN_DEBOUNCE_SEC       allowed cat must hold the open-verdict this long before
                           the door opens (default 3)
   MULTI_DEBOUNCE_SEC      a multi_cat / identity-change condition must hold this
@@ -107,6 +111,12 @@ DOOR_CLOSE_TIMEOUT_SEC = float(os.environ.get("DOOR_CLOSE_TIMEOUT_SEC", "30"))
 MIN_MEAL_SEC           = float(os.environ.get("MIN_MEAL_SEC", "10"))
 PRESENCE_WINDOW_SEC    = float(os.environ.get("PRESENCE_WINDOW_SEC", "5"))
 CLASSIFIER_MIN_CONF    = float(os.environ.get("CLASSIFIER_MIN_CONF", "0.9"))
+# Decision-level gates (default 0 = off, so behaviour is unchanged unless set).
+# OPEN_MIN_CONFIDENCE blocks an open whose winning identity's mean score is below
+# it (explicit "low_confidence" reason, on top of the vote-time CLASSIFIER_MIN_CONF
+# filter). OPEN_MIN_MARGIN is inert until the detector emits top-2 (see zone_state).
+OPEN_MIN_CONFIDENCE    = float(os.environ.get("OPEN_MIN_CONFIDENCE", "0"))
+OPEN_MIN_MARGIN        = float(os.environ.get("OPEN_MIN_MARGIN", "0"))
 OPEN_DEBOUNCE_SEC      = float(os.environ.get("OPEN_DEBOUNCE_SEC", "3"))
 MULTI_DEBOUNCE_SEC     = float(os.environ.get("MULTI_DEBOUNCE_SEC", "2"))
 DISPLAY_TEXT_INTERVAL  = max(1, int(os.environ.get("DISPLAY_TEXT_INTERVAL", "2")))
@@ -299,21 +309,26 @@ def _handle_event(
         _zone.update(wall_t, ev.get("cat"), ev.get("cat_score"), bool(box.get("in_action")))
 
     snap = _zone.snapshot(wall_t)
-    action, reason = decide(snap, ALLOWED_CATS, DANGEROUS_CONFUSIONS)
+    action, reason = decide(
+        snap, ALLOWED_CATS, DANGEROUS_CONFUSIONS,
+        min_confidence=OPEN_MIN_CONFIDENCE, min_margin=OPEN_MIN_MARGIN,
+    )
 
-    # Diagnostic: a cat is present but the door isn't being opened (no_identity /
-    # not_allowed / multi_cat). Edge-triggered so it can't flood the log: write
-    # once when the (action, identity, reason) changes.
+    # Explainable decision context (label-agnostic; top2/margin shown when known).
+    conf = "n/a" if snap.identity_score is None else f"{snap.identity_score:.3f}"
+    margin = "n/a" if snap.margin is None else f"{snap.margin:.3f}"
+    ctx = (f"feeder={FEEDER_ID} camera={CAMERA_ID} identity={snap.identity} "
+           f"conf={conf} margin={margin} n_cats={snap.n_cats} allowed={ALLOWED_CATS} "
+           f"action={action} reason={reason}")
+
+    # Diagnostic: a cat is present but the door isn't being opened. Edge-triggered
+    # so it can't flood the log: write once when the (action, identity, reason) changes.
     global _last_not_opening_key
     if snap.present and action != "open":
         key = (action, snap.identity, reason)
         if key != _last_not_opening_key:
             _last_not_opening_key = key
-            print(
-                f"[feeder={FEEDER_ID}] not opening: action={action} reason={reason}"
-                f" identity={snap.identity} n_cats={snap.n_cats}",
-                flush=True,
-            )
+            print(f"[feeder] decision: {ctx}", flush=True)
     else:
         _last_not_opening_key = None       # reset so re-entering the state re-logs
 
@@ -331,6 +346,7 @@ def _handle_event(
             _reset_close_backstop()
             _set_display_for_open(client, cmd.cat)
             print(f"[feeder={FEEDER_ID}] door opened: cat={cmd.cat}", flush=True)
+            print(f"[feeder] decision: {ctx}", flush=True)   # explainable open record
 
     elif cmd.kind == "close":
         if client.set_door("close", cmd.reason):

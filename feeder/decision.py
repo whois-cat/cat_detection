@@ -10,9 +10,17 @@ Decision rules (evaluated in order):
   n_cats >= 2 (sustained simultaneous) → "close",  "multi_cat"
   identity is None                     → "close",  "no_identity"
   identity not in allowed_cats         → "close",  "not_allowed:<cat>"
+  identity confidence < min_confidence → "close",  "low_confidence:<cat>"
+  identity margin < min_margin         → "close",  "low_margin:<cat>"  (only when a
+    top-2 margin is available; see ZoneSummary.margin TODO — never faked)
   identity blocked by a dangerous      → "close",  "dangerous_confusion:<actual>~<predicted>"
     confusion (block_open)
   identity in allowed_cats             → "open",   <cat>
+
+Temporal stability is handled upstream: ZoneState aggregates a sliding window of
+weighted votes (single weak frames can't win) and DoorFSM debounces the verdict
+(an open must hold for open_debounce_sec). decide() stays a pure per-snapshot
+function; the FSM is what turns a flickering verdict into "no open".
 """
 from __future__ import annotations
 
@@ -56,6 +64,9 @@ def decide(
     snap: ZoneSummary,
     allowed_cats: list[str],
     dangerous_confusions: "list[DangerousConfusion] | tuple" = (),
+    *,
+    min_confidence: float = 0.0,
+    min_margin: float = 0.0,
 ) -> tuple[str | None, str]:
     if not snap.present:
         return "close", "no_cat"
@@ -70,6 +81,21 @@ def decide(
 
     if cat not in allowed_cats:
         return "close", f"not_allowed:{cat}"
+
+    # Confidence gate (decision-level, configurable). Only applies when a real
+    # classifier score is available for the winning identity.
+    if (min_confidence > 0
+            and snap.identity_score is not None
+            and snap.identity_score < min_confidence):
+        return "close", f"low_confidence:{cat}"
+
+    # Margin gate. Only fires when a top1−top2 margin is actually available — the
+    # event stream doesn't carry top-2 today, so this is inert until the detector
+    # populates ZoneSummary.margin. We never synthesise a margin from votes.
+    if (min_margin > 0
+            and snap.margin is not None
+            and snap.margin < min_margin):
+        return "close", f"low_margin:{cat}"
 
     # Config-driven safety gate: if the resolved identity is a label that a
     # configured dangerous confusion says could really be a NON-allowed cat,

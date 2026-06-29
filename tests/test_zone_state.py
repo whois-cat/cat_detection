@@ -51,3 +51,23 @@ def test_presence_expires_after_timeout():
     z.update(0.0, "alisa", 0.9, True)
     assert z.snapshot(10.0).present is True       # within 30s timeout
     assert z.snapshot(31.0).present is False      # past it
+
+
+def test_identity_score_is_mean_of_winning_cat_scores():
+    z = _zone()
+    z.update(0.0, "cat_a", 0.8, True)
+    z.update(1.0, "cat_a", 0.9, True)
+    z.update(2.0, "cat_b", 0.95, True)   # loses the vote (one frame vs two)
+    snap = z.snapshot(2.0)
+    assert snap.identity == "cat_a"
+    assert round(snap.identity_score, 3) == 0.85   # mean(0.8, 0.9)
+    assert snap.margin is None                      # top-2 not in the event stream
+
+
+def test_identity_score_none_for_scoreless_path():
+    z = _zone()
+    z.update(0.0, "cat_a", None, True)   # non-classifier path (blob/yolo)
+    z.update(1.0, "cat_a", None, True)
+    snap = z.snapshot(1.0)
+    assert snap.identity == "cat_a"
+    assert snap.identity_score is None

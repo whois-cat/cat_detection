@@ -129,6 +129,13 @@
 #                             identity vote (default 0.9). Frames below this threshold
 #                             are silently excluded from voting; "unknown" is always
 #                             excluded. Raise this to make identity selection stricter.
+#     open_min_confidence    — decision gate (default 0 = off): block the open with
+#                             reason "low_confidence" if the winning identity's mean
+#                             score is below this. Separate from classifier_min_conf
+#                             (which filters who votes).
+#     open_min_margin        — decision gate (default 0 = off): block with "low_margin"
+#                             if top1−top2 margin < this. Inert until the detector
+#                             emits top-2 scores; safe to leave unset.
 #     open_debounce_sec      — an allowed+ready cat must stay the dominant open-verdict
 #                             continuously for this long before the door opens (default
 #                             3). Prevents opening on a momentary glimpse.
@@ -207,6 +214,11 @@ cameras:
       api_base_url: http://192.168.0.100
       serial_number: ABC123456
       allowed_cats: [alisa, ellie]
+      # Safety gates (recommended). Runtime default is 0/off for back-compat, but
+      # ship a safe value here so a copied config isn't wide open. open_min_margin
+      # is inert until the detector emits top-2 scores, but harmless to set now.
+      open_min_confidence: 0.85
+      open_min_margin: 0.15
       # Feeding is optional. Pick ONE mode (mutually exclusive). Every dispense is
       # logged to the shared /data/feed_journal/journal.db regardless of mode.
       #
@@ -235,6 +247,8 @@ cameras:
       api_base_url: http://192.168.0.101
       serial_number: DEF789012
       allowed_cats: [chuzh]
+      open_min_confidence: 0.85   # safety gate (see feeder1 above)
+      open_min_margin: 0.15
       # Concrete scheduled example: 1 portion at each of these local times.
       # After a restart, only the latest feed_catchup_max missed slots are fed;
       # older missed slots are journaled as "maintenance" (skipped, not dispensed).

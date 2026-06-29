@@ -26,6 +26,14 @@ class ZoneSummary:
     identity: str | None  # dominant weighted-vote cat identity (None = unresolved)
     present: bool         # any in-zone detection within door_close_timeout_sec
     meal_sec: float       # last_seen − first_seen for the current presence episode
+    identity_score: float | None = None  # mean cat_score of the winning identity's
+                                         # qualifying frames (None for non-classifier
+                                         # paths or no identity) — real confidence
+    # Top1−top2 probability margin for the winning identity. The detector event
+    # stream currently carries only top-1 (cat + cat_score), so this stays None.
+    # TODO: when the detector emits top-k per box, populate this so decide()'s
+    # min_margin gate activates — do NOT synthesise it from window votes.
+    margin: float | None = None
 
 
 class ZoneState:
@@ -98,6 +106,8 @@ class ZoneState:
         # "unknown" is excluded. Non-classifier paths (cat_score=None) vote
         # with weight 1.0 (blob detector, YOLO without classifier).
         votes: dict[str, float] = {}
+        score_sum: dict[str, float] = {}
+        score_cnt: dict[str, int] = {}
         for cats in recent.values():
             for cat, score in cats:
                 if not cat or cat == "unknown":
@@ -105,7 +115,17 @@ class ZoneState:
                 if score is not None and score < self._min_conf:
                     continue
                 votes[cat] = votes.get(cat, 0.0) + (score if score is not None else 1.0)
+                if score is not None:
+                    score_sum[cat] = score_sum.get(cat, 0.0) + score
+                    score_cnt[cat] = score_cnt.get(cat, 0) + 1
         identity = max(votes, key=votes.__getitem__) if votes else None
+        # Real confidence for the chosen identity = mean of its qualifying
+        # classifier scores. None when the winner only has scoreless votes
+        # (non-classifier path) — decide() then skips the confidence gate.
+        identity_score = (
+            score_sum[identity] / score_cnt[identity]
+            if identity is not None and score_cnt.get(identity) else None
+        )
 
         # --- present: any detection within door_close_timeout_sec ---
         present = (
@@ -126,4 +146,6 @@ class ZoneState:
             identity=identity,
             present=present,
             meal_sec=meal_sec,
+            identity_score=identity_score,
+            margin=None,   # top-2 not available in the event stream (see ZoneSummary)
         )

@@ -53,8 +53,9 @@ def test_stable_allowed_cat_opens():
 
 # ---- decide() verdicts (no cooldown) ----
 
-def _present(identity="alisa", n_cats=1, present=True):
-    return ZoneSummary(n_cats=n_cats, identity=identity, present=present, meal_sec=0.0)
+def _present(identity="alisa", n_cats=1, present=True, identity_score=None, margin=None):
+    return ZoneSummary(n_cats=n_cats, identity=identity, present=present, meal_sec=0.0,
+                       identity_score=identity_score, margin=margin)
 
 
 def test_allowed_present_single_cat_opens():
@@ -69,6 +70,47 @@ def test_not_allowed_cat_closes():
     action, reason = decide(_present("chuzh"), ["alisa"])
     assert action == "close"
     assert reason == "not_allowed:chuzh"
+
+
+# ---- confidence + margin gates (generic fixtures) ----
+
+def test_low_confidence_blocks_open():
+    # Allowed cat, but the winning identity's confidence is below the gate.
+    action, reason = decide(_present("cat_a", identity_score=0.6), ["cat_a"],
+                            min_confidence=0.85)
+    assert action == "close" and reason == "low_confidence:cat_a"
+
+
+def test_high_confidence_opens():
+    action, reason = decide(_present("cat_a", identity_score=0.95), ["cat_a"],
+                            min_confidence=0.85)
+    assert action == "open" and reason == "cat_a"
+
+
+def test_confidence_gate_off_by_default():
+    # Default min_confidence=0 → no decision-level confidence gate.
+    action, reason = decide(_present("cat_a", identity_score=0.10), ["cat_a"])
+    assert action == "open" and reason == "cat_a"
+
+
+def test_confidence_gate_skipped_when_score_unavailable():
+    # Non-classifier path (no score) → confidence gate can't apply, still opens.
+    action, reason = decide(_present("cat_a", identity_score=None), ["cat_a"],
+                            min_confidence=0.85)
+    assert action == "open" and reason == "cat_a"
+
+
+def test_margin_gate_inert_until_margin_available():
+    # min_margin set but margin is None (detector emits no top-2) → does NOT block.
+    action, _ = decide(_present("cat_a", identity_score=0.95, margin=None), ["cat_a"],
+                       min_margin=0.2)
+    assert action == "open"
+
+
+def test_low_margin_blocks_when_margin_present():
+    action, reason = decide(_present("cat_a", identity_score=0.95, margin=0.05), ["cat_a"],
+                            min_margin=0.2)
+    assert action == "close" and reason == "low_margin:cat_a"
 
 
 # ---- config-driven dangerous confusions (generic fixtures) ----

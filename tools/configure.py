@@ -346,6 +346,8 @@ def render_compose(cfg: dict) -> str:
                 "MIN_MEAL_SEC":            str(feeder.get("min_meal_sec", 10)),
                 "PRESENCE_WINDOW_SEC":     str(feeder.get("presence_window_sec", 5)),
                 "CLASSIFIER_MIN_CONF":     str(feeder.get("classifier_min_conf", 0.9)),
+                "OPEN_MIN_CONFIDENCE":     str(feeder.get("open_min_confidence", 0)),
+                "OPEN_MIN_MARGIN":         str(feeder.get("open_min_margin", 0)),
                 "OPEN_DEBOUNCE_SEC":       str(feeder.get("open_debounce_sec", 3)),
                 "MULTI_DEBOUNCE_SEC":      str(feeder.get("multi_debounce_sec", 2)),
                 "DISPLAY_TEXT_INTERVAL":   str(feeder.get("display_text_interval", 2)),
