@@ -45,9 +45,13 @@ from typing import Iterator
 import numpy as np
 
 from training.augment import (
+    INPUT_SIZE,
     LEVELS as AUG_LEVELS,
+    RESIZE_SHORT,
     augment_spec,
+    build_eval_transform,
     build_train_transform,
+    resize_short_for,
     save_augmentation_preview,
 )
 from training.mltracking import start_run
@@ -776,7 +780,7 @@ def configure_finetune(model, *, head_only: bool, full_finetune: bool):
 
 # ------------------------------------------------------------------- main -----
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", type=Path, required=True)
@@ -866,15 +870,39 @@ def main() -> None:
     ap.add_argument("--preview-augmentations", type=Path, default=None,
                     help="debug only: save a grid of original + augmented versions of a few "
                          "train crops to this dir, then continue. Never written into the dataset")
+    ap.add_argument("--image-size", type=int, default=INPUT_SIZE,
+                    help=f"classifier input (center-crop) size; default {INPUT_SIZE}. "
+                         "Short-side resize scales proportionally (256/224 ratio). "
+                         "Used consistently across train/val/test transforms. NOTE: "
+                         "the runtime detector still preprocesses to 256->224, so a "
+                         "non-default size requires aligning serve-time preprocessing "
+                         "before promoting the model")
     ap.add_argument("--out-root", type=Path, default=ROOT / "models/trained")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     if args.cache_max_side is not None:
         args.batch_max_side = args.cache_max_side
 
+    # Center-crop input size + its proportional short-side resize. Both feed the
+    # train/val/test transforms so framing is consistent at any --image-size.
+    if args.image_size < 1:
+        raise SystemExit(f"--image-size must be >= 1, got {args.image_size}")
+    args.resize_short = resize_short_for(args.image_size)
+
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    if args.image_size != INPUT_SIZE:
+        log.warning(
+            "image_size=%d (resize_short=%d) differs from the runtime default %d: "
+            "the detector still preprocesses to %d->%d, so align serve-time "
+            "preprocessing before promoting this model.",
+            args.image_size, args.resize_short, INPUT_SIZE, RESIZE_SHORT, INPUT_SIZE,
+        )
 
     import torch
     import torch.nn as nn
@@ -1180,7 +1208,19 @@ def main() -> None:
         spec.scale_min, spec.scale_max, spec.brightness, spec.contrast,
         spec.gamma, spec.noise_std, spec.blur_prob, spec.pad_frac * 100,
     )
-    train_pipe = build_train_transform(args.augment, IMAGENET_MEAN, IMAGENET_STD)
+    train_pipe = build_train_transform(
+        args.augment, IMAGENET_MEAN, IMAGENET_STD,
+        size=args.image_size, resize=args.resize_short)
+
+    # At the default size, val/test use the EXACT runtime preprocessing (_preprocess)
+    # so the reported metrics match serve time. At a non-default --image-size the
+    # runtime path doesn't apply, so val/test use the same deterministic eval
+    # transform at the chosen size — keeping train/val/test framing consistent.
+    eval_pipe = (
+        build_eval_transform(IMAGENET_MEAN, IMAGENET_STD,
+                             size=args.image_size, resize=args.resize_short)
+        if args.image_size != INPUT_SIZE else None
+    )
 
     def train_tf(img_bgr):
         from PIL import Image
@@ -1189,6 +1229,9 @@ def main() -> None:
 
     def eval_tf(img_bgr):
         rgb = np.ascontiguousarray(img_bgr[..., ::-1])
+        if eval_pipe is not None:
+            from PIL import Image
+            return eval_pipe(Image.fromarray(rgb))
         return torch.from_numpy(_preprocess(rgb)[0]).float()  # == runtime preprocessing
 
     def make_batch(batch_indices: list[int], tf, *, max_side: int = 0):
@@ -1233,7 +1276,6 @@ def main() -> None:
 
     # --- optional augmentation preview (debug only; never written to dataset) ---
     if args.preview_augmentations:
-        from training.augment import build_eval_transform
         sample = train_idx[:6]
         bgr_by_pos: dict[int, np.ndarray] = {}
         pending_refs, pending_pos = [], []
@@ -1259,7 +1301,8 @@ def main() -> None:
         if crops_rgb:
             written = save_augmentation_preview(
                 args.preview_augmentations, crops_rgb, train_pipe,
-                build_eval_transform(IMAGENET_MEAN, IMAGENET_STD),
+                build_eval_transform(IMAGENET_MEAN, IMAGENET_STD,
+                                     size=args.image_size, resize=args.resize_short),
             )
             log.info("wrote %d augmentation preview grid(s) to %s",
                      len(written), args.preview_augmentations)
@@ -1354,7 +1397,8 @@ def main() -> None:
             "val_frac": args.val_frac, "test_frac": args.test_frac,
             "replay_count": len(replay_metas),
             # model / optimisation
-            "model": "efficientnet_b0", "image_size": INPUT_SIZE,
+            "model": "efficientnet_b0", "image_size": args.image_size,
+            "resize_short_side": args.resize_short,
             "optimizer": "AdamW", "weight_decay": 1e-4,
             "lr": lr, "epochs": args.epochs, "batch_size": args.batch_size,
             "finetune_mode": finetune_mode, "seed": args.seed,
@@ -1475,10 +1519,14 @@ def main() -> None:
         "class_names": classes,
         "pad_frac": args.pad_frac,
         "preprocessing": {
-            "resize_short_side": 256, "center_crop": 224,
+            "resize_short_side": args.resize_short, "center_crop": args.image_size,
             "mean": IMAGENET_MEAN, "std": IMAGENET_STD,
             "interpolation": "bilinear",
-            "note": "byte-identical to detector/classifier.py::_preprocess",
+            "note": ("byte-identical to detector/classifier.py::_preprocess"
+                     if args.image_size == INPUT_SIZE else
+                     "WARNING: image_size != runtime default; detector/classifier.py "
+                     "still preprocesses to 256->224 — align serve-time preprocessing "
+                     "before promoting"),
         },
         "trust_classifier": args.trust_classifier,
         "trust_conf": args.trust_conf, "confuse": sorted(confuse),
@@ -1546,7 +1594,8 @@ def main() -> None:
         (out_dir / "augmentation_config.json").write_text(
             json.dumps({"level": args.augment, **vars(spec)}, indent=2), encoding="utf-8")
         (out_dir / "training_config.json").write_text(json.dumps({
-            "model": "efficientnet_b0", "image_size": INPUT_SIZE, "optimizer": "AdamW",
+            "model": "efficientnet_b0", "image_size": args.image_size,
+            "resize_short_side": args.resize_short, "optimizer": "AdamW",
             "weight_decay": 1e-4, "lr": lr, "epochs": args.epochs,
             "batch_size": args.batch_size, "seed": args.seed,
             "finetune_mode": finetune_mode, "augment": args.augment,

@@ -33,6 +33,16 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+def resize_short_for(size: int) -> int:
+    """Short-side resize that preserves the eval crop ratio (RESIZE_SHORT/INPUT_SIZE
+    = 256/224) for a given center-crop ``size``. 224 -> 256; scales proportionally
+    for other input sizes (e.g. 384 -> 439) so train/val/test framing stays
+    consistent at any --image-size."""
+    if size < 1:
+        raise ValueError(f"image size must be >= 1, got {size}")
+    return int(round(size * RESIZE_SHORT / INPUT_SIZE))
+
+
 @dataclass(frozen=True)
 class AugmentSpec:
     """A single augmentation level. All geometry is mild; the ``*_flip`` /
