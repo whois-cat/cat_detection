@@ -59,3 +59,17 @@ models/*.pt
 models/trained/
 models/backups/
 models/classifier/
+
+# Legacy baked classifier checkpoint — no longer used at runtime (model is
+# delivered via the models/classifier volume). Untracked with `git rm --cached`.
+detector/models/
+
+# Local runtime config — carries real cat/camera names + ${ENV} secret refs.
+# Per-deployment, like cameras.yaml; commit a *.example instead if one is added.
+configs/
+
+# Generated evaluation/report artifacts.
+reports/
+
+# Ultralytics auto-downloads yolov8n.pt into the repo root on first run.
+yolov8n.pt
