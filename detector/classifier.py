@@ -39,14 +39,71 @@ def _preprocess(crop_rgb: np.ndarray) -> np.ndarray:
     return arr.transpose(2, 0, 1)[np.newaxis]  # (1, 3, 224, 224) float32
 
 
+# Shown in every "model not usable" error so the operator knows the next step.
+# The runtime IR is baked at detector build time from the promoted checkpoint.
+_PROMOTE_HINT = (
+    "To (re)create the runtime model:\n"
+    "    just classifier-promote     # promote the latest trained checkpoint\n"
+    "    just up                     # rebuild + restart the detector (re-exports the IR)\n"
+    "Or set CLASSIFIER_WEIGHTS to a dir containing "
+    "cat_classifier.xml + cat_classifier.bin + classes.json."
+)
+
+
+def _require_runtime_file(path: Path, model_dir: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"runtime classifier file missing: {path}\n"
+            f"(classifier model dir: {model_dir})\n{_PROMOTE_HINT}"
+        )
+
+
+def _load_class_names(classes_path: Path, model_dir: Path) -> list[str]:
+    try:
+        names = json.loads(classes_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise ValueError(
+            f"invalid classes.json ({classes_path}): {e}\n{_PROMOTE_HINT}"
+        ) from e
+    if (not isinstance(names, list) or not names
+            or not all(isinstance(n, str) for n in names)):
+        raise ValueError(
+            f"classes.json must be a non-empty list of label strings ({classes_path})\n"
+            f"{_PROMOTE_HINT}"
+        )
+    return names
+
+
+def _check_output_dim(out_dim: int, n_classes: int, model_dir: Path) -> None:
+    """Pure guard (no OpenVINO) so it's unit-testable: the IR's output width must
+    equal the number of labels in classes.json, else predictions mislabel."""
+    if out_dim != n_classes:
+        raise ValueError(
+            f"classifier/classes mismatch in {model_dir}: the model outputs "
+            f"{out_dim} classes but classes.json lists {n_classes}. The IR and "
+            f"classes.json are out of sync.\n{_PROMOTE_HINT}"
+        )
+
+
 class CatClassifier:
     """Thread-safe EfficientNet-B0 classifier backed by an OpenVINO IR."""
 
     def __init__(self, model_dir: str | Path) -> None:
+        model_dir = Path(model_dir)
+        xml = model_dir / "cat_classifier.xml"
+        bin_ = model_dir / "cat_classifier.bin"
+        classes_path = model_dir / "classes.json"
+        # Validate required artifacts up front, BEFORE importing OpenVINO, so the
+        # failure is a clear actionable message (and so this guard is testable
+        # without an OpenVINO install).
+        _require_runtime_file(xml, model_dir)
+        _require_runtime_file(bin_, model_dir)
+        _require_runtime_file(classes_path, model_dir)
+        self.class_names: list[str] = _load_class_names(classes_path, model_dir)
+
         import openvino as ov
         import openvino.properties.hint as hints
 
-        model_dir = Path(model_dir)
         core = ov.Core()
         # Force FP32 inference. The CPU plugin otherwise runs FP32 IRs in bf16 by
         # default on AVX512_BF16/AMX hardware, whose ~8-bit mantissa shifts logits
@@ -55,13 +112,17 @@ class CatClassifier:
         # enforces FP32). Typed property — string keys can be silently ignored.
         # The speed cost is negligible for one B0 crop.
         self._compiled = core.compile_model(
-            core.read_model(str(model_dir / "cat_classifier.xml")),
+            core.read_model(str(xml)),
             "CPU",
             {hints.inference_precision: ov.Type.f32},
         )
-        self.class_names: list[str] = json.loads(
-            (model_dir / "classes.json").read_text(encoding="utf-8")
-        )
+        # Output width must match the label count (when statically known).
+        try:
+            out_dim = self._compiled.output(0).partial_shape[-1].get_length()
+        except Exception:
+            out_dim = None     # dynamic shape — skip cleanly rather than crash
+        if out_dim is not None:
+            _check_output_dim(out_dim, len(self.class_names), model_dir)
 
     def _probs(self, crop_rgb: np.ndarray) -> np.ndarray:
         """Softmax probability vector for one crop. classify_all() goes through

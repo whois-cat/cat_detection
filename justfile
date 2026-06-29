@@ -232,6 +232,19 @@ train-compare *ARGS:
         --reviews-db "{{review_db}}" \
         {{ARGS}}
 
+# Promote a trained checkpoint to the active bake source models/cat_classifier.pt.
+# Default (no SRC) selects the newest models/trained/*/cat_classifier.pt. Validated
+# + atomic + backs up the previous active file. Rebuild after: `just up`.
+[group('train')]
+classifier-promote SRC="":
+    {{CLASSIFIER_RUN}} python tools/promote_classifier.py promote --src "{{SRC}}"
+
+# Roll back models/cat_classifier.pt to a previous backup (default: newest backup).
+# Rebuild after: `just up`.
+[group('train')]
+classifier-rollback BACKUP="":
+    {{CLASSIFIER_RUN}} python tools/promote_classifier.py rollback --backup "{{BACKUP}}"
+
 # ──────────────────────────── journal ────────────────────────────
 
 # Show how a cat has been eating (door-open sessions) over the last N days.
