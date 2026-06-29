@@ -40,14 +40,25 @@ def _preprocess(crop_rgb: np.ndarray) -> np.ndarray:
 
 
 # Shown in every "model not usable" error so the operator knows the next step.
-# The runtime IR is baked at detector build time from the promoted checkpoint.
+# The runtime model is delivered via the shared read-only volume
+# (CLASSIFIER_WEIGHTS=/opt/models/classifier/current); switch it with promote.
 _PROMOTE_HINT = (
-    "To (re)create the runtime model:\n"
-    "    just classifier-promote     # promote the latest trained checkpoint\n"
-    "    just up                     # rebuild + restart the detector (re-exports the IR)\n"
-    "Or set CLASSIFIER_WEIGHTS to a dir containing "
-    "cat_classifier.xml + cat_classifier.bin + classes.json."
+    "To (re)create / fix the runtime model (no image rebuild needed):\n"
+    "    just classifier-promote     # export latest trained checkpoint + switch `current`\n"
+    "    just classifier-restart     # restart detectors to load it\n"
+    "Required files in the model dir: cat_classifier.xml + cat_classifier.bin + classes.json."
 )
+
+
+def _require_model_dir(model_dir: Path) -> None:
+    # CLASSIFIER_WEIGHTS usually points at the `current` symlink; a missing dir
+    # means nothing has been promoted yet (or the symlink dangles).
+    if not model_dir.exists():
+        raise FileNotFoundError(
+            f"classifier model dir does not exist: {model_dir}\n"
+            "(is a model promoted? is the volume mounted?)\n"
+            f"{_PROMOTE_HINT}"
+        )
 
 
 def _require_runtime_file(path: Path, model_dir: Path) -> None:
@@ -96,10 +107,25 @@ class CatClassifier:
         # Validate required artifacts up front, BEFORE importing OpenVINO, so the
         # failure is a clear actionable message (and so this guard is testable
         # without an OpenVINO install).
+        _require_model_dir(model_dir)
         _require_runtime_file(xml, model_dir)
         _require_runtime_file(bin_, model_dir)
         _require_runtime_file(classes_path, model_dir)
         self.class_names: list[str] = _load_class_names(classes_path, model_dir)
+
+        # Startup summary: model dir, resolved version (the `current` symlink's
+        # target dir name), classes, artifact format. Helps debug which version
+        # is live after a promote + restart.
+        try:
+            version = model_dir.resolve().name
+        except Exception:
+            version = "?"
+        print(
+            f"[classifier] enabled: model_dir={model_dir} version={version} "
+            f"classes_path={classes_path} num_classes={len(self.class_names)} "
+            f"classes={self.class_names} format=openvino-ir",
+            flush=True,
+        )
 
         import openvino as ov
         import openvino.properties.hint as hints

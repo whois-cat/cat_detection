@@ -19,8 +19,21 @@ def _touch_ir(model_dir):
     (model_dir / "cat_classifier.bin").write_bytes(b"")
 
 
+def test_missing_model_dir_is_actionable(tmp_path):
+    with pytest.raises(FileNotFoundError) as e:
+        CatClassifier(tmp_path / "current")          # nothing promoted / dangling symlink
+    assert "model dir does not exist" in str(e.value)
+    assert "just classifier-promote" in str(e.value)
+
+
 def test_missing_xml_is_actionable(tmp_path):
     with pytest.raises(FileNotFoundError, match=r"cat_classifier\.xml"):
+        CatClassifier(tmp_path)
+
+
+def test_missing_bin_is_actionable(tmp_path):
+    (tmp_path / "cat_classifier.xml").write_text("<net/>", encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match=r"cat_classifier\.bin"):
         CatClassifier(tmp_path)
 
 
@@ -30,12 +43,20 @@ def test_missing_classes_json_is_actionable(tmp_path):
         CatClassifier(tmp_path)
     assert "classes.json" in str(e.value)
     assert "just classifier-promote" in str(e.value)   # tells the operator what to run
+    assert "just classifier-restart" in str(e.value)
 
 
 def test_empty_classes_json_rejected(tmp_path):
     _touch_ir(tmp_path)
     (tmp_path / "classes.json").write_text("[]", encoding="utf-8")
     with pytest.raises(ValueError, match="non-empty list"):
+        CatClassifier(tmp_path)
+
+
+def test_invalid_json_classes_rejected(tmp_path):
+    _touch_ir(tmp_path)
+    (tmp_path / "classes.json").write_text("{ not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid classes.json"):
         CatClassifier(tmp_path)
 
 

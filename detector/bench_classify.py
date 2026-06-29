@@ -3,7 +3,7 @@
 Needs a real OpenVINO classifier IR dir (cat_classifier.xml + classes.json).
 Run inside the detector env, e.g.:
 
-    python detector/bench_classify.py --model /opt/models/cat_classifier_openvino \
+    python detector/bench_classify.py --model /opt/models/classifier/current \
         --n 64 --batch 16 --repeat 5
 """
 from __future__ import annotations

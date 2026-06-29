@@ -232,18 +232,37 @@ train-compare *ARGS:
         --reviews-db "{{review_db}}" \
         {{ARGS}}
 
-# Promote a trained checkpoint to the active bake source models/cat_classifier.pt.
-# Default (no SRC) selects the newest models/trained/*/cat_classifier.pt. Validated
-# + atomic + backs up the previous active file. Rebuild after: `just up`.
+# Promote a trained checkpoint to the active runtime model volume
+# (models/classifier/versions/<id> + switch the `current` symlink). Default (no
+# SRC) selects the newest models/trained/*/cat_classifier.pt. Runs inside a
+# detector container (torch + openvino) to export the OpenVINO IR; writes to the
+# host repo via the bind mount. Restart after: `just classifier-restart`.
+# Override CLUSTER_SERVICE if detector-grey is not present.
 [group('train')]
 classifier-promote SRC="":
-    {{CLASSIFIER_RUN}} python tools/promote_classifier.py promote --src "{{SRC}}"
+    {{COMPOSE}} run --rm --no-deps -v "$PWD":/work -w /work {{CLUSTER_SERVICE}} \
+        python tools/promote_classifier.py promote --src "{{SRC}}"
 
-# Roll back models/cat_classifier.pt to a previous backup (default: newest backup).
-# Rebuild after: `just up`.
+# Roll back the `current` symlink to the previous version (default) or VERSION=<id>.
+# No export needed, so this runs on the host. Restart after: `just classifier-restart`.
 [group('train')]
-classifier-rollback BACKUP="":
-    {{CLASSIFIER_RUN}} python tools/promote_classifier.py rollback --backup "{{BACKUP}}"
+classifier-rollback VERSION="":
+    python3 tools/promote_classifier.py rollback --version "{{VERSION}}"
+
+# Restart only the detector containers that mount the classifier model volume, so
+# they pick up a freshly promoted `current`. Does not rebuild images.
+[group('train')]
+classifier-restart:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    svc=$({{COMPOSE}} config --services | python3 tools/promote_classifier.py services)
+    if [ -z "$svc" ]; then
+        echo "No detector services found that use the classifier volume." >&2
+        exit 1
+    fi
+    echo "Restarting detector services:"
+    printf ' - %s\n' $svc
+    {{COMPOSE}} restart $svc
 
 # ──────────────────────────── journal ────────────────────────────
 

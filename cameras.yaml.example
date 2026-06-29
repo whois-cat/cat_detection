@@ -29,8 +29,9 @@
 #                     relies on the temporal action-zone aggregator below.
 #   yolo_weights    — path inside container (default: baked INT8 IR).
 #   yolo_conf       — YOLO confidence threshold.
-#   classifier_weights  — OpenVINO IR dir for the cat identity classifier
-#                         (default: /opt/models/cat_classifier_openvino/).
+#   classifier_weights  — runtime classifier model dir, served from the shared
+#                         read-only volume (default: /opt/models/classifier/current,
+#                         switched by `just classifier-promote`).
 #   detector_unknown_conf — detector-side identity confidence threshold; below
 #                           this the detector records cat="unknown" (default: 0.5).
 #                           Legacy alias: classifier_min_conf.

@@ -54,7 +54,8 @@ detector/yolov8n_int8_openvino_model/
 detector/datasets/
 
 # Classifier checkpoints & promotion artifacts — never commit weights.
-# (active bake source, trained outputs, and promotion backups)
+# (trained outputs, the runtime model volume, and legacy bake/backups)
 models/*.pt
 models/trained/
 models/backups/
+models/classifier/

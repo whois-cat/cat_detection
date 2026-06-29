@@ -137,7 +137,7 @@ class YoloCatDetector(Detector):
         self,
         weights: str = "/opt/models/yolov8n_int8_openvino_model/",
         conf: float = 0.25,
-        classifier_dir: str = "/opt/models/cat_classifier_openvino/",
+        classifier_dir: str = "/opt/models/classifier/current",
         min_conf: float = 0.5,
         pad_frac: float = 0.15,
     ) -> None:
@@ -214,7 +214,7 @@ def build_detector(detector_type: str) -> Detector:
             weights=os.environ.get("YOLO_WEIGHTS", "/opt/models/yolov8n_int8_openvino_model/"),
             conf=float(os.environ.get("YOLO_CONF", "0.25")),
             classifier_dir=os.environ.get(
-                "CLASSIFIER_WEIGHTS", "/opt/models/cat_classifier_openvino/"
+                "CLASSIFIER_WEIGHTS", "/opt/models/classifier/current"
             ),
             min_conf=float(
                 os.environ.get(

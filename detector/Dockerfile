@@ -20,15 +20,15 @@ RUN mkdir -p /opt/models \
     m = YOLO('yolov8n.pt'); \
     m.export(format='openvino', int8=True, data='coco128.yaml')"
 
-# ── Classifier: PT → OpenVINO IR + classes.json ────────────────────────────
-COPY models/cat_classifier.pt /app/models/cat_classifier.pt
-# classifier.py is copied here (not with the rest below) because the export
-# step's parity gate imports its runtime _preprocess to prove the exported IR
-# matches torch on the real preprocessing.
+# ── Classifier ─────────────────────────────────────────────────────────────
+# The runtime classifier model is NOT baked into the image. It is delivered via
+# the shared read-only volume at /opt/models/classifier
+# (CLASSIFIER_WEIGHTS=/opt/models/classifier/current), switched by
+# `just classifier-promote` + `just classifier-restart` — no image rebuild to
+# change the model. export_classifier.py stays in the image so promotion (run
+# inside this container) can export a checkpoint to the OpenVINO runtime format;
+# its parity gate imports classifier.py's runtime _preprocess.
 COPY export_classifier.py classifier.py ./
-RUN python export_classifier.py \
-    --pt /app/models/cat_classifier.pt \
-    --out /opt/models/cat_classifier_openvino/
 
 COPY storage.py recordings_index.py detectors.py bowl_monitor.py main.py ./
 

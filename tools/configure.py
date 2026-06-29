@@ -282,7 +282,10 @@ def render_compose(cfg: dict) -> str:
             "BLOB_MIN_AREA":       cam.get("blob_min_area", 500),
             "YOLO_WEIGHTS":        cam.get("yolo_weights", "/opt/models/yolov8n_int8_openvino_model/"),
             "YOLO_CONF":           cam.get("yolo_conf", 0.25),
-            "CLASSIFIER_WEIGHTS":  cam.get("classifier_weights", "/opt/models/cat_classifier_openvino/"),
+            # Runtime classifier model comes from the shared read-only volume
+            # (mounted below), not a baked image artifact. The `current` symlink
+            # is switched by `just classifier-promote`; restart to pick it up.
+            "CLASSIFIER_WEIGHTS":  cam.get("classifier_weights", "/opt/models/classifier/current"),
             "DETECTOR_UNKNOWN_CONF": cam.get(
                 "detector_unknown_conf",
                 cam.get("classifier_min_conf", 0.5),
@@ -327,6 +330,9 @@ def render_compose(cfg: dict) -> str:
 {env_lines}
     volumes:
       - ./data/events:/data/events
+      # Shared, read-only classifier model volume. Mount the PARENT dir (not the
+      # `current` symlink) so a promoted version switch is visible on restart.
+      - ./models/classifier:/opt/models/classifier:ro
 """)
 
         # Optional feeder service — generated only if feeder block present.
