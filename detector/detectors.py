@@ -51,6 +51,26 @@ class Detector(ABC):
         }
 
 
+def identity_crop_box(x1: int, y1: int, x2: int, y2: int,
+                      frame_w: int, frame_h: int, pad_frac: float) -> tuple[int, int, int, int]:
+    """Expand a clamped detection box by ``pad_frac * max(box_w, box_h)`` on every
+    side, clamped to the frame, and return (cx0, cy0, cx1, cy1).
+
+    This is the identity-crop padding: it only ADDS context around the box, so
+    the full cat body + tail inside the detection box is always kept and the box
+    itself is never cut. A smaller pad_frac keeps the body but trims surrounding
+    carpet/background; pad_frac=0 returns exactly the detection box. Geometry is
+    identical to training.sources._pad_crop / _local_box so the classifier sees
+    the same framing at train and serve time.
+    """
+    pad = int(pad_frac * max(x2 - x1, y2 - y1))
+    cx0 = max(0, x1 - pad)
+    cy0 = max(0, y1 - pad)
+    cx1 = min(frame_w, x2 + pad)
+    cy1 = min(frame_h, y2 + pad)
+    return cx0, cy0, cx1, cy1
+
+
 def _weights_backend(weights: str) -> str:
     """Best-effort artifact format for YOLO weights: an OpenVINO IR directory vs
     a torch .pt file. Used only for status reporting (never hardcodes names)."""
@@ -209,14 +229,12 @@ class YoloCatDetector(Detector):
                 x2, y2 = min(w, int(x2)), min(h, int(y2))
                 if x2 <= x1 or y2 <= y1:
                     continue
-                # Expand the box by pad_frac (same clamp as training._pad_crop)
-                # so the classifier sees the SAME framing it was trained on, then
-                # crop from the inference-coord frame YOLO saw (img_bgr). The
+                # Identity-crop padding (same geometry as training._pad_crop) so
+                # the classifier sees the SAME framing it was trained on. The
                 # emitted box stays the tight detection box — only the classifier
-                # input is padded.
-                pad = int(self._pad_frac * max(x2 - x1, y2 - y1))
-                cx0, cy0 = max(0, x1 - pad), max(0, y1 - pad)
-                cx1, cy1 = min(w, x2 + pad), min(h, y2 + pad)
+                # input is padded; the box itself is never cut.
+                cx0, cy0, cx1, cy1 = identity_crop_box(
+                    x1, y1, x2, y2, w, h, self._pad_frac)
                 crop_bgr = img_bgr[cy0:cy1, cx0:cx1]
                 crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
                 cat_name, cat_score = self._classifier.classify(crop_rgb)

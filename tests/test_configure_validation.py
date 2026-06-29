@@ -107,6 +107,31 @@ def test_valid_feeder_passes(tmp_path, monkeypatch):
 
 # ---- generated compose is valid YAML (#6) ----------------------------------
 
+def test_identity_crop_padding_flows_to_env():
+    compose = configure.render_compose(_cam(identity_crop_padding=0.05))
+    assert "CLASSIFIER_PAD_FRAC: 0.05" in compose
+
+
+def test_identity_crop_padding_defaults_to_current_behavior():
+    assert "CLASSIFIER_PAD_FRAC: 0.15" in configure.render_compose(_cam())
+
+
+def test_identity_crop_padding_overrides_legacy_alias():
+    cfg = _cam(identity_crop_padding=0.02, classifier_pad_frac=0.15)
+    assert "CLASSIFIER_PAD_FRAC: 0.02" in configure.render_compose(cfg)
+
+
+def test_legacy_classifier_pad_frac_still_honored():
+    assert "CLASSIFIER_PAD_FRAC: 0.05" in configure.render_compose(
+        _cam(classifier_pad_frac=0.05))
+
+
+def test_identity_crop_padding_out_of_range_rejected(tmp_path, monkeypatch):
+    _write_cfg(tmp_path, monkeypatch, _cam(identity_crop_padding=1.5))
+    with pytest.raises(SystemExit, match="out of range"):
+        configure.load_config()
+
+
 def test_render_compose_is_valid_yaml_with_feeder():
     cfg = {"cameras": [
         {"id": "grey", "rtsp": "rtsp://host/grey", "detector_type": "yolo_cat",

@@ -46,7 +46,8 @@ CAMERA_RANGES = (
     ("yolo_conf", 0.0, 1.0, False),
     ("detector_unknown_conf", 0.0, 1.0, False),
     ("classifier_min_conf", 0.0, 1.0, False),       # legacy alias of the above
-    ("classifier_pad_frac", 0.0, 1.0, False),
+    ("identity_crop_padding", 0.0, 1.0, False),
+    ("classifier_pad_frac", 0.0, 1.0, False),       # back-compat alias
     ("blob_bright_threshold", 0, 255, True),
     ("blob_min_area", 0, math.inf, True),
     ("ignore_region_min_coverage", 0.0, 1.0, False),
@@ -368,7 +369,12 @@ def render_compose(cfg: dict) -> str:
                 "detector_unknown_conf",
                 cam.get("classifier_min_conf", 0.5),
             ),
-            "CLASSIFIER_PAD_FRAC": cam.get("classifier_pad_frac", 0.15),
+            # Identity-crop padding around each detection box before classifying.
+            # Lower trims background/carpet while keeping the full body + tail.
+            # `identity_crop_padding` is the preferred key; `classifier_pad_frac`
+            # is kept as a back-compat alias. Match training's --pad-frac.
+            "CLASSIFIER_PAD_FRAC": cam.get(
+                "identity_crop_padding", cam.get("classifier_pad_frac", 0.15)),
             "DETECT_ROI":          _csv_coords(_rect_from_value(_detect_roi_value(cam))),
             "IGNORE_REGIONS":      json.dumps(_hard_ignore_region_values(cam)),
             "IGNORE_REGION_MIN_COVERAGE": cam.get("ignore_region_min_coverage", 0.8),

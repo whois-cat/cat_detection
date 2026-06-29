@@ -35,8 +35,12 @@
 #   detector_unknown_conf — detector-side identity confidence threshold; below
 #                           this the detector records cat="unknown" (default: 0.5).
 #                           Legacy alias: classifier_min_conf.
-#   classifier_pad_frac — context padding added around each YOLO box BEFORE the
-#                         identity classifier runs (default: 0.15). MUST match the
+#   identity_crop_padding — context padding added around each YOLO box BEFORE the
+#                         identity classifier runs (default: 0.15). Padding only
+#                         EXPANDS the box, so the full cat body + tail is always
+#                         kept; lower it (e.g. 0.05 / 0.02) to trim surrounding
+#                         carpet/background, 0 = exactly the detection box.
+#                         (Back-compat alias: classifier_pad_frac.) MUST match the
 #                         training crop padding in all three places or the
 #                         classifier sees different framing at serve vs train time:
 #                           detector  CLASSIFIER_PAD_FRAC  (this value)
