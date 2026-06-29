@@ -24,6 +24,7 @@ Networking model (important if you're chasing connectivity issues):
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -35,6 +36,64 @@ ROOT = Path(__file__).resolve().parent.parent
 CAMERAS_YAML = ROOT / "cameras.yaml"
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+# Numeric range specs: (key, lo, hi, integer). Only keys actually present in the
+# config are checked — defaults are trusted in-range. Confidences/fractions are
+# [0,1]; counts/durations are non-negative. Catches out-of-range thresholds at
+# `just configure` instead of at container start (or silently wrong behaviour).
+CAMERA_RANGES = (
+    ("detector_target_fps", 0, math.inf, False),
+    ("yolo_conf", 0.0, 1.0, False),
+    ("detector_unknown_conf", 0.0, 1.0, False),
+    ("classifier_min_conf", 0.0, 1.0, False),       # legacy alias of the above
+    ("classifier_pad_frac", 0.0, 1.0, False),
+    ("blob_bright_threshold", 0, 255, True),
+    ("blob_min_area", 0, math.inf, True),
+    ("ignore_region_min_coverage", 0.0, 1.0, False),
+    ("food_margin_frac", 0.0, 1.0, False),
+    ("food_texture_weight", 0.0, 1.0, False),
+    ("food_tiles", 1, math.inf, True),
+    ("food_tex_thresh", 0.0, math.inf, False),
+    ("food_empty_below", 0.0, 1.0, False),
+    ("food_full_above", 0.0, 1.0, False),
+    ("food_check_interval_sec", 0.0, math.inf, False),
+    ("food_median_window", 1, math.inf, True),
+    ("artificial_delay_ms", 0, math.inf, True),
+)
+
+FEEDER_RANGES = (
+    ("classifier_min_conf", 0.0, 1.0, False),
+    ("open_min_confidence", 0.0, 1.0, False),
+    ("open_min_margin", 0.0, 1.0, False),
+    ("door_close_timeout_sec", 0, math.inf, False),
+    ("min_meal_sec", 0, math.inf, False),
+    ("presence_window_sec", 0, math.inf, False),
+    ("open_debounce_sec", 0, math.inf, False),
+    ("multi_debounce_sec", 0, math.inf, False),
+    ("display_text_interval", 0, math.inf, False),
+    ("feed_grain_num", 1, math.inf, True),
+    ("food_empty_consecutive", 1, math.inf, True),
+    ("feed_min_interval_sec", 0, math.inf, False),
+    ("feed_confirm_timeout_sec", 0, math.inf, False),
+    ("feed_catchup_max", 0, math.inf, True),
+)
+
+VALID_ROTATE_DEG = (0, 90, 180, 270)
+
+
+def _check_ranges(label: str, src: dict, specs) -> None:
+    """sys.exit with a clear message if any present numeric key is out of range."""
+    for key, lo, hi, integer in specs:
+        if key not in src:
+            continue
+        v = src[key]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            sys.exit(f"{label}: {key} must be a number, got {v!r}")
+        if integer and not float(v).is_integer():
+            sys.exit(f"{label}: {key} must be a whole number, got {v!r}")
+        if not (lo <= v <= hi):
+            hi_s = "inf" if hi == math.inf else hi
+            sys.exit(f"{label}: {key}={v} out of range [{lo}, {hi_s}]")
 
 
 def _flat_points(raw) -> list[float]:
@@ -179,6 +238,21 @@ def load_config() -> dict:
         seen_cam.add(cid)
         if not cam.get("rtsp"):
             sys.exit(f"camera {cid}: missing rtsp")
+
+        _check_ranges(f"camera {cid}", cam, CAMERA_RANGES)
+        rot = cam.get("rotate_deg", 0)
+        if rot not in VALID_ROTATE_DEG:
+            sys.exit(f"camera {cid}: rotate_deg must be one of "
+                     f"{'/'.join(map(str, VALID_ROTATE_DEG))}, got {rot!r}")
+        # Food hysteresis must be ordered or the bowl monitor can't latch state.
+        empty_below = cam.get("food_empty_below", 0.30)
+        full_above = cam.get("food_full_above", 0.55)
+        if (isinstance(empty_below, (int, float)) and not isinstance(empty_below, bool)
+                and isinstance(full_above, (int, float)) and not isinstance(full_above, bool)
+                and empty_below >= full_above):
+            sys.exit(f"camera {cid}: food_empty_below ({empty_below}) must be "
+                     f"< food_full_above ({full_above})")
+
         feeder = cam.get("feeder")
         if feeder is not None:
             fid = feeder.get("id")
@@ -196,6 +270,10 @@ def load_config() -> dict:
             allowed = feeder.get("allowed_cats", [])
             if not isinstance(allowed, list) or not allowed:
                 sys.exit(f"camera {cid}: feeder.allowed_cats must be a non-empty list")
+            if not all(isinstance(c, str) and c.strip() for c in allowed):
+                sys.exit(f"camera {cid}: feeder.allowed_cats must be a list of "
+                         "non-empty strings")
+            _check_ranges(f"camera {cid}: feeder", feeder, FEEDER_RANGES)
             dcs = feeder.get("dangerous_confusions", [])
             if not isinstance(dcs, list):
                 sys.exit(f"camera {cid}: feeder.dangerous_confusions must be a list")
