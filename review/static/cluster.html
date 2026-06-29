@@ -211,9 +211,11 @@ async function loadCounts() {
         ? data.order : Object.keys(data.counts);
     order.forEach(lab => {
       const n = data.counts[lab] || 0;
+      const eps = (data.episodes && data.episodes[lab]) || 0;
       const span = document.createElement('span');
       span.className = n ? '' : 'c0';
-      span.innerHTML = `${lab} <b>${n}</b>`;
+      // crops in bold; episodes/visits in parens so balance reads at a glance.
+      span.innerHTML = eps ? `${lab} <b>${n}</b> (${eps} eps)` : `${lab} <b>${n}</b>`;
       el.appendChild(span);
     });
   } catch (e) { /* counts are best-effort */ }

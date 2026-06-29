@@ -167,6 +167,10 @@ def test_counts_endpoint_groups_crops_by_label(client):
     assert data["counts"]["chuzh"] == 3
     assert data["total"] == 9
     assert data["order"][:4] == ["alisa", "chuzh", "ellie", "felisis"]
+    # All fixture crops share one camera with wall_ms within the gap → 1 visit each.
+    assert data["episodes"]["alisa"] == 1
+    assert data["episodes"]["chuzh"] == 1
+    assert data["cameras"]["alisa"] == 1
 
 
 def test_per_crop_label_writes_one_row_each(client):

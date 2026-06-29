@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw
 from training import CropRef, CropUnavailable, decode_one_crop
 from training.build_cluster_manifest import kmeans
 from training.db import Box
+from training.label_stats import episode_camera_counts
 from training.segments import SegmentIndex
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,9 @@ RECORDINGS = Path(os.environ.get("RECORDINGS_ROOT", ROOT / "data/recordings"))
 REVIEW_DB = Path(os.environ.get("REVIEW_DB", ROOT / "data/review/reviews.db"))
 LABELS_ENV = [c.strip() for c in os.environ.get("REVIEW_LABELS", "").split(",") if c.strip()]
 EXTRA_LABELS = ["unknown", "discard"]
+# Episode = same camera, consecutive reviewed crops within this gap (matches the
+# training split's default so the count means "independent visits").
+EPISODE_GAP_MS = int(float(os.environ.get("EPISODE_GAP_SEC", "60")) * 1000)
 
 
 def _load_manifest() -> dict:
@@ -246,6 +250,22 @@ def _label_counts(conn: sqlite3.Connection) -> dict[str, int]:
         "SELECT label, COUNT(*) FROM reviews GROUP BY label"
     ).fetchall()
     return {label: int(n) for label, n in rows}
+
+
+def _label_episode_counts(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    """Per-label episode + camera counts from the reviews table's camera/wall_ms
+    columns (same grouping as the training split). Empty if those columns are
+    absent (older DBs). Caller holds the DB lock."""
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(reviews)")}
+    if not {"camera", "wall_ms"} <= cols:
+        return {}
+    by_label: dict[str, list[tuple[str, int]]] = {}
+    for label, camera, wall_ms in conn.execute(
+        "SELECT label, camera, wall_ms FROM reviews "
+        "WHERE camera IS NOT NULL AND wall_ms IS NOT NULL"
+    ).fetchall():
+        by_label.setdefault(str(label), []).append((str(camera), int(wall_ms)))
+    return episode_camera_counts(by_label, EPISODE_GAP_MS)
 
 
 def _all_clusters() -> list[dict]:
@@ -759,11 +779,14 @@ async def api_crop_label(payload: dict) -> JSONResponse:
 
 @app.get("/api/counts")
 def api_counts() -> JSONResponse:
-    """Live per-class crop counts (labelled crops, GROUP BY label)."""
+    """Live per-class crop counts plus episodes/cameras (labelled crops)."""
     with _db_lock:
         counts = _label_counts(_conn)
+        episodes = _label_episode_counts(_conn)
     return JSONResponse({
         "counts": counts,
+        "episodes": {lab: es["episodes"] for lab, es in episodes.items()},
+        "cameras": {lab: es["cameras"] for lab, es in episodes.items()},
         "total": sum(counts.values()),
         "order": [*LABELS, *EXTRA_LABELS],
     })
