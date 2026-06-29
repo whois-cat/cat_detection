@@ -30,6 +30,6 @@ RUN mkdir -p /opt/models \
 # its parity gate imports classifier.py's runtime _preprocess.
 COPY export_classifier.py classifier.py ./
 
-COPY storage.py recordings_index.py detectors.py bowl_monitor.py main.py ./
+COPY storage.py recordings_index.py detectors.py bowl_monitor.py status.py main.py ./
 
 CMD ["python", "-u", "main.py"]

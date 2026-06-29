@@ -85,6 +85,16 @@ def _load_class_names(classes_path: Path, model_dir: Path) -> list[str]:
     return names
 
 
+def resolve_model_version(model_dir: Path) -> str:
+    """Concrete version the model resolves to — the target dir name of the
+    `current` symlink (e.g. "20260629-001122"), or "?" if unresolvable. Used for
+    startup logging and the /status endpoint so the active version is visible."""
+    try:
+        return Path(model_dir).resolve().name
+    except Exception:
+        return "?"
+
+
 def _check_output_dim(out_dim: int, n_classes: int, model_dir: Path) -> None:
     """Pure guard (no OpenVINO) so it's unit-testable: the IR's output width must
     equal the number of labels in classes.json, else predictions mislabel."""
@@ -113,13 +123,15 @@ class CatClassifier:
         _require_runtime_file(classes_path, model_dir)
         self.class_names: list[str] = _load_class_names(classes_path, model_dir)
 
+        # Status attributes (also surfaced by the /status endpoint).
+        self.model_dir = str(model_dir)
+        self.resolved_version = resolve_model_version(model_dir)
+        self.format = "openvino"
+
         # Startup summary: model dir, resolved version (the `current` symlink's
         # target dir name), classes, artifact format. Helps debug which version
         # is live after a promote + restart.
-        try:
-            version = model_dir.resolve().name
-        except Exception:
-            version = "?"
+        version = self.resolved_version
         print(
             f"[classifier] enabled: model_dir={model_dir} version={version} "
             f"classes_path={classes_path} num_classes={len(self.class_names)} "
@@ -149,6 +161,17 @@ class CatClassifier:
             out_dim = None     # dynamic shape — skip cleanly rather than crash
         if out_dim is not None:
             _check_output_dim(out_dim, len(self.class_names), model_dir)
+
+    def status(self) -> dict:
+        """Runtime status fragment for the /status endpoint: enabled flag, active
+        model dir + resolved version, class count (not labels), artifact format."""
+        return {
+            "enabled": True,
+            "model_dir": self.model_dir,
+            "resolved_version": self.resolved_version,
+            "classes_count": len(self.class_names),
+            "format": self.format,
+        }
 
     def _probs(self, crop_rgb: np.ndarray) -> np.ndarray:
         """Softmax probability vector for one crop. classify_all() goes through

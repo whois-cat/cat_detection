@@ -25,10 +25,41 @@ import numpy as np
 
 class Detector(ABC):
     model_name: str = "unknown"
+    backend: str = "unknown"
 
     @abstractmethod
     def detect(self, img_bgr: np.ndarray) -> list[dict]:
         ...
+
+    def status(self) -> dict:
+        """Lightweight runtime status fragment for the /status endpoint.
+
+        Generic across detector types: `min_score` is the detection-confidence
+        threshold when the detector has one, and the classifier block reflects
+        whether a per-cat identity classifier is attached (yolo_cat) or not
+        (blob/yolo). No frames, labels, or secrets.
+        """
+        clf = getattr(self, "_classifier", None)
+        return {
+            "detector": {
+                "enabled": True,
+                "backend": self.backend,
+                "model": self.model_name,
+                "min_score": getattr(self, "conf", None),
+            },
+            "classifier": clf.status() if clf is not None else {"enabled": False},
+        }
+
+
+def _weights_backend(weights: str) -> str:
+    """Best-effort artifact format for YOLO weights: an OpenVINO IR directory vs
+    a torch .pt file. Used only for status reporting (never hardcodes names)."""
+    base = os.path.basename(os.path.normpath(weights)).lower()
+    if os.path.isdir(weights) or "openvino" in base or base.endswith(".xml"):
+        return "openvino"
+    if base.endswith(".pt"):
+        return "pytorch"
+    return "unknown"
 
 
 class BrightBlobDetector(Detector):
@@ -40,6 +71,7 @@ class BrightBlobDetector(Detector):
     density looks like one cat per visit. Reset on no-detection."""
 
     model_name = "blob-dummy"
+    backend = "opencv"
     # Synthetic identities for this dev/test detector only. NOT product logic —
     # override with BLOB_DUMMY_CATS=foo,bar; the generic default keeps real cat
     # names out of the codebase.
@@ -96,6 +128,7 @@ class YoloDetector(Detector):
         # (which carry no task metadata in their YAML).
         self.model = YOLO(weights, task="detect")
         self.conf = conf
+        self.backend = _weights_backend(weights)
         # Clean stem from either a .pt file or an OpenVINO model directory.
         stem = os.path.basename(os.path.normpath(weights))
         stem = os.path.splitext(stem)[0]
@@ -148,6 +181,7 @@ class YoloCatDetector(Detector):
         self._cv2 = cv2
         self.model = YOLO(weights, task="detect")
         self.conf = conf
+        self.backend = _weights_backend(weights)
         stem = os.path.splitext(os.path.basename(os.path.normpath(weights)))[0]
         self.model_name = f"{stem}+cat"
         self._classifier = CatClassifier(classifier_dir)

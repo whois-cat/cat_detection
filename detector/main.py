@@ -46,6 +46,7 @@ from aiohttp import web, WSMsgType
 from bowl_monitor import BowlMonitor
 from detectors import build_detector
 from recordings_index import query_ranges as query_recording_ranges
+from status import build_status
 from storage import init_db, insert_event, query_events, list_models
 
 
@@ -366,6 +367,15 @@ _decode_latency_ms_sum = 0.0
 _detect_latency_ms_sum = 0.0
 _loop_latency_ms_sum = 0.0
 
+# Runtime status (surfaced by /status). Monotonic timestamps so reported ages are
+# wall-clock-independent; single-writer (the detector loop) so plain assignment
+# is fine in CPython.
+_START_MONOTONIC = time.monotonic()
+_last_frame_monotonic: float | None = None       # last frame the detector processed
+_last_detection_monotonic: float | None = None   # last frame that yielded detections
+_detections_total = 0                            # cumulative detections since start
+_last_error: str | None = None                   # most recent loop error, if any
+
 # Latest-frame slot: decoder always overwrites; detector takes whatever's there
 # and runs. Frames produced while the detector is busy are dropped (only the
 # newest survives) — this gives correct adaptive detection fps regardless of
@@ -433,6 +443,7 @@ def detector_loop():
     by the latest-frame slot; an unbounded queue is never built."""
     global _fps_proc_count, _latest_frame, _frames_dropped_count
     global _decode_latency_ms_sum, _detect_latency_ms_sum, _loop_latency_ms_sum
+    global _last_frame_monotonic, _last_detection_monotonic, _detections_total, _last_error
     prev_had_detections = False
     last_processed_monotonic = 0.0
     min_interval_sec = (1.0 / DETECTOR_TARGET_FPS) if DETECTOR_TARGET_FPS > 0 else 0.0
@@ -456,10 +467,12 @@ def detector_loop():
             img_cam = frame.to_ndarray(format="bgr24")
             _decode_latency_ms_sum += (time.perf_counter() - decode_started) * 1000
         except Exception as e:
+            _last_error = f"frame decode failed: {e!r}"
             print(f"[detector] frame decode failed: {e!r}", flush=True)
             continue
         cam_H, cam_W = img_cam.shape[:2]
         _fps_proc_count += 1
+        _last_frame_monotonic = time.monotonic()
 
         # Crop in camera coords (DETECT_ROI is camera-frame fractions), then
         # rotate ONLY the inference input. Boxes come back in rotated-crop
@@ -524,6 +537,8 @@ def detector_loop():
             continue
 
         prev_had_detections = True
+        _last_detection_monotonic = time.monotonic()
+        _detections_total += len(boxes)
 
         for b in boxes:
             # ACTION gate operates in camera coords on camera box centers.
@@ -661,6 +676,22 @@ async def _load_recording_ranges(key: tuple[str, int, int]) -> list[list[int]]:
 
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "clients": len(clients)})
+
+
+async def status_handler(_request: web.Request) -> web.Response:
+    """Inspectable runtime snapshot for MVP/demo: service, camera, uptime, the
+    active classifier (enabled/model dir/version/class count/format), detector
+    backend, and frame/detection liveness. No frames, labels, or secrets."""
+    return web.json_response(build_status(
+        detector,
+        camera_id=CAMERA_ID,
+        now=time.monotonic(),
+        start_monotonic=_START_MONOTONIC,
+        last_frame_monotonic=_last_frame_monotonic,
+        last_detection_monotonic=_last_detection_monotonic,
+        detections_total=_detections_total,
+        last_error=_last_error,
+    ))
 
 
 async def config_handler(_request: web.Request) -> web.Response:
@@ -833,6 +864,7 @@ async def main():
     app.router.add_get("/models", models_handler)
     app.router.add_get("/recordings/ranges", recordings_ranges_handler)
     app.router.add_get("/health", health)
+    app.router.add_get("/status", status_handler)
     app.router.add_get("/config", config_handler)
     runner = web.AppRunner(app)
     await runner.setup()
