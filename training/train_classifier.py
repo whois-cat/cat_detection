@@ -100,6 +100,21 @@ def decide_label(det_label, det_conf, human, trust_classifier, trust_conf):
     return None
 
 
+def require_min_classes(classes: list[str]) -> None:
+    """Refuse to train an identity classifier on fewer than two labeled classes.
+
+    A single class yields a degenerate model that always predicts that class —
+    useless, yet still saveable/promotable. Fail loudly before model creation.
+    Class names are reported dynamically (no assumptions about which labels).
+    """
+    if len(classes) < 2:
+        raise SystemExit(
+            "need at least 2 labeled classes to train the identity classifier; "
+            f"found classes: {classes}. Review more crops (just label-review) or "
+            "check your drop labels / review labels."
+        )
+
+
 # ------------------------------------------------------------- episode split --
 
 def build_episodes(metas: list[Meta], gap_ms: int) -> list[list[int]]:
@@ -1018,6 +1033,7 @@ def main() -> None:
     replay_metas = [item.meta for item in replay_items]
 
     classes = sorted({m.label for m in [*fresh_metas, *replay_metas]})
+    require_min_classes(classes)
     cls_to_idx = {c: i for i, c in enumerate(classes)}
     log.info("classes (%d): %s", len(classes), classes)
     for c in sorted(confuse):
