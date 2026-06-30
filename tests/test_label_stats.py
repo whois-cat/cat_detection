@@ -1,15 +1,19 @@
+import json
 import sqlite3
 import subprocess
 import sys
 from collections import Counter
 
 from training.label_stats import (
+    classify_review_usability,
     episode_camera_counts,
     format_report,
+    load_event_scores,
     load_label_counts,
     load_label_episode_rows,
     resolve_reviews_db,
     summarize_counts,
+    usable_for_training_stats,
 )
 
 
@@ -170,3 +174,77 @@ assert label_stats.parse_csv("alisa,chuzh") == ["alisa", "chuzh"]
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+# ---- usable-for-training cross-check ----------------------------------------
+
+def _events_db(tmp_path, rows):
+    """events.db with the (id, score) columns the usable cross-check reads."""
+    db = tmp_path / "events.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, score REAL)")
+        conn.executemany("INSERT INTO events (id, score) VALUES (?, ?)", rows)
+        conn.commit()
+    finally:
+        conn.close()
+    return db
+
+
+def test_classify_review_usability_buckets():
+    review_labels = {
+        1: "cat_a",    # usable (event exists, score >= min)
+        2: "cat_b",    # below min score
+        3: "cat_a",    # orphan (no event row)
+        4: "discard",  # dropped → not counted at all
+        5: "cat_c",    # event score NULL → below
+    }
+    event_scores = {1: 0.9, 2: 0.4, 5: None}   # key 3 absent → orphan
+    r = classify_review_usability(review_labels, event_scores, min_score=0.7)
+    assert r["usable_for_training"] == 1
+    assert r["below_min_score"] == 2           # key2 (0.4) + key5 (NULL)
+    assert r["orphan_reviews"] == 1            # key3
+    assert r["min_score"] == 0.7
+
+
+def test_load_event_scores_returns_only_existing(tmp_path):
+    edb = _events_db(tmp_path, [(1, 0.9), (2, 0.4)])
+    assert load_event_scores(edb, [1, 2, 99]) == {1: 0.9, 2: 0.4}  # 99 missing
+
+
+def test_usable_for_training_stats_end_to_end(tmp_path):
+    rdb = _reviews_db(tmp_path, [
+        (1, "cat_a"), (2, "cat_b"), (3, "cat_a"), (4, "discard"), (5, "cat_c"),
+    ], with_meta=False)
+    edb = _events_db(tmp_path, [(1, 0.9), (2, 0.4), (5, 0.95)])  # key 3 missing
+    assert usable_for_training_stats(rdb, edb, min_score=0.7) == {
+        "usable_for_training": 2,   # key1 (0.9) + key5 (0.95)
+        "orphan_reviews": 1,        # key3
+        "below_min_score": 1,       # key2 (0.4)
+        "min_score": 0.7,
+    }
+
+
+def test_label_stats_works_without_events_db(tmp_path):
+    # Existing behaviour unchanged: no --events-db → no usable section, exit 0.
+    rdb = _reviews_db(tmp_path, [(1, "cat_a"), (2, "cat_b")], with_meta=False)
+    out = subprocess.run(
+        [sys.executable, "-m", "training.label_stats", "--reviews-db", str(rdb)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "reviewed labels:" in out
+    assert "usable for training" not in out
+
+
+def test_usable_cli_json_reports_fields(tmp_path):
+    rdb = _reviews_db(tmp_path, [(1, "cat_a"), (2, "cat_b"), (3, "cat_a")], with_meta=False)
+    edb = _events_db(tmp_path, [(1, 0.9), (2, 0.4)])   # key3 orphan, key2 below
+    out = subprocess.run(
+        [sys.executable, "-m", "training.label_stats",
+         "--reviews-db", str(rdb), "--events-db", str(edb), "--json"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert json.loads(out)["usable_for_training"] == {
+        "usable_for_training": 1, "orphan_reviews": 1,
+        "below_min_score": 1, "min_score": 0.7,
+    }

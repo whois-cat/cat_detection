@@ -5,12 +5,17 @@ import argparse
 import json
 import os
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DROP_LABELS = ("discard", "unknown")
+# Matches train_classifier.py's --min-score default: boxes below this YOLO score
+# are filtered out by iter_frames before reviews are joined, so a reviewed crop
+# under it is never seen by training.
+TRAIN_MIN_SCORE_DEFAULT = 0.7
 
 
 def _has_reviews_table(path: Path) -> bool:
@@ -88,6 +93,90 @@ def load_label_counts(reviews_db: Path) -> Counter[str]:
     finally:
         conn.close()
     return Counter({str(label): int(count) for label, count in rows})
+
+
+def load_review_labels(reviews_db: Path) -> dict[int, str]:
+    """{src_event_key: label} for every review row (read-only)."""
+    conn = sqlite3.connect(f"file:{reviews_db}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("SELECT src_event_key, label FROM reviews").fetchall()
+    finally:
+        conn.close()
+    return {int(k): str(v) for k, v in rows}
+
+
+def load_event_scores(events_db: Path, keys: Iterable[int]) -> dict[int, float | None]:
+    """{events.id: score} for the requested ids that exist in events.db (read-only).
+
+    Chunked IN-queries stay under SQLite's bound-variable limit. Missing ids are
+    simply absent from the result (→ treated as orphans by the caller)."""
+    key_list = list(dict.fromkeys(int(k) for k in keys))
+    out: dict[int, float | None] = {}
+    if not key_list:
+        return out
+    conn = sqlite3.connect(f"file:{events_db}?mode=ro", uri=True)
+    try:
+        for i in range(0, len(key_list), 900):
+            chunk = key_list[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            for eid, score in conn.execute(
+                f"SELECT id, score FROM events WHERE id IN ({placeholders})", chunk
+            ):
+                out[int(eid)] = None if score is None else float(score)
+    finally:
+        conn.close()
+    return out
+
+
+def classify_review_usability(
+    review_labels: dict[int, str],
+    event_scores: dict[int, float | None],
+    *,
+    min_score: float,
+    drop_labels: Iterable[str] = DEFAULT_DROP_LABELS,
+) -> dict:
+    """Bucket TRAINABLE reviews by whether train_classifier would keep them.
+
+    Mirrors train_classifier's join + score filter (iter_frames `AND score >=
+    min_score`, then reviews joined on events.id == src_event_key). A trainable
+    review (label not in drop_labels) is:
+      - orphan        : its src_event_key has no row in events.db
+      - below_min_score: event exists but score < min_score (or NULL)
+      - usable        : event exists and score >= min_score
+    No recording-availability check (train logs that separately as 'unavailable').
+    """
+    drop = set(parse_csv(drop_labels))
+    usable = orphan = below = 0
+    for key, label in review_labels.items():
+        if label in drop:
+            continue
+        if key not in event_scores:
+            orphan += 1
+        elif event_scores[key] is None or event_scores[key] < min_score:
+            below += 1
+        else:
+            usable += 1
+    return {
+        "usable_for_training": usable,
+        "orphan_reviews": orphan,
+        "below_min_score": below,
+        "min_score": float(min_score),
+    }
+
+
+def usable_for_training_stats(
+    reviews_db: Path, events_db: Path, *,
+    min_score: float = TRAIN_MIN_SCORE_DEFAULT,
+    drop_labels: Iterable[str] = DEFAULT_DROP_LABELS,
+) -> dict:
+    """Cross-check reviews.db against events.db: how many trainable reviews are
+    actually usable by training vs lost to orphan keys / below-min-score boxes."""
+    review_labels = load_review_labels(reviews_db)
+    drop = set(parse_csv(drop_labels))
+    trainable_keys = [k for k, lab in review_labels.items() if lab not in drop]
+    event_scores = load_event_scores(events_db, trainable_keys)
+    return classify_review_usability(
+        review_labels, event_scores, min_score=min_score, drop_labels=drop_labels)
 
 
 def episode_camera_counts(
@@ -281,6 +370,13 @@ def main() -> None:
     ap.add_argument("--episode-gap-sec", type=float, default=60.0,
                     help="episode = same camera, consecutive reviewed crops within "
                          "this wall-clock gap (matches the training split default)")
+    ap.add_argument("--events-db", type=Path, default=None,
+                    help="OPTIONAL events.db; cross-checks how many trainable reviews "
+                         "are actually usable by training (vs lost to orphan keys / "
+                         "below --min-score boxes)")
+    ap.add_argument("--min-score", type=float, default=TRAIN_MIN_SCORE_DEFAULT,
+                    help=f"YOLO box score floor for the usable cross-check "
+                         f"(default {TRAIN_MIN_SCORE_DEFAULT}, matches train_classifier)")
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = ap.parse_args()
 
@@ -303,11 +399,30 @@ def main() -> None:
         summary["episode_gap_sec"] = args.episode_gap_sec
         summary["episodes_per_label"] = episode_stats
 
+    # Usable-for-training cross-check against events.db (opt-in).
+    usable = None
+    if args.events_db is not None:
+        if not args.events_db.exists():
+            sys.exit(f"events db not found: {args.events_db}")
+        usable = usable_for_training_stats(
+            reviews_db, args.events_db,
+            min_score=args.min_score, drop_labels=parse_csv(args.drop_labels),
+        )
+        summary["usable_for_training"] = usable
+
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
         print(f"reviews db: {reviews_db}")
         print(format_report(summary, episode_stats))
+        if usable is not None:
+            print(
+                f"\nusable for training (vs events.db {args.events_db}): "
+                f"{usable['usable_for_training']}   "
+                f"(orphan={usable['orphan_reviews']}  "
+                f"below_min_score({usable['min_score']:g})={usable['below_min_score']}  "
+                f"[recording-unavailable: see train log])"
+            )
 
 
 if __name__ == "__main__":
