@@ -4,6 +4,7 @@ import subprocess
 import sys
 from collections import Counter
 
+import training.label_stats as label_stats
 from training.label_stats import (
     classify_review_usability,
     episode_camera_counts,
@@ -11,6 +12,7 @@ from training.label_stats import (
     load_event_scores,
     load_label_counts,
     load_label_episode_rows,
+    resolve_events_db,
     resolve_reviews_db,
     summarize_counts,
     usable_for_training_stats,
@@ -178,17 +180,20 @@ assert label_stats.parse_csv("alisa,chuzh") == ["alisa", "chuzh"]
 
 # ---- usable-for-training cross-check ----------------------------------------
 
-def _events_db(tmp_path, rows):
+def _write_events_db(path, rows):
     """events.db with the (id, score) columns the usable cross-check reads."""
-    db = tmp_path / "events.db"
-    conn = sqlite3.connect(str(db))
+    conn = sqlite3.connect(str(path))
     try:
         conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, score REAL)")
         conn.executemany("INSERT INTO events (id, score) VALUES (?, ?)", rows)
         conn.commit()
     finally:
         conn.close()
-    return db
+    return path
+
+
+def _events_db(tmp_path, rows):
+    return _write_events_db(tmp_path / "events.db", rows)
 
 
 def test_classify_review_usability_buckets():
@@ -225,11 +230,50 @@ def test_usable_for_training_stats_end_to_end(tmp_path):
     }
 
 
-def test_label_stats_works_without_events_db(tmp_path):
-    # Existing behaviour unchanged: no --events-db → no usable section, exit 0.
+# ---- events.db resolution / auto-discovery ----------------------------------
+
+def test_resolve_events_db_autodiscovers_valid_default(tmp_path):
+    (tmp_path / "data" / "events").mkdir(parents=True)
+    p = _write_events_db(tmp_path / "data/events/events.db", [(1, 0.9)])
+    assert resolve_events_db(None, root=tmp_path) == p
+
+
+def test_resolve_events_db_none_when_default_missing(tmp_path):
+    assert resolve_events_db(None, root=tmp_path) is None
+
+
+def test_resolve_events_db_none_when_default_is_empty_file(tmp_path):
+    (tmp_path / "data" / "events").mkdir(parents=True)
+    (tmp_path / "data/events/events.db").write_bytes(b"")   # 0-byte, no 'events' table
+    assert resolve_events_db(None, root=tmp_path) is None
+
+
+def test_resolve_events_db_explicit_override(tmp_path):
+    p = _write_events_db(tmp_path / "e.db", [(1, 0.9)])
+    assert resolve_events_db(p) == p                       # explicit, usable
+    assert resolve_events_db(tmp_path / "nope.db") is None  # explicit, missing → skip
+
+
+def test_main_autodiscovers_default_events_db(tmp_path, monkeypatch, capsys):
+    # No --events-db: label-stats finds <root>/data/events/events.db on its own.
+    (tmp_path / "data" / "events").mkdir(parents=True)
+    _write_events_db(tmp_path / "data/events/events.db", [(1, 0.9), (2, 0.4)])
+    rdb = _reviews_db(tmp_path, [(1, "cat_a"), (2, "cat_b"), (3, "cat_a")], with_meta=False)
+    monkeypatch.setattr(label_stats, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["label_stats", "--reviews-db", str(rdb), "--json"])
+    label_stats.main()
+    assert json.loads(capsys.readouterr().out)["usable_for_training"] == {
+        "usable_for_training": 1, "orphan_reviews": 1,   # key1 usable, key3 orphan
+        "below_min_score": 1, "min_score": 0.7,          # key2 (0.4) below
+    }
+
+
+def test_label_stats_graceful_when_events_db_missing(tmp_path):
+    # Missing events.db (explicit, so it's deterministic) → plain report, exit 0.
     rdb = _reviews_db(tmp_path, [(1, "cat_a"), (2, "cat_b")], with_meta=False)
     out = subprocess.run(
-        [sys.executable, "-m", "training.label_stats", "--reviews-db", str(rdb)],
+        [sys.executable, "-m", "training.label_stats",
+         "--reviews-db", str(rdb), "--events-db", str(tmp_path / "nope.db")],
         check=True, capture_output=True, text=True,
     ).stdout
     assert "reviewed labels:" in out

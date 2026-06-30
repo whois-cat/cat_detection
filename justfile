@@ -141,6 +141,7 @@ label-stats *ARGS:
     uv run python -m training.label_stats \
         --reviews-db "{{review_db}}" \
         --labels "{{labels}}" \
+        --events-db "{{events_db}}" \
         {{ARGS}}
 
 # Reset ONLY the human-review state: MOVE (never delete) reviews.db + clusters.json

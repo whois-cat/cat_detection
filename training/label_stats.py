@@ -5,7 +5,6 @@ import argparse
 import json
 import os
 import sqlite3
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
@@ -126,6 +125,41 @@ def load_event_scores(events_db: Path, keys: Iterable[int]) -> dict[int, float |
     finally:
         conn.close()
     return out
+
+
+def _has_events_table(path: Path) -> bool:
+    """True only if `path` is a usable events DB (exists, opens, has 'events').
+    A missing / empty (0-byte) / non-SQLite file returns False so the cross-check
+    is skipped rather than crashing."""
+    if not path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.DatabaseError:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+        ).fetchone()
+        return row is not None
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        conn.close()
+
+
+def resolve_events_db(explicit: Path | None, *, root: Path | None = None) -> Path | None:
+    """Pick the events.db for the usable cross-check, or None to skip it.
+
+    With no explicit path, auto-discovers the canonical
+    ``<root>/data/events/events.db`` (root defaults to the repo root) so
+    ``just label-stats`` includes usability stats with no extra flags. Returns
+    None when the chosen DB is missing/empty/not an events DB, so label-stats
+    degrades to the plain report instead of erroring. An explicit --events-db is
+    honoured when usable, else skipped (never a hard failure)."""
+    base = root if root is not None else ROOT
+    candidate = explicit if explicit is not None else base / "data/events/events.db"
+    return candidate if _has_events_table(candidate) else None
 
 
 def classify_review_usability(
@@ -371,9 +405,10 @@ def main() -> None:
                     help="episode = same camera, consecutive reviewed crops within "
                          "this wall-clock gap (matches the training split default)")
     ap.add_argument("--events-db", type=Path, default=None,
-                    help="OPTIONAL events.db; cross-checks how many trainable reviews "
-                         "are actually usable by training (vs lost to orphan keys / "
-                         "below --min-score boxes)")
+                    help="events.db for the usable-for-training cross-check. "
+                         "Auto-discovered at data/events/events.db when present, so "
+                         "no flag is needed for the normal layout; pass this to "
+                         "override (tests/custom paths). Missing/empty → skipped.")
     ap.add_argument("--min-score", type=float, default=TRAIN_MIN_SCORE_DEFAULT,
                     help=f"YOLO box score floor for the usable cross-check "
                          f"(default {TRAIN_MIN_SCORE_DEFAULT}, matches train_classifier)")
@@ -399,13 +434,13 @@ def main() -> None:
         summary["episode_gap_sec"] = args.episode_gap_sec
         summary["episodes_per_label"] = episode_stats
 
-    # Usable-for-training cross-check against events.db (opt-in).
+    # Usable-for-training cross-check. Runs by default when the canonical
+    # events.db is present; --events-db overrides; missing/empty → skipped.
     usable = None
-    if args.events_db is not None:
-        if not args.events_db.exists():
-            sys.exit(f"events db not found: {args.events_db}")
+    events_db = resolve_events_db(args.events_db)
+    if events_db is not None:
         usable = usable_for_training_stats(
-            reviews_db, args.events_db,
+            reviews_db, events_db,
             min_score=args.min_score, drop_labels=parse_csv(args.drop_labels),
         )
         summary["usable_for_training"] = usable
@@ -417,7 +452,7 @@ def main() -> None:
         print(format_report(summary, episode_stats))
         if usable is not None:
             print(
-                f"\nusable for training (vs events.db {args.events_db}): "
+                f"\nusable for training (vs {events_db}): "
                 f"{usable['usable_for_training']}   "
                 f"(orphan={usable['orphan_reviews']}  "
                 f"below_min_score({usable['min_score']:g})={usable['below_min_score']}  "
