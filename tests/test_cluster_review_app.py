@@ -70,7 +70,7 @@ def _manifest() -> dict:
          "representatives": [it["crop_id"] for it in items[6:9]]},
     ]
     return {
-        "labels": ["alisa", "chuzh", "ellie", "felisis"],
+        "labels": ["cat_a", "cat_b", "cat_c", "cat_d"],
         "items": items,
         "clusters": clusters,
         "params": {"min_score": 0.7, "pad_frac": 0.15},
@@ -146,7 +146,7 @@ def test_resplit_removes_old_child_cluster_reviews(client):
     client.post("/api/cluster_split", json={"cluster_id": 0, "parts": 2})
     old_ids = [c["cluster_id"] for c in _children_of(client, 0)]
     # Label one old child so it has a cluster_reviews row + per-crop reviews.
-    client.post("/api/cluster_review", json={"cluster_id": old_ids[0], "label": "alisa"})
+    client.post("/api/cluster_review", json={"cluster_id": old_ids[0], "label": "cat_a"})
 
     client.post("/api/cluster_split", json={"cluster_id": 0, "parts": 2})
     conn = client.mod._conn
@@ -158,43 +158,52 @@ def test_resplit_removes_old_child_cluster_reviews(client):
     assert client.get("/api/counts").json()["total"] == 0
 
 
+def test_mixed_batch_warning_present_in_html(client):
+    # The review UI must warn that a time-based batch can contain multiple cats,
+    # near the whole-batch labelling controls, before any apply-all action.
+    html = client.get("/").text
+    assert "This batch may contain multiple cats." in html
+    assert "Label only selected crops." in html
+    assert 'id="mixedBatchWarning"' in html
+
+
 def test_counts_endpoint_groups_crops_by_label(client):
-    # Label whole clusters: cluster 1 (3 crops) → chuzh, cluster 0 (6) → alisa.
-    client.post("/api/cluster_review", json={"cluster_id": 1, "label": "chuzh"})
-    client.post("/api/cluster_review", json={"cluster_id": 0, "label": "alisa"})
+    # Label whole clusters: cluster 1 (3 crops) → cat_b, cluster 0 (6) → cat_a.
+    client.post("/api/cluster_review", json={"cluster_id": 1, "label": "cat_b"})
+    client.post("/api/cluster_review", json={"cluster_id": 0, "label": "cat_a"})
     data = client.get("/api/counts").json()
-    assert data["counts"]["alisa"] == 6
-    assert data["counts"]["chuzh"] == 3
+    assert data["counts"]["cat_a"] == 6
+    assert data["counts"]["cat_b"] == 3
     assert data["total"] == 9
-    assert data["order"][:4] == ["alisa", "chuzh", "ellie", "felisis"]
+    assert data["order"][:4] == ["cat_a", "cat_b", "cat_c", "cat_d"]
     # All fixture crops share one camera with wall_ms within the gap → 1 visit each.
-    assert data["episodes"]["alisa"] == 1
-    assert data["episodes"]["chuzh"] == 1
-    assert data["cameras"]["alisa"] == 1
+    assert data["episodes"]["cat_a"] == 1
+    assert data["episodes"]["cat_b"] == 1
+    assert data["cameras"]["cat_a"] == 1
 
 
 def test_per_crop_label_writes_one_row_each(client):
     crop_ids = ["grey:0", "grey:3", "grey:5"]
-    r = client.post("/api/crop_label", json={"crop_ids": crop_ids, "label": "ellie"})
+    r = client.post("/api/crop_label", json={"crop_ids": crop_ids, "label": "cat_c"})
     assert r.status_code == 200, r.text
     assert r.json()["labeled"] == 3
     counts = client.get("/api/counts").json()["counts"]
-    assert counts["ellie"] == 3
+    assert counts["cat_c"] == 3
 
     # Re-labelling the same crop updates in place (no duplicate rows).
-    client.post("/api/crop_label", json={"crop_ids": ["grey:0"], "label": "alisa"})
+    client.post("/api/crop_label", json={"crop_ids": ["grey:0"], "label": "cat_a"})
     counts = client.get("/api/counts").json()["counts"]
-    assert counts["ellie"] == 2
-    assert counts["alisa"] == 1
+    assert counts["cat_c"] == 2
+    assert counts["cat_a"] == 1
 
 
 def test_per_crop_label_rejects_unknown_crop_and_label(client):
     assert client.post("/api/crop_label",
-                       json={"crop_ids": ["nope:1"], "label": "alisa"}).status_code == 404
+                       json={"crop_ids": ["nope:1"], "label": "cat_a"}).status_code == 404
     assert client.post("/api/crop_label",
                        json={"crop_ids": ["grey:0"], "label": "banana"}).status_code == 400
     assert client.post("/api/crop_label",
-                       json={"crop_ids": [], "label": "alisa"}).status_code == 400
+                       json={"crop_ids": [], "label": "cat_a"}).status_code == 400
 
 
 def _review_rows(client):
@@ -207,8 +216,8 @@ def test_cluster_label_with_exceptions_labels_selected_and_rest(client):
     # include_hidden=true: selected/rest over the WHOLE cluster (all 6).
     r = client.post("/api/cluster_label_with_exceptions", json={
         "cluster_id": 0,
-        "majority_label": "felisis",
-        "exceptions": {"discard": ["grey:0", "grey:5"], "chuzh": ["grey:3"]},
+        "majority_label": "cat_d",
+        "exceptions": {"discard": ["grey:0", "grey:5"], "cat_b": ["grey:3"]},
         "include_hidden": True,
     })
     assert r.status_code == 200, r.text
@@ -217,18 +226,18 @@ def test_cluster_label_with_exceptions_labels_selected_and_rest(client):
     assert data["labeled_count"] == 6
     assert data["include_hidden"] is True
     assert data["majority_labeled_count"] == 3
-    assert data["exception_counts"] == {"discard": 2, "chuzh": 1}
+    assert data["exception_counts"] == {"discard": 2, "cat_b": 1}
 
     rows = dict(_review_rows(client))
     assert rows["grey:0"] == "discard"
     assert rows["grey:5"] == "discard"
-    assert rows["grey:3"] == "chuzh"
-    assert rows["grey:1"] == "felisis"
-    assert rows["grey:2"] == "felisis"
-    assert rows["grey:4"] == "felisis"
+    assert rows["grey:3"] == "cat_b"
+    assert rows["grey:1"] == "cat_d"
+    assert rows["grey:2"] == "cat_d"
+    assert rows["grey:4"] == "cat_d"
     status = client.get("/api/clusters").json()["queue"][0]["status"]
     assert status["status"] == "labeled"
-    assert status["label"] == "felisis"
+    assert status["label"] == "cat_d"
 
 
 def test_label_defaults_to_visible_only(client):
@@ -236,7 +245,7 @@ def test_label_defaults_to_visible_only(client):
     # the 4 hidden crops are left untouched.
     r = client.post("/api/cluster_label_with_exceptions", json={
         "cluster_id": 0,
-        "majority_label": "felisis",
+        "majority_label": "cat_d",
         "exceptions": {},
     })
     assert r.status_code == 200, r.text
@@ -247,7 +256,7 @@ def test_label_defaults_to_visible_only(client):
     assert data["labeled_count"] == 2
 
     rows = dict(_review_rows(client))
-    assert rows == {"grey:0": "felisis", "grey:3": "felisis"}
+    assert rows == {"grey:0": "cat_d", "grey:3": "cat_d"}
     for hidden in ("grey:1", "grey:2", "grey:4", "grey:5"):
         assert hidden not in rows
 
@@ -255,14 +264,14 @@ def test_label_defaults_to_visible_only(client):
 def test_label_include_hidden_labels_every_crop(client):
     r = client.post("/api/cluster_label_with_exceptions", json={
         "cluster_id": 0,
-        "majority_label": "felisis",
+        "majority_label": "cat_d",
         "exceptions": {},
         "include_hidden": True,
     })
     assert r.status_code == 200, r.text
     assert r.json()["labeled_count"] == 6
     rows = dict(_review_rows(client))
-    assert all(rows[f"grey:{k}"] == "felisis" for k in range(6))
+    assert all(rows[f"grey:{k}"] == "cat_d" for k in range(6))
 
 
 def test_cluster_label_with_exceptions_rejects_invalid_label_and_camera_names(client):
@@ -273,7 +282,7 @@ def test_cluster_label_with_exceptions_rejects_invalid_label_and_camera_names(cl
     }).status_code == 400
     assert client.post("/api/cluster_label_with_exceptions", json={
         "cluster_id": 0,
-        "majority_label": "alisa",
+        "majority_label": "cat_a",
         "exceptions": {"grey": ["grey:0"]},
     }).status_code == 400
     assert client.mod._conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 0
@@ -282,7 +291,7 @@ def test_cluster_label_with_exceptions_rejects_invalid_label_and_camera_names(cl
 def test_cluster_label_with_exceptions_rejects_crop_from_other_cluster(client):
     r = client.post("/api/cluster_label_with_exceptions", json={
         "cluster_id": 0,
-        "majority_label": "alisa",
+        "majority_label": "cat_a",
         "exceptions": {"discard": ["grey:6"]},
     })
     assert r.status_code == 400
@@ -304,7 +313,7 @@ def test_cluster_label_with_exceptions_rolls_back_on_write_failure(client, monke
     with pytest.raises(RuntimeError):
         client.post("/api/cluster_label_with_exceptions", json={
             "cluster_id": 0,
-            "majority_label": "alisa",
+            "majority_label": "cat_a",
             "exceptions": {"discard": ["grey:0"]},
         })
     assert client.mod._conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 0
@@ -335,12 +344,12 @@ def test_hidden_duplicate_can_be_overridden_as_exception(client):
     # remain untouched.
     r = client.post("/api/cluster_label_with_exceptions", json={
         "cluster_id": 0,
-        "majority_label": "alisa",
+        "majority_label": "cat_a",
         "exceptions": {"discard": ["grey:2"]},
     })
     assert r.status_code == 200, r.text
     rows = dict(_review_rows(client))
     assert rows["grey:2"] == "discard"          # explicitly selected → labelled
-    assert rows["grey:0"] == "alisa"            # visible → majority
-    assert rows["grey:3"] == "alisa"            # visible → majority
+    assert rows["grey:0"] == "cat_a"            # visible → majority
+    assert rows["grey:3"] == "cat_a"            # visible → majority
     assert "grey:1" not in rows                 # hidden, not selected → untouched

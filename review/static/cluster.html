@@ -77,6 +77,10 @@
   .bulk .vis b { color:var(--fg); }
   .bulk .sel { color:var(--fg); font-weight:600; }
   .bulk .grid2 { display:grid; grid-template-columns:auto 1fr; align-items:center; gap:8px; }
+  .warn-banner { border:1px solid var(--warn); border-radius:6px; padding:8px 10px;
+                 background:rgba(255,189,74,.10); color:var(--warn); font-size:12px;
+                 line-height:1.35; }
+  .warn-banner b { color:var(--warn); }
   details.advanced { border-top:1px solid var(--line); padding-top:8px; }
   details.advanced > summary { cursor:pointer; color:var(--muted); list-style:none; padding:4px 0; }
   details.advanced > summary::-webkit-details-marker { display:none; }
@@ -121,7 +125,13 @@
     <!-- Primary (and only) labelling path. Two modes, switched by selection:
          no selection → label the whole cluster; selection → exceptions. -->
     <div class="bulk section">
-      <span class="head" id="bulkTitle">label whole cluster</span>
+      <span class="head" id="bulkTitle">label whole batch</span>
+      <!-- Time-based review batches are NOT identity clusters: a batch can hold
+           more than one cat. Warn before any apply-all so a single label isn't
+           swept across a mixed batch. Always visible; never blocks labelling. -->
+      <div class="warn-banner" id="mixedBatchWarning" role="alert">
+        ⚠ This batch may contain multiple cats. <b>Label only selected crops.</b>
+      </div>
       <div class="vis" id="visibilityLine"></div>     <!-- simple "N crops" count -->
 
       <!-- selection == 0 -->
@@ -277,7 +287,7 @@ function updateApplySummary() {
   document.getElementById('wholeMode').hidden = n > 0;
   document.getElementById('exceptionsMode').hidden = n === 0;
   document.getElementById('bulkTitle').textContent =
-      n > 0 ? 'label with exceptions' : 'label whole cluster';
+      n > 0 ? 'label with exceptions' : 'label whole batch';
   if (!btn) return;
 
   if (n === 0) {
