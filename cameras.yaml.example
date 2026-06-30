@@ -175,7 +175,7 @@
 #     ---- scheduled mode — feed at fixed clock times ----
 #     feed_times             — list of "HH:MM" slots, e.g. ["08:00","13:00","18:00"].
 #                             A malformed entry fails the feeder at startup.
-#     feed_tz                — IANA tz for the slots, e.g. "Europe/Moscow"
+#     feed_tz                — IANA tz for the slots, e.g. "America/New_York"
 #                             (default: container local tz).
 #     feed_catchup_max       — on restart / after downtime, at most this many of the
 #                             latest missed slots actually feed; older missed slots
@@ -218,7 +218,7 @@ cameras:
       id: feeder1
       api_base_url: http://192.168.0.100
       serial_number: ABC123456
-      allowed_cats: [alisa, ellie]
+      allowed_cats: [cat_a, cat_c]
       # Safety gates (recommended). Runtime default is 0/off for back-compat, but
       # ship a safe value here so a copied config isn't wide open. open_min_margin
       # is inert until the detector emits top-2 scores, but harmless to set now.
@@ -239,7 +239,7 @@ cameras:
       # feed_mode: scheduled
       # feed_grain_num: 1
       # feed_times: ["08:00", "13:00", "18:00", "22:00"]
-      # feed_tz: Europe/Moscow      # default: container local tz
+      # feed_tz: America/New_York      # default: container local tz
       # feed_catchup_max: 2         # latest N missed slots feed; older = maintenance
 
   - id: kitchen
@@ -251,7 +251,7 @@ cameras:
       id: feeder2
       api_base_url: http://192.168.0.101
       serial_number: DEF789012
-      allowed_cats: [chuzh]
+      allowed_cats: [cat_b]
       open_min_confidence: 0.85   # safety gate (see feeder1 above)
       open_min_margin: 0.15
       # Concrete scheduled example: 1 portion at each of these local times.
@@ -260,5 +260,5 @@ cameras:
       feed_mode: scheduled
       feed_grain_num: 1
       feed_times: ["08:00", "13:00", "18:00", "22:00"]
-      feed_tz: Europe/Moscow      # omit to use the container's local tz
+      feed_tz: America/New_York      # omit to use the container's local tz
       feed_catchup_max: 2
