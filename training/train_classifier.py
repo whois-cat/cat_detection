@@ -690,6 +690,21 @@ def index_batches(indices: list[int], batch_size: int, *,
         yield order[start:start + max(1, batch_size)]
 
 
+def mean_from_batch_means(pairs: list[tuple[float, int]]) -> float:
+    """Combine per-batch mean losses into a single dataset mean:
+    ``sum(mean_b * size_b) / sum(size_b)``.
+
+    With an UNWEIGHTED criterion (mean = (1/N)·ΣL) this equals the plain
+    per-sample mean and is therefore independent of how samples are grouped into
+    batches — so the logged train/val loss curves are comparable regardless of
+    shuffling/episode ordering. (A weighted criterion's per-batch mean normalises
+    by Σweight, so the same accumulation would NOT be grouping-invariant — which
+    is exactly the asymmetry this logging path avoids.)
+    """
+    total = sum(n for _, n in pairs)
+    return sum(m * n for m, n in pairs) / max(1, total)
+
+
 def load_checkpoint_remapped(model, checkpoint: dict, classes: list[str]) -> dict:
     """Load a previous classifier, remapping the head by class name.
 
@@ -1310,12 +1325,14 @@ def main() -> None:
             log.warning("preview-augmentations: could not decode any sample crops")
 
     def predict_indices(indices: list[int]):
-        """Returns (y_true, y_pred, kept_indices, mean_loss). Loss uses the same
-        weighted criterion as training, for an honest val/test loss curve."""
+        """Returns (y_true, y_pred, kept_indices, mean_loss). The reported loss is
+        the UNWEIGHTED mean cross-entropy (criterion_report), so val/test loss is
+        comparable to train_loss and free of the weighted-mean × batch-ordering
+        asymmetry. The weighted criterion is used only for gradients."""
         y_true: list[int] = []
         y_pred: list[int] = []
         kept: list[int] = []   # source item indices aligned with y_true/y_pred
-        loss_sum, n_seen = 0.0, 0
+        batch_means: list[tuple[float, int]] = []
         with torch.no_grad():
             for batch_indices in index_batches(indices, args.batch_size):
                 batch = make_batch(batch_indices, eval_tf)
@@ -1323,12 +1340,11 @@ def main() -> None:
                     continue
                 x, y, batch_kept = batch
                 logits = model(x)
-                loss_sum += float(criterion(logits, y)) * x.size(0)
-                n_seen += x.size(0)
+                batch_means.append((float(criterion_report(logits, y)), x.size(0)))
                 y_true.extend(y.tolist())
                 y_pred.extend(logits.argmax(1).tolist())
                 kept.extend(batch_kept)
-        return y_true, y_pred, kept, loss_sum / max(1, n_seen)
+        return y_true, y_pred, kept, mean_from_batch_means(batch_means)
 
     # --- class-imbalance weighting (inverse frequency on TRAIN) ---
     counts = np.bincount([cls_to_idx[metas[j].label] for j in train_idx],
@@ -1372,6 +1388,10 @@ def main() -> None:
     optim = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
     criterion = nn.CrossEntropyLoss(weight=ce_weight)
+    # Unweighted CE used ONLY for the logged loss curve (not gradients): keeps
+    # train_loss and val_loss on the same, comparable scale. The weighted
+    # criterion above still drives optimisation, so training behaviour is unchanged.
+    criterion_report = nn.CrossEntropyLoss()
 
     # --- experiment tracking (MLflow if installed; transparent no-op otherwise) ---
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1440,10 +1460,13 @@ def main() -> None:
                 continue
             x, y, _ = batch
             optim.zero_grad()
-            loss = criterion(model(x), y)
+            out = model(x)
+            loss = criterion(out, y)          # weighted — drives gradients (unchanged)
             loss.backward()
             optim.step()
-            running += loss.item() * x.size(0)
+            # Logged train_loss uses the UNWEIGHTED mean CE (same as val), so the
+            # two curves are comparable; gradients above are unaffected.
+            running += float(criterion_report(out.detach(), y)) * x.size(0)
             seen += x.size(0)
             if first_batch:
                 log_rss(log, "after-first-batch")
