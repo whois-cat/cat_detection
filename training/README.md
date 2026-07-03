@@ -270,11 +270,44 @@ and is not used by review/training filters. For one-off experiments, pass
 to or above the feeder are not removed. Tune the cutoff with
 `--ignore-region-min-coverage` (default `0.8`).
 
-Embedding choice:
+Embedding choice (only for `--mode embedding`; `--mode time` uses no embeddings
+and never loads any of these backends):
 
-- `--embedding auto` (default) uses cached ImageNet EfficientNet-B0 features
-  when available, otherwise falls back to deterministic visual texture/color
-  features. This keeps the command usable offline.
+- `--embedding auto` (default) prefers **DINOv2** when its optional deps and
+  model are available, then cached ImageNet EfficientNet-B0 features, then
+  deterministic visual texture/color features. It degrades gracefully: a machine
+  without the DINO deps logs a warning and falls back — the command stays usable
+  offline and existing setups keep working unchanged.
+- `--embedding dinov2` uses a small, CPU-friendly self-supervised DINOv2
+  (`facebook/dinov2-small`) to embed crops. Self-supervised features tend to
+  separate individual cats (fur/face) better than supervised EfficientNet
+  logits, so clusters are cleaner and human labeling is faster. **Offline
+  cluster building only** — DINOv2 is never used by live inference, the detector,
+  the feeder, or runtime identity prediction. It needs the optional `label`
+  extra (transformers + torch); install it with:
+
+  ```bash
+  # from the repo root (system Python / any venv):
+  uv pip install -e '.[label]'
+  # or, inside the training uv project:
+  uv sync --extra label       # (cd training)
+  ```
+
+  If the deps are missing and you pass `--embedding dinov2` explicitly, the
+  command fails with a clear message. Under `--embedding auto` it just falls
+  back. The model downloads once from Hugging Face on first use; on an offline
+  machine pre-cache it, or pass `--allow-download` where network is available.
+
+  ```bash
+  REVIEW_LABELS=alisa,chuzh,ellie,felisis \
+  RECORDING_TZ=UTC \
+  just label-build \
+    --mode embedding \
+    --embedding dinov2 \
+    --min-score 0.7 \
+    --clusters 80
+  ```
+
 - `--embedding efficientnet --allow-download` lets torchvision fetch ImageNet
   weights if the machine has network access.
 - `--embedding visual` is fastest and dependency-light, but mixed clusters are

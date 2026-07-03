@@ -30,6 +30,12 @@ classifier = ["torch==2.5.1", "torchvision==0.20.1", "scikit-learn", "mlflow>=2.
 # Stage B label-review web app (see ../review/requirements.txt). Decode-only —
 # deliberately no openvino/torch; av+numpy come from the base deps above.
 review     = ["fastapi", "uvicorn", "Pillow"]
+# Optional Stage A DINOv2 embedding backend (`--embedding dinov2`) for cleaner
+# cold-start clusters. OFFLINE labeling only — never used by live inference, the
+# detector, or the feeder. Everything else (time mode, efficientnet, visual)
+# works without this extra. torch pin matches `classifier` above; on Linux uv
+# resolves it from the CPU wheel index configured below.
+label      = ["torch==2.5.1", "transformers>=4.40", "Pillow"]
 
 [tool.uv.sources]
 torch = [

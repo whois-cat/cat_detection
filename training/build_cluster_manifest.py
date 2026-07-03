@@ -65,6 +65,81 @@ class EfficientNetExtractor:
         return [row for row in arr]
 
 
+class DinoV2Extractor:
+    """Offline-only DINOv2 embedding backend for cold-start cluster building.
+
+    Self-supervised ImageNet-free features tend to separate individual cats
+    (fur pattern / face) better than supervised EfficientNet logits, so the
+    cold-start clusters are cleaner and faster to bulk-label. This is used ONLY
+    here, during offline manifest building — never in live inference, the
+    detector, the feeder, or runtime identity prediction.
+
+    Dependencies (transformers + torch) are imported lazily so importing this
+    module never fails when they are absent; only constructing the extractor
+    does. Runs on CPU by default; ``facebook/dinov2-small`` is a small,
+    CPU-friendly, widely available variant.
+    """
+
+    name = "dinov2"
+
+    def __init__(self, *, batch_size: int, allow_download: bool,
+                 model_id: str = "facebook/dinov2-small", device: str = "cpu") -> None:
+        try:
+            import torch
+            from PIL import Image
+            from transformers import AutoImageProcessor, AutoModel
+        except Exception as exc:  # pragma: no cover - depends on optional deps
+            raise RuntimeError(
+                "DINOv2 backend requires transformers and torch. "
+                "Install optional labeling dependencies."
+            ) from exc
+
+        local_only = not allow_download
+        try:
+            self._processor = AutoImageProcessor.from_pretrained(
+                model_id, local_files_only=local_only
+            )
+            model = AutoModel.from_pretrained(model_id, local_files_only=local_only)
+        except Exception as exc:  # pragma: no cover - depends on cached weights
+            if local_only:
+                raise RuntimeError(
+                    f"DINOv2 weights for {model_id} are not cached; re-run with "
+                    "--allow-download or use --embedding efficientnet/visual"
+                ) from exc
+            raise RuntimeError(f"failed to load DINOv2 model {model_id}: {exc}") from exc
+
+        self._torch = torch
+        self._image = Image
+        self._device = torch.device(device)
+        self._batch_size = max(1, int(batch_size))
+        self._model = model.to(self._device)
+        self._model.eval()
+        # Record the concrete model in the name so it flows into the manifest
+        # (params.embedding) and never gets mixed up with EfficientNet features.
+        self.name = f"dinov2:{model_id.rsplit('/', 1)[-1]}"
+
+    def encode_batch(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        torch = self._torch
+        out: list[np.ndarray] = []
+        # Sub-batch internally so a large flush does not spike CPU RAM.
+        for start in range(0, len(images), self._batch_size):
+            chunk = images[start:start + self._batch_size]
+            pil = [
+                self._image.fromarray(np.ascontiguousarray(img_bgr[..., ::-1]))
+                for img_bgr in chunk
+            ]
+            inputs = self._processor(images=pil, return_tensors="pt").to(self._device)
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+            emb = getattr(outputs, "pooler_output", None)
+            if emb is None:
+                emb = outputs.last_hidden_state[:, 0]  # CLS token fallback
+            emb = torch.nn.functional.normalize(emb, dim=1)  # L2-normalized
+            arr = emb.cpu().numpy().astype(np.float32)
+            out.extend(row for row in arr)
+        return out
+
+
 def _torch_home() -> Path:
     if os.environ.get("TORCH_HOME"):
         return Path(os.environ["TORCH_HOME"])
@@ -80,12 +155,30 @@ def _torchvision_weights_cached(weights) -> bool:
 
 
 def build_extractor(kind: str, *, batch_size: int, allow_download: bool):
-    if kind in {"auto", "efficientnet"}:
+    """Construct the embedding backend for --mode embedding.
+
+    Explicit backends fail loudly if unavailable; ``auto`` degrades gracefully
+    dinov2 → efficientnet → visual, so a machine without the DINO deps (or
+    cached weights) keeps working exactly as before.
+    """
+    if kind == "dinov2":
+        try:
+            return DinoV2Extractor(batch_size=batch_size, allow_download=allow_download)
+        except Exception as exc:
+            raise SystemExit(f"dinov2 embeddings unavailable: {exc}") from exc
+    if kind == "efficientnet":
         try:
             return EfficientNetExtractor(batch_size=batch_size, allow_download=allow_download)
         except Exception as exc:
-            if kind == "efficientnet":
-                raise SystemExit(f"efficientnet embeddings unavailable: {exc}") from exc
+            raise SystemExit(f"efficientnet embeddings unavailable: {exc}") from exc
+    if kind == "auto":
+        try:
+            return DinoV2Extractor(batch_size=batch_size, allow_download=allow_download)
+        except Exception as exc:
+            print(f"[cluster] dinov2 unavailable ({exc}); trying efficientnet")
+        try:
+            return EfficientNetExtractor(batch_size=batch_size, allow_download=allow_download)
+        except Exception as exc:
             print(f"[cluster] efficientnet unavailable ({exc}); falling back to visual features")
     return VisualExtractor()
 
@@ -495,7 +588,7 @@ def default_cluster_count(n: int) -> int:
 
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", type=Path, required=True, help="events.db")
     ap.add_argument("--recordings", type=Path, required=True, help="data/recordings root")
@@ -525,15 +618,20 @@ def main() -> None:
                     help="time mode: start a new per-camera episode when the gap "
                          "to the previous detection is >= this many seconds "
                          "(default 30, like the feeder presence episode)")
-    ap.add_argument("--embedding", choices=("auto", "visual", "efficientnet"),
+    ap.add_argument("--embedding",
+                    choices=("auto", "visual", "efficientnet", "dinov2"),
                     default="auto",
-                    help="feature extractor for clustering; auto uses cached "
-                         "EfficientNet ImageNet weights when available")
+                    help="feature extractor for --mode embedding (unused in "
+                         "--mode time); auto prefers dinov2 (best clusters) then "
+                         "cached EfficientNet ImageNet weights then deterministic "
+                         "visual features, degrading gracefully when optional "
+                         "deps/weights are missing")
     ap.add_argument("--embedding-batch-size", type=int, default=32)
     ap.add_argument("--embedding-dim", type=int, default=64,
                     help="compact stored embedding dim for clustering/splitting")
     ap.add_argument("--allow-download", action="store_true",
-                    help="allow torchvision to download EfficientNet weights")
+                    help="allow downloading model weights (torchvision "
+                         "EfficientNet or Hugging Face DINOv2) when not cached")
     ap.add_argument("--no-store-embeddings", action="store_true",
                     help="smaller manifest, but disables split-cluster in review UI")
     ap.add_argument("--dedupe-window-sec", type=float, default=15.0,
@@ -557,7 +655,11 @@ def main() -> None:
                          "box area is inside an ignore region")
     ap.add_argument("--labels", default="",
                     help="optional comma-separated label names for the review UI")
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
 
     from training import CropSource
     from training.regions import (

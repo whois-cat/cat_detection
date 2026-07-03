@@ -26,6 +26,14 @@ classifier = [
 yolo = [
     "ultralytics==8.3.18",
 ]
+# Optional DINOv2 embedding backend for offline cold-start cluster building
+# (training/build_cluster_manifest.py --embedding dinov2). Not used by live
+# inference, the detector, or the feeder.
+label = [
+    "torch==2.5.1",
+    "transformers>=4.40",
+    "Pillow>=10",
+]
 dev = [
     "ultralytics==8.3.18",
 ]
