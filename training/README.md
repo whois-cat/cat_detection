@@ -483,6 +483,36 @@ NOT crash — collect/relabel more crops (especially the confuse pair) and re-ru
 `{state_dict, class_names, num_classes}` format `export_classifier.py` expects)
 plus `metadata.json` (class_names, pad_frac, preprocessing spec, val metrics).
 
+**Open-set identity (prototype-distance gate).** The classifier head is
+closed-set softmax: on its own it will confidently label *any* crop — a stranger
+cat, a raccoon, a dog — as one of the known cats, and softmax "confidence" is not
+calibrated probability. To make identity open-set, training also computes a
+**prototype** per class: the L2-normalized mean of that cat's training-crop
+embeddings (EfficientNet's 1280-d pre-classifier features). At serve time a crop
+is rejected as `unknown` when its embedding is farther (cosine distance) than a
+ceiling from *every* known-cat prototype, regardless of how confident softmax is
+— so a new/unfamiliar animal lands far from all prototypes and never opens the
+feeder. The decision logic is `detector/unknown.py::decide_identity` (fail-closed).
+
+- Prototypes are saved into `cat_classifier.pt` and written to `prototypes.json`
+  next to `classes.json` on export; promotion copies the whole export dir, so no
+  extra step is needed. `metadata.json → open_set.suggested_max_prototype_distance`
+  reports a starting ceiling (the worst class's p95 train distance).
+- The gate is **off by default** and **backward compatible**: it activates only
+  when the model ships `prototypes.json` (a re-export/re-train) *and* the runtime
+  env `DETECTOR_MAX_PROTOTYPE_DISTANCE` is set. Unset → the runtime behaves
+  exactly as before (softmax floor `DETECTOR_UNKNOWN_CONF` only). Older
+  single-output models with no embedding simply skip the gate — never an error.
+- Enable it on the detector once you've validated the ceiling on real data:
+  ```bash
+  # cameras.yaml / detector env:
+  DETECTOR_MAX_PROTOTYPE_DISTANCE=0.35   # e.g. metadata suggested value
+  DETECTOR_UNKNOWN_CONF=0.9              # softmax floor (unchanged)
+  ```
+  Lower the distance → reject more (fewer false accepts, more false rejects);
+  raise it → accept more. `/status` reports `has_embedding` and
+  `prototype_classes` so you can confirm the gate is live.
+
 **Export + swap the classifier (later, deliberate step).**
 
 ```bash
@@ -645,7 +675,15 @@ training/
 ├── extract_classifier.py     (optional ImageFolder/JPG export from CropSource)
 ├── extract_detector.py       (one-shot script wrapping FullFrameSource)
 ├── build_cluster_manifest.py (cold-start clustering manifest)
-└── train_classifier.py       (train identity classifier; best-by-val → models/trained/)
+├── train_classifier.py       (identity-classifier ENTRY POINT: build_parser + main;
+│                              re-exports the helpers below for back-compat)
+├── classifier_types.py       (Meta / CropRefLite / TrainItem)
+├── classifier_labels.py      (label policy: decide_label / require_min_classes)
+├── classifier_split.py       (episode split + leakage checks + in-episode sampling)
+├── classifier_metrics.py     (confusion / PR-F1 / dangerous confusions / reports)
+├── classifier_artifacts.py   (labels.json + confusion-matrix CSV/PNG writers)
+├── classifier_model.py       (checkpoint remap, finetune config, open-set prototypes)
+└── classifier_batching.py    (shrink/batch/mean-loss helpers for the train loop)
 
 ../review/            (FastAPI bulk label-review app; `just label-review`)
 ├── cluster_app.py    (bulk cluster labels; corrections → reviews.db)

@@ -36,11 +36,8 @@ import logging
 import os
 import random
 import sys
-from collections import defaultdict, namedtuple
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 
@@ -63,737 +60,59 @@ ROOT = Path(__file__).resolve().parents[1]
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-DROP_LABELS = {"discard", "unknown"}
 
-@dataclass(frozen=True)
-class Meta:
-    label: str
-    camera: str
-    wall_ms: int
-    rowid: int | None = None
-    duplicate_group_id: str | None = None
-    suspicious_score: float = 0.0
-    sampling_reason: str | None = None
+# ----------------------------------------------------------------------------
+# The training pipeline is split across focused modules (types, labels, split,
+# metrics, artifacts, model, batching). These re-exports keep the historical
+# `from training.train_classifier import X` surface working for callers/tests,
+# and let main() below reference the helpers by their bare names.
+from training.classifier_types import CropRefLite, Meta, TrainItem  # noqa: E402,F401
+from training.classifier_labels import (  # noqa: E402,F401
+    DROP_LABELS,
+    decide_label,
+    require_min_classes,
+)
+from training.classifier_split import (  # noqa: E402,F401
+    build_episodes,
+    check_split_leakage,
+    print_split_report,
+    sample_indices_for_training,
+    split_episodes,
+    summarize_split,
+)
+from training.classifier_metrics import (  # noqa: E402,F401
+    DangerousConfusion,
+    confusion,
+    dangerous_confusion_report,
+    dangerous_from_confuse,
+    format_epoch_line,
+    load_dangerous_confusions,
+    per_camera_confusion,
+    per_class_f1,
+    per_class_pr,
+    per_group_accuracy,
+    present_class_mask,
+    print_report,
+    supported_macro_recall,
+)
+from training.classifier_artifacts import (  # noqa: E402,F401
+    labels_payload,
+    write_confusion_csv,
+    write_confusion_png,
+    write_labels_json,
+)
+from training.classifier_model import (  # noqa: E402,F401
+    configure_finetune,
+    load_checkpoint_remapped,
+    prototype_distance_stats,
+    prototypes_from_embeddings,
+)
+from training.classifier_batching import (  # noqa: E402,F401
+    index_batches,
+    mean_from_batch_means,
+    shrink_bgr_for_batch,
+)
 
-
-CropRefLite = namedtuple("CropRefLite", ["camera_id", "wall_ms", "box", "rotate_deg"])
-# A training item is decoded from exactly ONE of:
-#   ref     — a fresh CropRefLite, decoded from recordings per batch, OR
-#   replay  — a replay.ReplayItem, decoded from its .npz per batch, OR
-#   image   — an already-decoded crop (legacy / pre-shrunk path).
-TrainItem = namedtuple("TrainItem", ["meta", "ref", "image", "replay"])
-
-
-# --------------------------------------------------------------- label policy --
-
-def decide_label(det_label, det_conf, human, trust_classifier, trust_conf):
-    """Final training label for one crop, or None to drop it.
-
-    Default (trust_classifier=False): ONLY human labels are used. With
-    --trust-classifier, an unreviewed crop may also use the existing classifier's
-    label when its cat_score >= trust_conf. discard/unknown are always dropped.
-    """
-    if human is not None:
-        return None if human in DROP_LABELS else human
-    if not trust_classifier:
-        return None                      # human-only by default
-    if not det_label or det_label in DROP_LABELS:
-        return None
-    if det_conf is not None and det_conf >= trust_conf:
-        return det_label
-    return None
-
-
-def require_min_classes(classes: list[str]) -> None:
-    """Refuse to train an identity classifier on fewer than two labeled classes.
-
-    A single class yields a degenerate model that always predicts that class —
-    useless, yet still saveable/promotable. Fail loudly before model creation.
-    Class names are reported dynamically (no assumptions about which labels).
-    """
-    if len(classes) < 2:
-        raise SystemExit(
-            "need at least 2 labeled classes to train the identity classifier; "
-            f"found classes: {classes}. Review more crops (just label-review) or "
-            "check your drop labels / review labels."
-        )
-
-
-# ------------------------------------------------------------- episode split --
-
-def build_episodes(metas: list[Meta], gap_ms: int) -> list[list[int]]:
-    """Group crop indices into episodes: same camera, consecutive in wall_ms with
-    no gap > gap_ms. Returns a list of episodes, each a list of crop indices."""
-    by_cam: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    for i, m in enumerate(metas):
-        by_cam[m.camera].append((m.wall_ms, i))
-    episodes: list[list[int]] = []
-    for _cam, lst in by_cam.items():
-        lst.sort()
-        cur: list[int] = []
-        prev: int | None = None
-        for wall_ms, i in lst:
-            if prev is not None and wall_ms - prev > gap_ms:
-                episodes.append(cur)
-                cur = []
-            cur.append(i)
-            prev = wall_ms
-        if cur:
-            episodes.append(cur)
-    return episodes
-
-
-def split_episodes(episodes: list[list[int]], metas: list[Meta], *,
-                   val_frac: float, test_frac: float,
-                   required: set[str], seed: int):
-    """Assign whole episodes to train/val/test.
-
-    The unit of splitting is an episode, never an individual crop, so adjacent
-    near-duplicates cannot leak across splits. Val/test are nudged to contain
-    every class when possible so per-class metrics are meaningful.
-    """
-    if val_frac < 0 or test_frac < 0 or val_frac + test_frac >= 1:
-        raise ValueError("--val-frac and --test-frac must be >=0 and sum to < 1")
-    rng = random.Random(seed)
-    order = list(range(len(episodes)))
-    rng.shuffle(order)
-
-    total = sum(len(e) for e in episodes)
-    test_target = test_frac * total
-    val_target = val_frac * total
-    test_eps: set[int] = set()
-    val_eps: set[int] = set()
-
-    n = 0
-    for e in order:
-        if n >= test_target:
-            break
-        test_eps.add(e)
-        n += len(episodes[e])
-
-    n = 0
-    for e in order:
-        if n >= val_target:
-            break
-        if e in test_eps:
-            continue
-        val_eps.add(e)
-        n += len(episodes[e])
-
-    def ep_labels(e: int) -> set[str]:
-        return {metas[i].label for i in episodes[e]}
-
-    def ensure_labels(split_name: str, target_eps: set[int], other_eps: set[int]) -> None:
-        label_union = set().union(*(ep_labels(e) for e in target_eps)) if target_eps else set()
-        for cat in required:
-            if cat in label_union:
-                continue
-            for e in order:
-                if e not in target_eps and e not in other_eps and cat in ep_labels(e):
-                    target_eps.add(e)
-                    label_union |= ep_labels(e)
-                    break
-            else:
-                log.warning(
-                    "class %r not present in %s — metric may be empty for that class",
-                    cat, split_name,
-                )
-
-    if val_frac > 0:
-        ensure_labels("val", val_eps, test_eps)
-    if test_frac > 0:
-        ensure_labels("test", test_eps, val_eps)
-
-    train_idx, val_idx, test_idx = [], [], []
-    for e in range(len(episodes)):
-        if e in val_eps:
-            val_idx.extend(episodes[e])
-        elif e in test_eps:
-            test_idx.extend(episodes[e])
-        else:
-            train_idx.extend(episodes[e])
-    return train_idx, val_idx, test_idx
-
-
-def check_split_leakage(episodes: list[list[int]],
-                        train_idx: list[int], val_idx: list[int],
-                        test_idx: list[int]) -> None:
-    """Fail loudly if the train/val/test split leaks.
-
-    Two independent guarantees: (1) the three index sets are pairwise disjoint —
-    no crop is in two splits; (2) every episode (a whole visit's worth of
-    near-duplicate neighbours) lands entirely in ONE split, so adjacent frames
-    of the same visit can't straddle the boundary. Raises AssertionError on any
-    violation; cheap enough to run unconditionally after every split."""
-    train_s, val_s, test_s = set(train_idx), set(val_idx), set(test_idx)
-    assert not (train_s & val_s), f"train∩val leak: {sorted(train_s & val_s)[:5]}"
-    assert not (train_s & test_s), f"train∩test leak: {sorted(train_s & test_s)[:5]}"
-    assert not (val_s & test_s), f"val∩test leak: {sorted(val_s & test_s)[:5]}"
-    owner: dict[int, str] = {}
-    for name, s in (("train", train_s), ("val", val_s), ("test", test_s)):
-        for idx in s:
-            owner[idx] = name
-    for ep_n, episode in enumerate(episodes):
-        homes = {owner[i] for i in episode if i in owner}
-        assert len(homes) <= 1, (
-            f"episode {ep_n} leaks across splits {sorted(homes)} "
-            f"(crops {episode[:5]})"
-        )
-
-
-def summarize_split(episodes: list[list[int]],
-                    train_idx, val_idx, test_idx,
-                    metas: list,
-                    *, identities=None) -> dict:
-    """Compute leakage/distribution facts for the train/val/test split.
-
-    ``identities[i]`` (optional) is a hashable per-crop image identity (e.g. the
-    detector event rowid) used for the path/image-overlap check; falls back to
-    the crop index itself, which still detects index reuse.
-    """
-    splits = {"train": list(train_idx), "val": list(val_idx), "test": list(test_idx)}
-    idx_to_split: dict[int, str] = {}
-    for name, idxs in splits.items():
-        for i in idxs:
-            idx_to_split[i] = name
-    if identities is None:
-        identities = list(range(len(metas)))
-
-    group_counts = {name: set() for name in splits}
-    group_overlap: list[tuple[int, list[str]]] = []
-    for ep_n, ep in enumerate(episodes):
-        homes = {idx_to_split[i] for i in ep if i in idx_to_split}
-        for h in homes:
-            group_counts[h].add(ep_n)
-        if len(homes) > 1:
-            group_overlap.append((ep_n, sorted(homes)))
-
-    class_dist = {}
-    for name, idxs in splits.items():
-        d: dict[str, int] = defaultdict(int)
-        for i in idxs:
-            d[metas[i].label] += 1
-        class_dist[name] = dict(sorted(d.items()))
-
-    id_by_split = {name: {identities[i] for i in idxs} for name, idxs in splits.items()}
-    path_overlap = 0
-    path_examples: list[tuple[str, str, object]] = []
-    for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
-        inter = id_by_split[a] & id_by_split[b]
-        path_overlap += len(inter)
-        for x in list(inter)[:3]:
-            path_examples.append((a, b, x))
-
-    return {
-        "sample_counts": {n: len(s) for n, s in splits.items()},
-        "group_counts": {n: len(s) for n, s in group_counts.items()},
-        "class_dist": class_dist,
-        "group_overlap_count": len(group_overlap),
-        "group_overlap_examples": group_overlap[:5],
-        "path_overlap_count": path_overlap,
-        "path_overlap_examples": path_examples,
-    }
-
-
-def print_split_report(summary: dict, *, episode_gap_sec: float) -> None:
-    """Loud, explicit leakage report (acceptance: zero group/path overlap)."""
-    print("\n=== train/val/test split report ===")
-    print("split method: episode-grouped (whole visit → one split, never per-crop)")
-    print(f"group key:    camera_id + consecutive wall_ms gap <= {episode_gap_sec:g}s")
-    sc, gc = summary["sample_counts"], summary["group_counts"]
-    for name in ("train", "val", "test"):
-        print(f"  {name:<5} samples={sc[name]:<6} groups={gc[name]:<5} "
-              f"classes={summary['class_dist'][name]}")
-    print(f"group overlap (episodes spanning splits): {summary['group_overlap_count']}")
-    if summary["group_overlap_examples"]:
-        print(f"  examples: {summary['group_overlap_examples']}")
-    print(f"path/image overlap (same crop in two splits): {summary['path_overlap_count']}")
-    if summary["path_overlap_examples"]:
-        print(f"  examples: {summary['path_overlap_examples']}")
-    if summary["group_overlap_count"] or summary["path_overlap_count"]:
-        raise SystemExit(
-            "LEAKAGE DETECTED: train/val/test share groups or crops — refusing to "
-            "train on a contaminated split (see report above)."
-        )
-    print("leakage check: OK (0 group overlap, 0 path overlap)\n")
-
-
-def _evenly_spaced(indices: list[int], quota: int) -> list[int]:
-    if quota <= 0:
-        return []
-    if len(indices) <= quota:
-        return list(indices)
-    if quota == 1:
-        return [indices[0]]
-    out = []
-    step = (len(indices) - 1) / float(quota - 1)
-    for n in range(quota):
-        out.append(indices[round(n * step)])
-    return list(dict.fromkeys(out))
-
-
-def sample_indices_for_training(
-    indices: list[int],
-    episodes: list[list[int]],
-    metas: list[Meta],
-    *,
-    max_per_episode: int = 0,
-    max_per_duplicate_group: int = 0,
-    keep_suspicious_per_episode: int = 4,
-) -> list[int]:
-    """Deterministically thin near-duplicate training examples within episodes.
-
-    The split unit stays the episode/visit. This function only decides which
-    crops inside already-assigned episodes are useful enough to decode/train on,
-    so adjacent frames cannot leak across train/val/test.
-    """
-    allowed = set(indices)
-    if not allowed:
-        return []
-    if max_per_episode <= 0 and max_per_duplicate_group <= 0:
-        return list(indices)
-
-    selected: set[int] = set()
-    for episode in episodes:
-        ep = [i for i in episode if i in allowed]
-        if not ep:
-            continue
-        ep.sort(key=lambda i: (metas[i].wall_ms, metas[i].rowid or -1, i))
-
-        keep: set[int] = set()
-        # First/last preserve visit boundaries; suspicious keeps hard examples.
-        keep.add(ep[0])
-        keep.add(ep[-1])
-        suspicious = sorted(
-            ep,
-            key=lambda i: (-float(metas[i].suspicious_score), metas[i].wall_ms, i),
-        )
-        for i in suspicious[:max(0, keep_suspicious_per_episode)]:
-            if metas[i].suspicious_score > 0:
-                keep.add(i)
-
-        by_group: dict[str, list[int]] = defaultdict(list)
-        for i in ep:
-            gid = metas[i].duplicate_group_id or f"event:{i}"
-            by_group[gid].append(i)
-        if max_per_duplicate_group > 0:
-            for group in by_group.values():
-                keep.update(_evenly_spaced(group, max_per_duplicate_group))
-        else:
-            keep.update(ep)
-
-        if max_per_episode > 0 and len(keep) < min(len(ep), max_per_episode):
-            remaining = [i for i in ep if i not in keep]
-            keep.update(_evenly_spaced(remaining, max_per_episode - len(keep)))
-
-        if max_per_episode > 0 and len(keep) > max_per_episode:
-            keep_order = sorted(
-                keep,
-                key=lambda i: (
-                    i not in {ep[0], ep[-1]},
-                    -float(metas[i].suspicious_score),
-                    metas[i].wall_ms,
-                    i,
-                ),
-            )
-            keep = set(keep_order[:max_per_episode])
-        selected.update(keep)
-
-    return [i for i in indices if i in selected]
-
-
-# ----------------------------------------------------------------- metrics ----
-
-def confusion(y_true: list[int], y_pred: list[int], n: int) -> np.ndarray:
-    m = np.zeros((n, n), dtype=np.int64)
-    for t, p in zip(y_true, y_pred):
-        m[t, p] += 1
-    return m
-
-
-def per_class_pr(cm: np.ndarray):
-    """Return (precision[], recall[]) per class from a confusion matrix."""
-    tp = np.diag(cm).astype(np.float64)
-    recall = np.divide(tp, cm.sum(axis=1), out=np.zeros_like(tp), where=cm.sum(axis=1) > 0)
-    precision = np.divide(tp, cm.sum(axis=0), out=np.zeros_like(tp), where=cm.sum(axis=0) > 0)
-    return precision, recall
-
-
-def per_class_f1(precision: np.ndarray, recall: np.ndarray) -> np.ndarray:
-    denom = precision + recall
-    return np.divide(2 * precision * recall, denom,
-                     out=np.zeros_like(precision), where=denom > 0)
-
-
-def present_class_mask(cm: np.ndarray) -> np.ndarray:
-    """Classes with at least one true sample in this eval split."""
-    return cm.sum(axis=1) > 0
-
-
-def supported_macro_recall(cm: np.ndarray) -> float:
-    """Macro recall over classes that are actually present in this eval split."""
-    _prec, rec = per_class_pr(cm)
-    present = present_class_mask(cm)
-    if not bool(present.any()):
-        return 0.0
-    return float(rec[present].mean())
-
-
-@dataclass(frozen=True)
-class DangerousConfusion:
-    """A user-configured confusion that matters (e.g. a feeder safety risk).
-    `predicted` mistaken for the model's output, `actual` the true label."""
-    predicted: str
-    actual: str
-    reason: str = ""
-
-
-def load_dangerous_confusions(path: Path) -> list[DangerousConfusion]:
-    """Load dangerous confusion pairs from a YAML or JSON file. Accepts either a
-    top-level list or a mapping with a ``dangerous_confusions`` key:
-
-        dangerous_confusions:
-          - predicted: cat_a
-            actual: cat_b
-            reason: "cat_a feeder must not open for cat_b"
-    """
-    import yaml  # available in the training env; parses JSON too
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    if isinstance(data, dict):
-        data = data.get("dangerous_confusions", [])
-    out: list[DangerousConfusion] = []
-    for item in data or []:
-        out.append(DangerousConfusion(
-            predicted=str(item["predicted"]),
-            actual=str(item["actual"]),
-            reason=str(item.get("reason", "")),
-        ))
-    return out
-
-
-def dangerous_from_confuse(confuse) -> list[DangerousConfusion]:
-    """Back-compat: treat a `--confuse a,b` pair as dangerous in BOTH directions."""
-    cs = sorted(c for c in confuse if c)
-    if len(cs) != 2:
-        return []
-    a, b = cs
-    return [DangerousConfusion(a, b, "configured via --confuse"),
-            DangerousConfusion(b, a, "configured via --confuse")]
-
-
-def dangerous_confusion_report(cm: np.ndarray, classes: list[str],
-                               dangerous) -> tuple[int, list[dict]]:
-    """Count, per configured dangerous pair, how many true-`actual` crops were
-    predicted `predicted`. Returns (total_errors, per-pair details)."""
-    idx = {c: i for i, c in enumerate(classes)}
-    total = 0
-    details: list[dict] = []
-    for dc in dangerous:
-        if dc.predicted not in idx or dc.actual not in idx:
-            continue
-        a, p = idx[dc.actual], idx[dc.predicted]
-        count = int(cm[a, p])
-        support = int(cm[a].sum())
-        total += count
-        details.append({
-            "predicted": dc.predicted, "actual": dc.actual,
-            "count": count, "support": support,
-            "rate": (count / support) if support else 0.0,
-            "reason": dc.reason,
-        })
-    return total, details
-
-
-def print_report(cm: np.ndarray, classes: list[str], confuse: set[str] = frozenset(),
-                 *, dangerous=()) -> dict:
-    prec, rec = per_class_pr(cm)
-    f1 = per_class_f1(prec, rec)
-    support = cm.sum(axis=1)
-    present = present_class_mask(cm)
-    macro_recall = supported_macro_recall(cm)
-    macro_f1 = float(f1[present].mean()) if bool(present.any()) else 0.0
-    overall = float(np.diag(cm).sum() / max(1, cm.sum()))
-
-    width = max((len(c) for c in classes), default=1) + 1
-    # Dynamic N×N confusion matrix — built from the class list, never a fixed size.
-    print("\nconfusion matrix (rows=true, cols=pred):")
-    print(" " * width + "".join(f"{c[:7]:>8}" for c in classes))
-    for i, c in enumerate(classes):
-        print(f"{c:<{width}}" + "".join(f"{cm[i, j]:>8d}" for j in range(len(classes))))
-
-    print("\nper-class precision / recall / F1:")
-    for i, c in enumerate(classes):
-        flag = "  <-- confuse" if c in confuse else ""
-        if support[i] == 0:
-            print(f"  {c:<{width}} precision=NA     recall=NA     F1=NA     support=0{flag}")
-        else:
-            print(
-                f"  {c:<{width}} precision={prec[i]:.3f}  recall={rec[i]:.3f}  "
-                f"F1={f1[i]:.3f}  support={int(support[i])}{flag}"
-            )
-    print(
-        f"\noverall accuracy = {overall:.3f}   "
-        f"macro recall = {macro_recall:.3f}   macro F1 = {macro_f1:.3f} "
-        f"(present classes only)"
-    )
-
-    dangerous_total, dangerous_details = dangerous_confusion_report(cm, classes, dangerous)
-    if dangerous_details:
-        print("\ndangerous confusions (true → predicted):")
-        for d in dangerous_details:
-            tail = f"  — {d['reason']}" if d["reason"] else ""
-            print(f"  {d['actual']} → {d['predicted']}: {d['count']}/{d['support']} "
-                  f"({d['rate'] * 100:.1f}%){tail}")
-        print(f"  total dangerous errors = {dangerous_total}")
-
-    return {
-        "classes": classes,
-        "present_classes": [classes[i] for i, ok in enumerate(present) if ok],
-        "missing_eval_classes": [classes[i] for i, ok in enumerate(present) if not ok],
-        "precision": {c: float(prec[i]) for i, c in enumerate(classes)},
-        "recall": {c: float(rec[i]) for i, c in enumerate(classes)},
-        "f1": {c: float(f1[i]) for i, c in enumerate(classes)},
-        "support": {c: int(support[i]) for i, c in enumerate(classes)},
-        "macro_recall": macro_recall,
-        "macro_f1": macro_f1,
-        "overall_accuracy": overall,
-        "confusion_matrix": cm.tolist(),
-        "dangerous_confusions": dangerous_details,
-        "dangerous_errors": dangerous_total,
-    }
-
-
-def per_camera_confusion(y_true, y_pred, classes, cameras) -> dict:
-    """Per-camera confusion + accuracy, when camera metadata is available."""
-    if not cameras:
-        return {}
-    by_cam: dict[str, tuple[list, list]] = defaultdict(lambda: ([], []))
-    for t, p, cam in zip(y_true, y_pred, cameras):
-        by_cam[cam][0].append(t)
-        by_cam[cam][1].append(p)
-    out = {}
-    print("\nper-camera accuracy:")
-    for cam in sorted(by_cam, key=str):
-        yt, yp = by_cam[cam]
-        cmc = confusion(yt, yp, len(classes))
-        acc = float(np.diag(cmc).sum() / max(1, cmc.sum()))
-        print(f"  camera {cam}: n={len(yt)} accuracy={acc:.3f}")
-        out[str(cam)] = {"n": len(yt), "accuracy": acc, "confusion_matrix": cmc.tolist()}
-    return out
-
-
-def per_group_accuracy(y_true, y_pred, groups, *, worst: int = 5) -> dict:
-    """Per-group/episode accuracy summary, when group metadata is available.
-    Prints the mean and the worst few groups rather than every group."""
-    if not groups:
-        return {}
-    tally: dict[object, list[int]] = defaultdict(lambda: [0, 0])  # group -> [correct, total]
-    for t, p, g in zip(y_true, y_pred, groups):
-        if g is None:
-            continue
-        tally[g][1] += 1
-        if t == p:
-            tally[g][0] += 1
-    accs = [(g, c / n, n) for g, (c, n) in tally.items() if n > 0]
-    if not accs:
-        return {}
-    mean = sum(a for _, a, _ in accs) / len(accs)
-    accs.sort(key=lambda x: (x[1], -x[2]))  # worst accuracy first
-    print(f"\nper-group/episode accuracy: groups={len(accs)} mean={mean:.3f}")
-    for g, a, n in accs[:worst]:
-        print(f"  worst group {g}: accuracy={a:.3f} (n={n})")
-    return {
-        "n_groups": len(accs),
-        "mean_group_accuracy": mean,
-        "worst": [{"group": g, "accuracy": a, "n": n} for g, a, n in accs[:worst]],
-    }
-
-
-# --- experiment artifacts (everything sized/keyed from the class list) --------
-
-def labels_payload(classes: list[str]) -> dict:
-    """Run-level label metadata — class list, count, and both index mappings."""
-    return {
-        "classes": list(classes),
-        "num_classes": len(classes),
-        "label_to_index": {c: i for i, c in enumerate(classes)},
-        "index_to_label": {str(i): c for i, c in enumerate(classes)},
-    }
-
-
-def write_labels_json(path: Path, classes: list[str]) -> None:
-    Path(path).write_text(json.dumps(labels_payload(classes), indent=2), encoding="utf-8")
-
-
-def write_confusion_csv(path: Path, cm, classes: list[str]) -> None:
-    """Dynamic N×N confusion matrix as a labelled CSV (rows=true, cols=pred)."""
-    import csv
-    cm = np.asarray(cm)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([r"true\pred", *classes])
-        for i, c in enumerate(classes):
-            w.writerow([c, *(int(cm[i, j]) for j in range(len(classes)))])
-
-
-def write_confusion_png(path: Path, cm, classes: list[str], *, title: str = "confusion matrix") -> None:
-    """Confusion-matrix heatmap; figure size scales with the number of classes."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    cm = np.asarray(cm)
-    n = len(classes)
-    side = max(4.0, 0.6 * n + 2.0)
-    fig, ax = plt.subplots(figsize=(side, side))
-    im = ax.imshow(cm, cmap="Blues")
-    ax.set_xticks(range(n)); ax.set_xticklabels(classes, rotation=45, ha="right")
-    ax.set_yticks(range(n)); ax.set_yticklabels(classes)
-    ax.set_xlabel("predicted"); ax.set_ylabel("true"); ax.set_title(title)
-    thresh = (cm.max() / 2) if cm.size else 0
-    for i in range(n):
-        for j in range(n):
-            ax.text(j, i, int(cm[i, j]), ha="center", va="center", fontsize=8,
-                    color="white" if cm[i, j] > thresh else "black")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
-def shrink_bgr_for_batch(img: np.ndarray, max_side: int) -> np.ndarray:
-    """Cap a decoded crop before turning the current batch into tensors.
-
-    Runtime preprocessing ultimately resizes classifier crops to 224px input.
-    Keeping very large raw crops inside a batch only burns memory; a 384-512px
-    cap preserves useful detail while making CPU training much harder to OOM.
-    """
-    if max_side <= 0:
-        return img
-    h, w = img.shape[:2]
-    longest = max(h, w)
-    if longest <= max_side:
-        return img
-    scale = max_side / float(longest)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    import cv2
-
-    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-
-def index_batches(indices: list[int], batch_size: int, *,
-                  rng: random.Random | None = None) -> Iterator[list[int]]:
-    order = list(indices)
-    if rng is not None:
-        rng.shuffle(order)
-    for start in range(0, len(order), max(1, batch_size)):
-        yield order[start:start + max(1, batch_size)]
-
-
-def mean_from_batch_means(pairs: list[tuple[float, int]]) -> float:
-    """Combine per-batch mean losses into a single dataset mean:
-    ``sum(mean_b * size_b) / sum(size_b)``.
-
-    With an UNWEIGHTED criterion (mean = (1/N)·ΣL) this equals the plain
-    per-sample mean and is therefore independent of how samples are grouped into
-    batches — so the logged train/val loss curves are comparable regardless of
-    shuffling/episode ordering. (A weighted criterion's per-batch mean normalises
-    by Σweight, so the same accumulation would NOT be grouping-invariant — which
-    is exactly the asymmetry this logging path avoids.)
-    """
-    total = sum(n for _, n in pairs)
-    return sum(m * n for m, n in pairs) / max(1, total)
-
-
-def load_checkpoint_remapped(model, checkpoint: dict, classes: list[str]) -> dict:
-    """Load a previous classifier, remapping the head by class name.
-
-    Weekly fine-tunes can add or temporarily miss classes. The backbone is still
-    valuable, and classifier rows for overlapping class names should be reused.
-    New class rows keep the freshly initialised weights.
-    """
-    state = checkpoint["state_dict"]
-    checkpoint_classes = list(checkpoint.get("class_names", []))
-    current = model.state_dict()
-
-    loaded_body = 0
-    skipped = []
-    head_keys = {"classifier.1.weight", "classifier.1.bias"}
-    for key, value in state.items():
-        if key in head_keys:
-            continue
-        if key in current and tuple(current[key].shape) == tuple(value.shape):
-            current[key] = value
-            loaded_body += 1
-        else:
-            skipped.append(key)
-
-    overlap: list[str] = []
-    if checkpoint_classes:
-        old_index = {c: i for i, c in enumerate(checkpoint_classes)}
-        weight_key = "classifier.1.weight"
-        bias_key = "classifier.1.bias"
-        if weight_key in state and bias_key in state:
-            for new_i, cat in enumerate(classes):
-                old_i = old_index.get(cat)
-                if old_i is None or old_i >= state[weight_key].shape[0]:
-                    continue
-                current[weight_key][new_i].copy_(state[weight_key][old_i])
-                current[bias_key][new_i].copy_(state[bias_key][old_i])
-                overlap.append(cat)
-
-    model.load_state_dict(current)
-    return {
-        "checkpoint_classes": checkpoint_classes,
-        "overlap_classes": overlap,
-        "new_classes": [c for c in classes if c not in overlap],
-        "dropped_checkpoint_classes": [c for c in checkpoint_classes if c not in classes],
-        "loaded_body_tensors": loaded_body,
-        "skipped_tensors": skipped,
-    }
-
-
-def configure_finetune(model, *, head_only: bool, full_finetune: bool):
-    """Set ``requires_grad`` for the chosen fine-tune mode and return
-    ``(trainable_params, mode, n_trainable, n_frozen)``.
-
-    Modes (mutually exclusive):
-      - ``head``     — ONLY the classifier head trains (CPU-friendly; the backbone
-                       is a frozen feature extractor). ``--head-only``.
-      - ``partial``  — head + the last two feature blocks (the default).
-      - ``full``     — the whole backbone (low LR). ``--full-finetune``.
-
-    The optimizer must be built from the returned ``trainable_params`` so frozen
-    tensors never get gradients/updates.
-    """
-    if head_only and full_finetune:
-        raise ValueError("--head-only and --full-finetune are mutually exclusive")
-
-    if full_finetune:
-        for p in model.parameters():
-            p.requires_grad = True
-        mode = "full"
-    else:
-        # Both head-only and partial start from a fully frozen backbone.
-        for p in model.parameters():
-            p.requires_grad = False
-        for p in model.classifier.parameters():
-            p.requires_grad = True
-        if head_only:
-            mode = "head"
-        else:
-            for blk in (model.features[-1], model.features[-2]):
-                for p in blk.parameters():
-                    p.requires_grad = True
-            mode = "partial"
-
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    n_trainable = int(sum(p.numel() for p in trainable))
-    n_frozen = int(sum(p.numel() for p in model.parameters() if not p.requires_grad))
-    return trainable, mode, n_trainable, n_frozen
-
-
-# ------------------------------------------------------------------- main -----
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -1480,8 +799,9 @@ def main() -> None:
         macro = supported_macro_recall(cm)
         cross = dangerous_confusion_report(cm, classes, dangerous)[0]
         train_loss = running / max(1, seen)
-        log.info("epoch %02d  train_loss=%.4f  val_loss=%.4f  val_macro_recall=%.3f  "
-                 "dangerous_errors=%d", epoch, train_loss, val_loss, macro, cross)
+        log.info("%s", format_epoch_line(
+            epoch, train_loss, val_loss, macro, cross,
+            dangerous_configured=bool(dangerous)))
         run.log_metrics({
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -1529,6 +849,58 @@ def main() -> None:
     else:
         test_metrics = None
 
+    # --- open-set prototypes: mean embedding per class over TRAIN crops ---
+    # EfficientNet's pre-classifier 1280-d embedding (features → avgpool →
+    # flatten) centroid per class. Shipped alongside the model so the runtime can
+    # reject crops that are far from every known cat (open-set) instead of always
+    # forcing a closed-set softmax label. Fail-closed: computed here from the SAME
+    # deterministic eval transform the runtime uses, never from augmented crops.
+    def embed_indices(indices: list[int]):
+        embs: list[np.ndarray] = []
+        labels: list[int] = []
+        with torch.no_grad():
+            for batch_indices in index_batches(indices, args.batch_size):
+                batch = make_batch(batch_indices, eval_tf)
+                if batch is None:
+                    continue
+                x, y, _ = batch
+                feat = torch.flatten(model.avgpool(model.features(x)), 1)
+                embs.append(feat.cpu().numpy())
+                labels.extend(y.tolist())
+        if not embs:
+            return np.zeros((0, 0), dtype=np.float32), []
+        return np.concatenate(embs, axis=0).astype(np.float32), labels
+
+    train_emb, train_emb_labels = embed_indices(train_idx)
+    prototypes: dict[str, list[float]] = {}
+    proto_dist_stats: dict[str, dict] = {}
+    embedding_dim = int(train_emb.shape[1]) if train_emb.size else 0
+    if train_emb.size:
+        proto_matrix = prototypes_from_embeddings(train_emb, train_emb_labels, len(classes))
+        prototypes = {
+            classes[c]: proto_matrix[c].tolist()
+            for c in range(len(classes))
+            if float(np.linalg.norm(proto_matrix[c])) > 0
+        }
+        proto_dist_stats = prototype_distance_stats(
+            train_emb, train_emb_labels, proto_matrix, classes)
+        if proto_dist_stats:
+            suggested = max(s["p95"] for s in proto_dist_stats.values())
+            log.info(
+                "open-set prototypes: %d/%d classes, embedding_dim=%d; "
+                "train cosine-distance to own prototype per class: %s",
+                len(prototypes), len(classes), embedding_dim,
+                {c: round(s["p95"], 3) for c, s in proto_dist_stats.items()},
+            )
+            log.info(
+                "suggested runtime ceiling: DETECTOR_MAX_PROTOTYPE_DISTANCE≈%.2f "
+                "(worst-class p95; raise to accept more, lower to reject more)",
+                suggested,
+            )
+    else:
+        log.warning("could not decode any train crops for prototypes; the open-set "
+                    "distance gate will be unavailable for this model")
+
     # --- save to a NEW path; export_classifier-compatible .pt ---
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = args.out_root / stamp
@@ -1536,7 +908,9 @@ def main() -> None:
     pt_path = out_dir / "cat_classifier.pt"
     torch.save({"state_dict": model.state_dict(),
                 "class_names": classes,
-                "num_classes": len(classes)}, pt_path)
+                "num_classes": len(classes),
+                "prototypes": prototypes,
+                "embedding_dim": embedding_dim}, pt_path)
     meta = {
         "created": stamp,
         "class_names": classes,
@@ -1564,6 +938,18 @@ def main() -> None:
         "finetune_mode": finetune_mode, "best_epoch": best["epoch"],
         "val_metrics": metrics, "test_metrics": test_metrics,
         "counts_train": dict(zip(classes, counts.astype(int).tolist())),
+        "open_set": {
+            "prototype_classes": sorted(prototypes),
+            "embedding_dim": embedding_dim,
+            "train_distance_stats": proto_dist_stats,
+            "suggested_max_prototype_distance": (
+                round(max(s["p95"] for s in proto_dist_stats.values()), 3)
+                if proto_dist_stats else None
+            ),
+            "note": ("per-class mean embedding over TRAIN crops; ship as "
+                     "prototypes.json and set DETECTOR_MAX_PROTOTYPE_DISTANCE at "
+                     "runtime to reject crops far from every known cat"),
+        },
     }
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"\nsaved best model -> {pt_path}")
