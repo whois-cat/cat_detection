@@ -34,7 +34,7 @@ Usage sketch (per-cat classifier):
 
     src = CropSource(db_path="data/events/events.db",
                      recordings_root="data/recordings",
-                     model="yolov8n", min_score=0.3, pad_frac=0.15)
+                     model="yolo26n", min_score=0.3, pad_frac=0.15)
 
     tfm = transforms.Compose([
         transforms.ToPILImage(),                    # BGR ndarray → PIL

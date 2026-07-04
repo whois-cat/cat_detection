@@ -149,7 +149,7 @@ class YoloDetector(Detector):
     # COCO class IDs we keep. 15=cat, 16=dog (in case the user wants either).
     KEEP_CLS_IDS = (15,)
 
-    def __init__(self, weights: str = "/opt/models/yolov8n_int8_openvino_model/", conf: float = 0.25):
+    def __init__(self, weights: str = "/opt/models/yolo26n_int8_openvino_model/", conf: float = 0.25):
         from ultralytics import YOLO
         # `task='detect'` silences "Unable to guess model task" for OpenVINO dirs
         # (which carry no task metadata in their YAML).
@@ -198,7 +198,7 @@ class YoloCatDetector(Detector):
 
     def __init__(
         self,
-        weights: str = "/opt/models/yolov8n_int8_openvino_model/",
+        weights: str = "/opt/models/yolo26n_int8_openvino_model/",
         conf: float = 0.25,
         classifier_dir: str = "/opt/models/classifier/current",
         min_conf: float = 0.5,
@@ -279,12 +279,12 @@ def build_detector(detector_type: str) -> Detector:
         )
     if detector_type == "yolo":
         return YoloDetector(
-            weights=os.environ.get("YOLO_WEIGHTS", "yolov8n.pt"),
+            weights=os.environ.get("YOLO_WEIGHTS", "yolo26n.pt"),
             conf=float(os.environ.get("YOLO_CONF", "0.25")),
         )
     if detector_type == "yolo_cat":
         return YoloCatDetector(
-            weights=os.environ.get("YOLO_WEIGHTS", "/opt/models/yolov8n_int8_openvino_model/"),
+            weights=os.environ.get("YOLO_WEIGHTS", "/opt/models/yolo26n_int8_openvino_model/"),
             conf=float(os.environ.get("YOLO_CONF", "0.25")),
             classifier_dir=os.environ.get(
                 "CLASSIFIER_WEIGHTS", "/opt/models/classifier/current"

@@ -17,14 +17,14 @@ fine-tuned per-cat labels you'd pass --classes cat_a,cat_b,cat_c.
 
 Train a fine-tuned YOLO on it:
 
-    yolo train data=out_dir/data.yaml model=yolov8n.pt imgsz=640 epochs=50
+    yolo train data=out_dir/data.yaml model=yolo26n.pt imgsz=640 epochs=50
 
 Usage (from live2/):
 
     uv run python -m training.extract_detector \
         --recordings data/recordings --db data/events/events.db \
         --out data/datasets/detector --val-frac 0.1 \
-        --camera default --model yolov8n
+        --camera default --model yolo26n
 """
 from __future__ import annotations
 
@@ -139,7 +139,7 @@ def main():
     ]
     (args.out / "data.yaml").write_text("\n".join(yaml) + "\n")
     log.info("done. train=%d val=%d  classes=%s", n_train, n_val, class_names)
-    log.info("train: yolo train data=%s model=yolov8n.pt imgsz=640 epochs=50",
+    log.info("train: yolo train data=%s model=yolo26n.pt imgsz=640 epochs=50",
              args.out / "data.yaml")
 
 

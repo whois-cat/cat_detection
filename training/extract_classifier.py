@@ -24,7 +24,7 @@ Usage (from the live2/ directory):
     uv run python -m training.extract_classifier \
         --recordings data/recordings --db data/events/events.db \
         --out data/datasets/classifier --val-frac 0.1 --test-frac 0.1 \
-        --camera default --model yolov8n --min-score 0.7
+        --camera default --model yolo26n --min-score 0.7
 
 By default, only human-reviewed identity labels are exported. Unreviewed crops
 are ignored unless --trust-classifier is explicitly set.

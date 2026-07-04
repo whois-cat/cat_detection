@@ -137,7 +137,7 @@ def test_iter_crop_refs_enumerates_without_decoding(tmp_path):
     conn = init_db(db)
     for i in range(6):
         insert_event(
-            conn, camera_id="grey", model="yolov8n", wall_ms=1000 + i,
+            conn, camera_id="grey", model="yolo26n", wall_ms=1000 + i,
             pts=None, tb_num=None, tb_den=None, media_t=None,
             frame_w=320, frame_h=240, rotate_deg=0,
             cat="alisa" if i % 2 == 0 else "chuzh", cat_score=0.9,

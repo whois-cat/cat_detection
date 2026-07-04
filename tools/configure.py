@@ -359,7 +359,7 @@ def render_compose(cfg: dict) -> str:
             "DETECTOR_TARGET_FPS": cam.get("detector_target_fps", 2.0),
             "BLOB_BRIGHT_THRESHOLD": cam.get("blob_bright_threshold", 240),
             "BLOB_MIN_AREA":       cam.get("blob_min_area", 500),
-            "YOLO_WEIGHTS":        cam.get("yolo_weights", "/opt/models/yolov8n_int8_openvino_model/"),
+            "YOLO_WEIGHTS":        cam.get("yolo_weights", "/opt/models/yolo26n_int8_openvino_model/"),
             "YOLO_CONF":           cam.get("yolo_conf", 0.25),
             # Runtime classifier model comes from the shared read-only volume
             # (mounted below), not a baked image artifact. The `current` symlink

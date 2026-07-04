@@ -73,7 +73,7 @@ def test_time_mode_manifest_end_to_end(tmp_path, monkeypatch):
 
     def ev(camera, wall_ms):
         insert_event(
-            conn, camera_id=camera, model="yolov8n", wall_ms=wall_ms,
+            conn, camera_id=camera, model="yolo26n", wall_ms=wall_ms,
             pts=None, tb_num=None, tb_den=None, media_t=None,
             frame_w=320, frame_h=240, rotate_deg=0, cat=None, cat_score=None,
             box_x=10, box_y=20, box_w=40, box_h=40, score=0.9,

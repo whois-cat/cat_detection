@@ -24,7 +24,7 @@ classifier = [
     "scikit-learn",
 ]
 yolo = [
-    "ultralytics==8.3.18",
+    "ultralytics==8.4.87",
 ]
 # Optional DINOv2 embedding backend for offline cold-start cluster building
 # (training/build_cluster_manifest.py --embedding dinov2). Not used by live
@@ -35,7 +35,7 @@ label = [
     "Pillow>=10",
 ]
 dev = [
-    "ultralytics==8.3.18",
+    "ultralytics==8.4.87",
 ]
 test = [
     "Pillow>=10",

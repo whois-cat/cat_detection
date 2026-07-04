@@ -37,7 +37,7 @@ class _ClfStub:
 
 
 class _EnabledDet(Detector):
-    model_name = "yolov8n_int8_openvino_model+cat"
+    model_name = "yolo26n_int8_openvino_model+cat"
     backend = "openvino"
     conf = 0.25
 
@@ -78,7 +78,7 @@ def test_status_with_classifier_enabled():
     }
     assert s["detector"] == {
         "enabled": True, "backend": "openvino",
-        "model": "yolov8n_int8_openvino_model+cat", "min_score": 0.25,
+        "model": "yolo26n_int8_openvino_model+cat", "min_score": 0.25,
     }
 
 

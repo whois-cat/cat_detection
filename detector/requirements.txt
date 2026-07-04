@@ -11,7 +11,7 @@ torch==2.5.1+cpu; platform_system == "Linux"
 torchvision==0.20.1+cpu; platform_system == "Linux"
 # YOLO + classifier. Runtime inference uses OpenVINO models, but ultralytics
 # still imports torch for its predictor/result wrappers.
-ultralytics==8.3.18
+ultralytics==8.4.87
 # OpenVINO runtime — INT8 inference for YOLO and EfficientNet classifier.
 openvino==2024.4.0
 nncf==2.13.0

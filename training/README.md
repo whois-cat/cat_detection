@@ -65,7 +65,7 @@ from training import FullFrameSource, CropSource
 
 # One Sample per frame, all boxes attached. For training a detector.
 for sample in FullFrameSource(db_path, recordings_root,
-                              camera_id="default", model="yolov8n"):
+                              camera_id="default", model="yolo26n"):
     img = sample.image            # H×W×3 BGR uint8 (camera orientation)
     for b in sample.boxes:        # all detected cats in this frame
         ...
@@ -238,7 +238,7 @@ review-only events from the recordings with the non-quantized YOLO path:
 
 ```bash
 just train-rescan --conf 0.3 --imgsz 512 --sample-interval-sec 1
-just label-build --model offline-yolov8n --min-score 0.5 --clusters 100
+just label-build --model offline-yolo26n --min-score 0.5 --clusters 100
 ```
 
 `just label-build` writes `data/review/clusters.json` by default. Useful
@@ -600,7 +600,7 @@ uv run python -m training.extract_detector \
     --recordings data/recordings \
     --db data/events/events.db \
     --out data/datasets/detector \
-    --model yolov8n \
+    --model yolo26n \
     --val-frac 0.1
     # add --collapse-to-single-class to train a "cat or not" detector
 ```
@@ -619,7 +619,7 @@ Train:
 ```bash
 uv pip install ultralytics
 yolo train data=data/datasets/detector/data.yaml \
-          model=yolov8n.pt imgsz=640 epochs=50
+          model=yolo26n.pt imgsz=640 epochs=50
 ```
 
 After training, drop the resulting `best.pt` into the detector container

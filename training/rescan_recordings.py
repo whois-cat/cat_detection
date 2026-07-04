@@ -3,7 +3,7 @@
 This is the cold-start escape hatch for a bad live detector pool: instead of
 trusting already-recorded detector events, sample full frames from the mediamtx
 recordings, run COCO cat detection, and write fresh event rows under a separate
-model/source. The review manifest can then use `--model offline-yolov8n`.
+model/source. The review manifest can then use `--model offline-yolo26n`.
 """
 from __future__ import annotations
 
@@ -147,9 +147,9 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=ROOT / "cameras.yaml")
     ap.add_argument("--camera", action="append", default=[],
                     help="camera id to scan; repeatable; default scans all recording dirs")
-    ap.add_argument("--weights", default="/opt/models/yolov8n.pt",
+    ap.add_argument("--weights", default="/opt/models/yolo26n.pt",
                     help="YOLO weights; default matches the non-quantized model from main")
-    ap.add_argument("--model-name", default="offline-yolov8n")
+    ap.add_argument("--model-name", default="offline-yolo26n")
     ap.add_argument("--source", default="offline_rescan")
     ap.add_argument("--conf", type=float, default=0.3)
     ap.add_argument("--imgsz", type=int, default=512)

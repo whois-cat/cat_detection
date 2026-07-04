@@ -102,7 +102,7 @@ def test_time_mode_does_not_build_any_extractor(tmp_path, monkeypatch):
     conn = init_db(db)
     for w in (1_000, 3_000, 5_000):
         insert_event(
-            conn, camera_id="grey", model="yolov8n", wall_ms=w,
+            conn, camera_id="grey", model="yolo26n", wall_ms=w,
             pts=None, tb_num=None, tb_den=None, media_t=None,
             frame_w=320, frame_h=240, rotate_deg=0, cat=None, cat_score=None,
             box_x=10, box_y=20, box_w=40, box_h=40, score=0.9,

@@ -17,7 +17,7 @@ RUN uv pip install --system --no-cache -r requirements.txt
 RUN mkdir -p /opt/models \
  && cd /opt/models \
  && python -c "from ultralytics import YOLO; \
-    m = YOLO('yolov8n.pt'); \
+    m = YOLO('yolo26n.pt'); \
     m.export(format='openvino', int8=True, data='coco128.yaml')"
 
 # ── Classifier ─────────────────────────────────────────────────────────────

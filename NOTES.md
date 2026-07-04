@@ -298,7 +298,7 @@ Wire (WebSocket / `/events`):
   "cat": "cat_a",
   "cat_score": 0.91,
   "camera_id": "default",
-  "model": "yolov8n",
+  "model": "yolo26n",
   "boxes": [{"x": 412, "y": 220, "w": 80, "h": 60,
              "score": 0.83, "in_action": true}]
 }
@@ -333,7 +333,7 @@ On the same WebSocket, identified by `kind`:
 {
   "kind": "stats",
   "camera_id": "default",
-  "model": "yolov8n",
+  "model": "yolo26n",
   "fps_in": 14.92,
   "fps_processed": 5.10,
   "active_tracks": 0,
@@ -367,7 +367,7 @@ here. After editing, run `just configure`.
 | `rtsp` | — | Camera RTSP URL with credentials |
 | `label` | title-cased id | Display name in the UI picker |
 | `detector_type` | `blob` | `blob` or `yolo` |
-| `yolo_weights` | `/opt/models/yolov8n_int8_openvino_model/` | Pre-quantised INT8 by default |
+| `yolo_weights` | `/opt/models/yolo26n_int8_openvino_model/` | Pre-quantised INT8 by default |
 | `yolo_conf` | 0.25 | YOLO confidence threshold |
 | `blob_bright_threshold` | 240 | Blob detector grayscale threshold |
 | `blob_min_area` | 500 | Minimum blob area (px) |
@@ -484,7 +484,7 @@ resolved by later architecture decisions (noted).
     `durationToMs` handles seconds / nanoseconds / `"1h2m3s"` defensively.
 17. **OpenVINO model dir masked by dev bind-mount**: dev compose mounts
     `./detector → /app`; the OpenVINO export originally lived at
-    `/app/yolov8n_int8_openvino_model/` and disappeared at runtime.
+    `/app/yolo26n_int8_openvino_model/` and disappeared at runtime.
     Moved to `/opt/models/` and updated `YOLO_WEIGHTS` default.
 18. **Sideways camera tanked YOLO recall**: CNNs aren't rotation-invariant.
     Added `FRAME_ROTATE_DEG` that rotates only the inference crop and

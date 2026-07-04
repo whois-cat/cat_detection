@@ -6,7 +6,7 @@ from storage import init_db, insert_event, query_events
 
 
 def _insert(conn, wall_ms):
-    insert_event(conn, camera_id="grey", model="yolov8n", wall_ms=wall_ms,
+    insert_event(conn, camera_id="grey", model="yolo26n", wall_ms=wall_ms,
                  pts=None, tb_num=None, tb_den=None, media_t=None,
                  frame_w=320, frame_h=240, rotate_deg=0, cat="alisa", cat_score=0.9,
                  box_x=1, box_y=2, box_w=3, box_h=4, score=0.8)

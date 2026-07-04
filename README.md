@@ -85,7 +85,7 @@ The detector is swappable via `DETECTOR_TYPE`:
   zero-dep, useful for end-to-end testing without a model (shine a
   flashlight at the camera).
 - `yolo` — Ultralytics YOLO. Default weights are a **pre-quantised INT8
-  OpenVINO IR** baked into the image at build time (`yolov8n` for COCO
+  OpenVINO IR** baked into the image at build time (`yolo26n` for COCO
   cat class), running ~3-4× faster than torch CPU. Swap via `YOLO_WEIGHTS`
   to use your own fine-tune.
 

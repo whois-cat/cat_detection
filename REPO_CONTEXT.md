@@ -386,4 +386,4 @@ approved examples can outlive both pruner cleanup and the 30-day hard cap.
 - Last source-code commit before this document: `1a75b2c Add cold-start cluster labeling and replay training`.
 - Last full check after the implementation: `just check` passed with 17 tests.
 - Known local untracked runtime/development artifacts at the time of writing:
-  `configs/`, `reports/`, and `yolov8n.pt`.
+  `configs/`, `reports/`, and `yolo26n.pt`.
