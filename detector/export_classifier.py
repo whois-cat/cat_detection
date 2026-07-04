@@ -253,13 +253,32 @@ def export(pt_path: Path, out_dir: Path, crops_dir: Path | None = None) -> None:
     model.eval()                                      # once, before anything
     print(f"[export] model.training after eval() = {model.training}", flush=True)
 
+    # Export a TWO-output IR: output 0 = logits (unchanged — runtime cat_score and
+    # the parity gate both read output 0), output 1 = the 1280-d pre-classifier
+    # embedding used by the open-set prototype-distance gate (detector/unknown.py).
+    # A single-output IR would give the runtime no embedding, leaving the gate
+    # dormant. The wrapper computes logits exactly as EfficientNet.forward does, so
+    # logits — and therefore parity — are byte-for-byte unchanged.
+    class _ClassifierWithEmbedding(nn.Module):
+        def __init__(self, m: nn.Module) -> None:
+            super().__init__()
+            self.features = m.features
+            self.avgpool = m.avgpool
+            self.classifier = m.classifier
+
+        def forward(self, x):
+            feat = torch.flatten(self.avgpool(self.features(x)), 1)
+            return self.classifier(feat), feat
+
+    export_model = _ClassifierWithEmbedding(model).eval()
+
     # Convert under no_grad (NOT inference_mode): convert_model traces via
     # torch.jit.trace, and tracing under inference_mode raises "inference tensors
     # cannot be saved for backward". no_grad is enough — we never backprop.
     # example_input is shape-only (eval BatchNorm uses running stats, not it).
     example = torch.zeros(1, 3, 224, 224)
     with torch.no_grad():
-        ov_model = ov.convert_model(model, example_input=example)
+        ov_model = ov.convert_model(export_model, example_input=example)
     # If convert flipped the flag, this print localizes it; the parity step
     # re-evals defensively regardless.
     print(f"[export] model.training after convert_model = {model.training}", flush=True)
@@ -271,6 +290,20 @@ def export(pt_path: Path, out_dir: Path, crops_dir: Path | None = None) -> None:
     classes_path = out_dir / "classes.json"
     classes_path.write_text(json.dumps(class_names), encoding="utf-8")
     print(f"[export] classes → {classes_path} : {class_names}", flush=True)
+
+    # Open-set prototypes (optional): mean per-class embedding computed at train
+    # time. Shipped as prototypes.json next to classes.json; the runtime loads it
+    # to reject crops far from every known cat. Absent on older checkpoints — the
+    # runtime then simply falls back to the softmax-only gate (no behavior change).
+    prototypes = checkpoint.get("prototypes")
+    if prototypes:
+        proto_path = out_dir / "prototypes.json"
+        proto_path.write_text(json.dumps(prototypes), encoding="utf-8")
+        print(f"[export] prototypes → {proto_path} : {sorted(prototypes)} "
+              f"(dim={len(next(iter(prototypes.values())))})", flush=True)
+    else:
+        print("[export] no prototypes in checkpoint — open-set distance gate will "
+              "be unavailable (older checkpoint; re-train to enable).", flush=True)
 
     # ---- parity gates (fail the build on any drift) ----
     _check_preprocess_parity(crops_dir)

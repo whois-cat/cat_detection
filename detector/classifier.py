@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
+from unknown import UnknownConfig, decide_identity
+
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -85,6 +87,36 @@ def _load_class_names(classes_path: Path, model_dir: Path) -> list[str]:
     return names
 
 
+def _load_prototypes(proto_path: Path, class_names: list[str]) -> dict | None:
+    """Load optional open-set prototypes.json → {class_name: unit np.ndarray}.
+
+    Missing file → None (the open-set distance gate stays off; behavior is
+    exactly the softmax-only path). A present-but-malformed file is a promotion
+    error, so it raises rather than silently disabling the safety gate. Only
+    prototypes for known class names are kept; each is L2-normalized so cosine
+    distance is stable regardless of how it was stored."""
+    if not proto_path.exists():
+        return None
+    try:
+        raw = json.loads(proto_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise ValueError(f"invalid prototypes.json ({proto_path}): {e}") from e
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"prototypes.json must be a non-empty object ({proto_path})")
+    out: dict[str, np.ndarray] = {}
+    known = set(class_names)
+    for name, vec in raw.items():
+        if name not in known:
+            continue
+        arr = np.asarray(vec, dtype=np.float32)
+        norm = float(np.linalg.norm(arr))
+        if arr.ndim != 1 or norm == 0.0:
+            raise ValueError(
+                f"prototypes.json[{name!r}] must be a non-zero 1-D vector ({proto_path})")
+        out[name] = arr / norm
+    return out or None
+
+
 def resolve_model_version(model_dir: Path) -> str:
     """Concrete version the model resolves to — the target dir name of the
     `current` symlink (e.g. "20260629-001122"), or "?" if unresolvable. Used for
@@ -122,6 +154,9 @@ class CatClassifier:
         _require_runtime_file(bin_, model_dir)
         _require_runtime_file(classes_path, model_dir)
         self.class_names: list[str] = _load_class_names(classes_path, model_dir)
+        # Optional open-set prototypes (mean per-class embedding). None → the
+        # distance gate is unavailable and identity falls back to softmax only.
+        self.prototypes = _load_prototypes(model_dir / "prototypes.json", self.class_names)
 
         # Status attributes (also surfaced by the /status endpoint).
         self.model_dir = str(model_dir)
@@ -162,6 +197,22 @@ class CatClassifier:
         if out_dim is not None:
             _check_output_dim(out_dim, len(self.class_names), model_dir)
 
+        # A 2-output IR (logits + embedding) enables the open-set distance gate.
+        # A legacy 1-output IR has no embedding, so the gate stays off regardless
+        # of prototypes.json — the runtime falls back to softmax-only cleanly.
+        try:
+            self._has_embedding = len(self._compiled.outputs) > 1
+        except Exception:
+            self._has_embedding = False
+        gate = (
+            "on" if (self._has_embedding and self.prototypes) else
+            "off (no embedding output)" if self.prototypes else
+            "off (no prototypes)"
+        )
+        print(f"[classifier] open-set prototype gate: {gate}; "
+              f"prototypes={sorted(self.prototypes) if self.prototypes else None}",
+              flush=True)
+
     def status(self) -> dict:
         """Runtime status fragment for the /status endpoint: enabled flag, active
         model dir + resolved version, class count (not labels), artifact format."""
@@ -171,6 +222,10 @@ class CatClassifier:
             "resolved_version": self.resolved_version,
             "classes_count": len(self.class_names),
             "format": self.format,
+            "has_embedding": bool(getattr(self, "_has_embedding", False)),
+            "prototype_classes": (
+                len(self.prototypes) if getattr(self, "prototypes", None) else 0
+            ),
         }
 
     def _probs(self, crop_rgb: np.ndarray) -> np.ndarray:
@@ -195,6 +250,45 @@ class CatClassifier:
         z = np.asarray(logits, dtype=np.float64)
         e = np.exp(z - z.max(axis=1, keepdims=True))
         return e / e.sum(axis=1, keepdims=True)
+
+    def _probs_emb_batch(
+        self, crops_rgb: list[np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Softmax matrix (N, C) plus the embedding matrix (N, D) in ONE inference.
+
+        Returns ``(probs, embeddings)``; ``embeddings`` is None when the IR has no
+        embedding output (legacy 1-output model), in which case the open-set
+        distance gate cannot run and identity degrades to softmax only. Works with
+        a plain-list compiled stub (tests) as well as an OpenVINO OVDict."""
+        if not crops_rgb:
+            return np.empty((0, len(self.class_names)), dtype=np.float64), None
+        inp = np.concatenate([_preprocess(c) for c in crops_rgb], axis=0)
+        result = self._compiled(inp)
+        z = np.asarray(result[0], dtype=np.float64)  # (N, C) logits
+        e = np.exp(z - z.max(axis=1, keepdims=True))
+        probs = e / e.sum(axis=1, keepdims=True)
+        emb = None
+        try:
+            if len(result) > 1:
+                emb = np.asarray(result[1], dtype=np.float32)  # (N, D)
+        except (TypeError, KeyError, IndexError):
+            emb = None
+        return probs, emb
+
+    def decide(self, crop_rgb: np.ndarray, config: UnknownConfig) -> tuple[str, float]:
+        """Open-set identity decision for one crop: (label_or_UNKNOWN, confidence).
+
+        Combines the softmax floor with cosine distance to the matched class
+        prototype (detector/unknown.py::decide_identity), so a crop that is far
+        from every known cat is rejected as UNKNOWN even when softmax looks
+        confident. Degrades safely: with no prototypes / no embedding / no
+        configured distance ceiling it is exactly the softmax-threshold gate."""
+        probs, emb = self._probs_emb_batch([crop_rgb])
+        embedding = emb[0] if emb is not None else None
+        return decide_identity(
+            probs[0], self.class_names, config,
+            embedding=embedding, prototypes=self.prototypes,
+        )
 
     def classify_batch(self, crops_rgb: list[np.ndarray]) -> list[tuple[str, float]]:
         """Classify many crops at once. Returns [(cat_name, confidence), ...] in

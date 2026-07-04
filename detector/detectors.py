@@ -71,6 +71,13 @@ def identity_crop_box(x1: int, y1: int, x2: int, y2: int,
     return cx0, cy0, cx1, cy1
 
 
+def _optional_float(value: str | None) -> float | None:
+    """Parse an optional float env var: unset/empty → None (feature disabled)."""
+    if value is None or value.strip() == "":
+        return None
+    return float(value)
+
+
 def _weights_backend(weights: str) -> str:
     """Best-effort artifact format for YOLO weights: an OpenVINO IR directory vs
     a torch .pt file. Used only for status reporting (never hardcodes names)."""
@@ -181,7 +188,10 @@ class YoloCatDetector(Detector):
 
     Crops each detected cat from the same frame YOLO saw (img_bgr, inference
     coords) and classifies it. Sets b["cat"] to the classifier name, or
-    "unknown" when confidence < DETECTOR_UNKNOWN_CONF.
+    "unknown" when the softmax confidence is below DETECTOR_UNKNOWN_CONF OR the
+    crop embedding is farther than DETECTOR_MAX_PROTOTYPE_DISTANCE from every
+    known cat prototype (open-set rejection; the distance gate is off unless that
+    env var is set and the model ships prototypes).
     """
 
     KEEP_CLS_IDS = (15,)
@@ -193,9 +203,11 @@ class YoloCatDetector(Detector):
         classifier_dir: str = "/opt/models/classifier/current",
         min_conf: float = 0.5,
         pad_frac: float = 0.15,
+        max_prototype_distance: float | None = None,
     ) -> None:
         import cv2
         from classifier import CatClassifier
+        from unknown import UnknownConfig
         from ultralytics import YOLO
 
         self._cv2 = cv2
@@ -206,6 +218,14 @@ class YoloCatDetector(Detector):
         self.model_name = f"{stem}+cat"
         self._classifier = CatClassifier(classifier_dir)
         self._min_conf = min_conf
+        # Open-set identity gate. min_confidence keeps the existing softmax floor;
+        # max_prototype_distance (None unless DETECTOR_MAX_PROTOTYPE_DISTANCE is
+        # set) additionally rejects crops far from every known-cat prototype. With
+        # it None, decide() is byte-identical to the old softmax-threshold path.
+        self._unknown_cfg = UnknownConfig(
+            min_confidence=min_conf,
+            max_prototype_distance=max_prototype_distance,
+        )
         # Context padding around the box BEFORE classification. MUST match the
         # training crop padding (cluster review / train_classifier --pad-frac)
         # or the classifier sees a
@@ -237,9 +257,10 @@ class YoloCatDetector(Detector):
                     x1, y1, x2, y2, w, h, self._pad_frac)
                 crop_bgr = img_bgr[cy0:cy1, cx0:cx1]
                 crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-                cat_name, cat_score = self._classifier.classify(crop_rgb)
-                if cat_score < self._min_conf:
-                    cat_name = "unknown"
+                # Open-set decision: softmax floor + optional prototype-distance
+                # rejection. Returns "unknown" when uncertain (fail-closed).
+                cat_name, cat_score = self._classifier.decide(
+                    crop_rgb, self._unknown_cfg)
                 out.append({
                     "x": x1, "y": y1,
                     "w": x2 - x1, "h": y2 - y1,
@@ -275,6 +296,13 @@ def build_detector(detector_type: str) -> Detector:
                 )
             ),
             pad_frac=float(os.environ.get("CLASSIFIER_PAD_FRAC", "0.15")),
+            # Optional open-set gate. Unset → None → softmax-only (unchanged
+            # behavior). Set to e.g. 0.35 to reject crops far from every known
+            # cat; the metadata.json "suggested_max_prototype_distance" from
+            # training is a good starting value.
+            max_prototype_distance=_optional_float(
+                os.environ.get("DETECTOR_MAX_PROTOTYPE_DISTANCE")
+            ),
         )
     raise ValueError(
         f"unknown DETECTOR_TYPE: {detector_type!r} "
