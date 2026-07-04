@@ -157,7 +157,7 @@ SCHEDULE_TICK_SEC        = 30.0
 
 
 def _resolve_feed_tz() -> dt.tzinfo:
-    """FEED_TZ as an IANA name (e.g. Europe/Moscow), or the container local tz."""
+    """FEED_TZ as an IANA name (e.g. America/New_York), or the container local tz."""
     name = os.environ.get("FEED_TZ", "").strip()
     if not name:
         local = dt.datetime.now().astimezone().tzinfo

@@ -205,10 +205,10 @@ concurrently with the detector's writes.
 
 | cat     | colour                  |
 |---------|-------------------------|
-| felisis | `#555555` (dark gray)   |
-| alisa   | `#a04935` (brown-red)   |
-| ellie   | `#cccccc` (light gray)  |
-| chuzh   | `#ffffff` (white)       |
+| cat_d | `#555555` (dark gray)   |
+| cat_a   | `#a04935` (brown-red)   |
+| cat_c   | `#cccccc` (light gray)  |
+| cat_b   | `#ffffff` (white)       |
 
 ### Gap overlay
 
@@ -295,7 +295,7 @@ Wire (WebSocket / `/events`):
   "media_t": 0.057,
   "w": 2304, "h": 1296,
   "rotate_deg": 90,
-  "cat": "alisa",
+  "cat": "cat_a",
   "cat_score": 0.91,
   "camera_id": "default",
   "model": "yolov8n",

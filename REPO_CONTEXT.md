@@ -131,7 +131,7 @@ detector confidence to decide whether a crop is likely worth reviewing.
 Example:
 
 ```bash
-export REVIEW_LABELS=alisa,chuzh,ellie,felisis
+export REVIEW_LABELS=cat_a,cat_b,cat_c,cat_d
 export RECORDING_TZ=America/New_York
 
 just label-build detector-grey --default-rotate-deg 90 --min-score 0.7 --clusters 80
@@ -181,8 +181,8 @@ but EfficientNet/visual embeddings are simpler and practical for now.
 
 Bulk labeling means labeling a group at once:
 
-- "this whole cluster is `alisa`";
-- "this whole cluster is `chuzh`";
+- "this whole cluster is `cat_a`";
+- "this whole cluster is `cat_b`";
 - "this whole cluster is junk, discard it";
 - "this cluster is mixed, split it".
 
@@ -200,7 +200,7 @@ Train only from reviewed human labels by default:
 ```bash
 just train-run \
   --default-rotate-deg 90 \
-  --confuse alisa,felisis \
+  --confuse cat_a,cat_d \
   --val-frac 0.2 \
   --test-frac 0.1 \
   --replay-set data/replay
@@ -296,7 +296,7 @@ Useful checks:
 - macro recall;
 - worst-class recall;
 - high-confidence wrong predictions at the feeder threshold;
-- confusion between visually similar cats, especially `alisa` and `felisis`.
+- confusion between visually similar cats, especially `cat_a` and `cat_d`.
 
 The script can produce a verdict, but promotion should still be a human
 decision when the model controls a physical feeder.
@@ -366,8 +366,8 @@ approved examples can outlive both pruner cleanup and the 30-day hard cap.
 
 ## Gotchas
 
-- A crop showing a wall/bowl with `model says alisa 32%` is not evidence of
-  `alisa`; it is usually a detector false positive plus an irrelevant identity
+- A crop showing a wall/bowl with `model says cat_a 32%` is not evidence of
+  `cat_a`; it is usually a detector false positive plus an irrelevant identity
   guess.
 - Cold-start manifests should sort/review by detector quality and clusters, not
   old identity names.

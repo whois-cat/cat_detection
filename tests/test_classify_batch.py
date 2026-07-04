@@ -31,21 +31,21 @@ def _make(classes):
 
 
 def test_classify_batch_preserves_order_and_runs_once():
-    clf = _make(["alisa", "chuzh", "ellie"])
+    clf = _make(["cat_a", "cat_b", "cat_c"])
     crops = [np.zeros((40, 40, 3), np.uint8) for _ in range(5)]
     out = clf.classify_batch(crops)
-    assert [name for name, _ in out] == ["alisa", "chuzh", "ellie", "alisa", "chuzh"]
+    assert [name for name, _ in out] == ["cat_a", "cat_b", "cat_c", "cat_a", "cat_b"]
     assert all(0.0 <= c <= 1.0 for _, c in out)
     assert clf._compiled.calls == 1                  # single batched inference
 
 
 def test_classify_is_batch_wrapper():
-    clf = _make(["alisa", "chuzh"])
+    clf = _make(["cat_a", "cat_b"])
     name, conf = clf.classify(np.zeros((40, 40, 3), np.uint8))
-    assert name == "alisa"
+    assert name == "cat_a"
     assert 0.0 <= conf <= 1.0
 
 
 def test_classify_batch_empty():
-    clf = _make(["alisa", "chuzh"])
+    clf = _make(["cat_a", "cat_b"])
     assert clf.classify_batch([]) == []
