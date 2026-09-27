@@ -11,6 +11,7 @@ Decision rules (evaluated in order):
   identity is None                     → "close",  "no_identity"
   identity not in allowed_cats         → "close",  "not_allowed:<cat>"
   identity confidence < min_confidence → "close",  "low_confidence:<cat>"
+    (skipped for "unknown": it is low-confidence by definition)
   identity margin < min_margin         → "close",  "low_margin:<cat>"  (only when a
     top-2 margin is available; see ZoneSummary.margin TODO — never faked)
   identity blocked by a dangerous      → "close",  "dangerous_confusion:<actual>~<predicted>"
@@ -27,7 +28,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from zone_state import ZoneSummary
+from zone_state import UNKNOWN, ZoneSummary
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,10 @@ def decide(
 
     # Confidence gate (decision-level, configurable). Only applies when a real
     # classifier score is available for the winning identity.
+    # "unknown" (only reachable when explicitly allowed) is unconfident by
+    # definition, so the gate would always block it.
     if (min_confidence > 0
+            and cat != UNKNOWN
             and snap.identity_score is not None
             and snap.identity_score < min_confidence):
         return "close", f"low_confidence:{cat}"

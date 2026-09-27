@@ -71,3 +71,19 @@ def test_identity_score_none_for_scoreless_path():
     snap = z.snapshot(1.0)
     assert snap.identity == "cat_a"
     assert snap.identity_score is None
+
+
+def test_unknown_votes_when_enabled():
+    z = ZoneState(window_sec=5, door_close_timeout_sec=30, classifier_min_conf=0.5,
+                  unknown_votes=True)
+    z.update(0.0, "unknown", 0.4, True)
+    z.update(1.0, "alisa", 0.3, True)     # below min_conf → counts as unknown
+    assert z.snapshot(1.0).identity == "unknown"
+
+
+def test_confident_cat_beats_unknown_votes():
+    z = ZoneState(window_sec=5, door_close_timeout_sec=30, classifier_min_conf=0.5,
+                  unknown_votes=True)
+    z.update(0.0, "unknown", 0.4, True)
+    z.update(1.0, "alisa", 0.9, True)
+    assert z.snapshot(1.0).identity == "alisa"

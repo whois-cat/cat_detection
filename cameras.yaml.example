@@ -117,7 +117,10 @@
 #     serial_number  — hardware serial used in API paths (/api/<serial>/door/...)
 #     allowed_cats   — list of cat names allowed to open this feeder. Names must
 #                      match class_names in the classifier model. Nothing hardcoded
-#                      here — add/remove names freely.
+#                      here — add/remove names freely. The special name
+#                      "unknown" also opens for cats the classifier can't
+#                      confidently identify (below classifier_min_conf) — a
+#                      stopgap when an allowed cat stops being recognised.
 #     dangerous_confusions — optional list of {actual, predicted, action} safety
 #                      rules. action "block_open" (default) refuses to open when the
 #                      resolved (allowed) identity could really be a NON-allowed cat,

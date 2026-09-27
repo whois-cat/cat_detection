@@ -12,7 +12,8 @@ def _run(events, *, allowed, window_sec=0.4, open_debounce=3.0):
     """events: list of (wall_t, cat, score, in_action). Returns True if the door
     ever opened."""
     zone = ZoneState(window_sec=window_sec, door_close_timeout_sec=30.0,
-                     classifier_min_conf=0.5)
+                     classifier_min_conf=0.5,
+                     unknown_votes="unknown" in allowed)
     fsm = DoorFSM(open_debounce_sec=open_debounce, multi_debounce_sec=2.0)
     opened = False
     for wall_t, cat, score, in_action in events:
@@ -73,6 +74,17 @@ def test_not_allowed_cat_closes():
 
 
 # ---- confidence + margin gates (generic fixtures) ----
+
+def test_unknown_opens_when_allowed():
+    events = [(i * 0.5, "unknown", 0.3, True) for i in range(12)]
+    assert _run(events, allowed=["felisis", "unknown"]) is True
+
+
+def test_allowed_unknown_skips_confidence_gate():
+    action, reason = decide(_present("unknown", identity_score=0.3),
+                            ["felisis", "unknown"], min_confidence=0.85)
+    assert action == "open" and reason == "unknown"
+
 
 def test_low_confidence_blocks_open():
     # Allowed cat, but the winning identity's confidence is below the gate.

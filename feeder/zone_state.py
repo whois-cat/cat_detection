@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+UNKNOWN = "unknown"
+
 
 @dataclass
 class ZoneSummary:
@@ -49,8 +51,13 @@ class ZoneState:
         window_sec: float,
         door_close_timeout_sec: float,
         classifier_min_conf: float,
+        unknown_votes: bool = False,
     ) -> None:
         self._win = window_sec
+        # When True (a feeder lists "unknown" in allowed_cats), unconfident
+        # frames — detector "unknown" or below classifier_min_conf — vote as
+        # UNKNOWN instead of being dropped, so an unrecognised cat can win.
+        self._unknown_votes = unknown_votes
         self._timeout = door_close_timeout_sec
         self._min_conf = classifier_min_conf
         # wall_t → list of (cat, cat_score) for in_action detections at that frame
@@ -103,17 +110,21 @@ class ZoneState:
             n_cats = 0
 
         # --- identity: weighted vote of high-confidence in_action labels ---
-        # "unknown" is excluded. Non-classifier paths (cat_score=None) vote
+        # "unknown" is excluded unless unknown_votes is on (then unconfident
+        # frames vote as UNKNOWN, weighted by their low score, so any confident
+        # named cat still wins). Non-classifier paths (cat_score=None) vote
         # with weight 1.0 (blob detector, YOLO without classifier).
         votes: dict[str, float] = {}
         score_sum: dict[str, float] = {}
         score_cnt: dict[str, int] = {}
         for cats in recent.values():
             for cat, score in cats:
-                if not cat or cat == "unknown":
+                if not cat:
                     continue
-                if score is not None and score < self._min_conf:
-                    continue
+                if cat == UNKNOWN or (score is not None and score < self._min_conf):
+                    if not self._unknown_votes:
+                        continue
+                    cat = UNKNOWN
                 votes[cat] = votes.get(cat, 0.0) + (score if score is not None else 1.0)
                 if score is not None:
                     score_sum[cat] = score_sum.get(cat, 0.0) + score

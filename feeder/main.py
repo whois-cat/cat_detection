@@ -29,7 +29,8 @@ Env vars (all from configure.py — nothing hardcoded):
   FEEDER_API_BASE_URL     base URL of the feeder REST API
   FEEDER_SERIAL_NUMBER    feeder hardware serial
   ALLOWED_CATS            comma-separated list of allowed cat names (this feeder's
-                          target identities) — empty means open for none
+                          target identities) — empty means open for none.
+                          "unknown" also admits cats the classifier can't identify.
   DANGEROUS_CONFUSIONS    optional JSON list of {actual, predicted, action} pairs;
                           action "block_open" refuses to open when the predicted
                           (allowed) identity could really be a non-allowed cat.
@@ -88,7 +89,7 @@ from feed_control import FeedController
 from feeder_client import FeederClient
 from journal import FeedJournal
 from schedule_feed import ScheduleFeeder
-from zone_state import ZoneState
+from zone_state import UNKNOWN, ZoneState
 
 # ---- config (all from env) ----
 
@@ -529,6 +530,7 @@ def main() -> None:
         window_sec=PRESENCE_WINDOW_SEC,
         door_close_timeout_sec=DOOR_CLOSE_TIMEOUT_SEC,
         classifier_min_conf=CLASSIFIER_MIN_CONF,
+        unknown_votes=UNKNOWN in ALLOWED_CATS,
     )
     _fsm = DoorFSM(
         open_debounce_sec=OPEN_DEBOUNCE_SEC,
