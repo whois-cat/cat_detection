@@ -53,7 +53,7 @@ Local runtime data is intentionally outside git:
 data/
   streamhub/recordings/<camera>/<date>/<hour>/<start>_<dur>ms.mp4   segments
   streamhub/recordings/<camera>/<date>/<hour>/<start>.labels.jsonl  CV results + decisions
-  streamhub/feed_journal/journal.db  decider journal (door sessions, scheduled feeds)
+  decider/feed_journal/journal.db    decider journal (door sessions, scheduled feeds)
   streamhub/pins.json                ranges the pruner keeps
   events/events.db                   previous stack's detections (training)
   recordings/<camera>/*.mp4          previous stack's recordings (training)

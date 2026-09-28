@@ -19,7 +19,7 @@ manifest    := env_var_or_default("CLUSTER_MANIFEST", "data/review/clusters.json
 # When empty, the review UI falls back to the labels baked into the manifest.
 labels      := env_var_or_default("REVIEW_LABELS",    "")
 rec_tz      := env_var_or_default("RECORDING_TZ",     "UTC")
-journal_db  := env_var_or_default("FEED_JOURNAL_DB",  "data/streamhub/feed_journal/journal.db")
+journal_db  := env_var_or_default("FEED_JOURNAL_DB",  "data/decider/feed_journal/journal.db")
 replay_set  := env_var_or_default("REPLAY_SET",       "data/replay")
 streamhub_port := env_var_or_default("STREAMHUB_PORT", "8096")
 

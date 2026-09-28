@@ -1,6 +1,6 @@
 # streamhub, cv-worker, decider, pruner (see README.md, PLAN.md); settings in
 # config.yaml (from config.example.yaml), secrets in secrets/streamhub.env.
-# Uses its own data dir (data/streamhub) and port, and each camera's second
+# Uses its own data dirs (data/streamhub, data/decider) and port, and each camera's second
 # RTSP session slot, so it can run next to the previous stack.
 #
 #   just up | down | ps | logs [service] | status
@@ -73,7 +73,8 @@ services:
       TZ: ${TZ:-UTC}
     volumes:
       - ./config.yaml:/config.yaml:ro
-      - ./data/streamhub:/data
+      # Its own state (feed journal), separate from recordings.
+      - ./data/decider:/data
     env_file:
       - path: ./secrets/streamhub.env
         required: false

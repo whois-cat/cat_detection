@@ -39,8 +39,8 @@ just status                            # per-camera ingest status
 ```
 
 Data lives in `data/streamhub/` (recordings with their `.labels.jsonl`
-sidecars, the feed journal, pins). `CACHEDIR.TAG` keeps backup tools out of
-the recordings.
+sidecars, pins; shared with pruner) and `data/decider/` (the feed journal).
+`CACHEDIR.TAG` keeps backup tools out of the recordings.
 
 `decider` starts with `dry_run: true` in the example config: it decides and
 journals but never calls the feeder API. Turn it off only after the previous
@@ -69,7 +69,7 @@ Everything below is outside git; copy it from the old checkout.
 | `cameras.yaml` | → `config.yaml` + `secrets/streamhub.env` | camera URLs/credentials, feeder ids and serials (already transcribed in `config.example.yaml`) |
 | `models/classifier/` (incl. symlinks) | same path | the deployed classifier |
 | `models/trained/` | same path | trained checkpoints (re-exportable, needed for promote) |
-| `data/feed_journal/journal.db` (+ `-wal`) | `data/streamhub/feed_journal/` | **at switchover, right before `dry_run: false`**, with the old feeders stopped: scheduled feeding checks it for slots already fed today — with an empty journal it would feed the latest missed slots again. (A dry run uses `journal.dry-run.db`.) Containers run as UID 1000: `chown` it. |
+| `data/feed_journal/journal.db` (+ `-wal`) | `data/decider/feed_journal/` | **at switchover, right before `dry_run: false`**, with the old feeders stopped: scheduled feeding checks it for slots already fed today — with an empty journal it would feed the latest missed slots again. (A dry run uses `journal.dry-run.db`.) Containers run as UID 1000: `chown` it. |
 | `data/review/`, `reviews.db` (repo root) | same paths | human labels; the root `reviews.db` holds more reviews than `data/review/reviews.db` |
 | `data/events/`, `data/recordings/`, `data/replay/`, `data/mlflow/` | same paths | training data and history, if you still train on them |
 
