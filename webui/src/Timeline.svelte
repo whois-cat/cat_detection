@@ -1,27 +1,37 @@
 <script>
-  // Timeline for one camera. Viewport, hover and playhead are shared (see
-  // lib/state.svelte.js), so all timelines pan, zoom and hover together.
+  // One timeline for all shown cameras: per camera a row with its recorded
+  // spans and detection density, one shared time scale, playhead and hover.
+  // Viewport, hover and playhead live in lib/state.svelte.js.
   //
   // Props:
-  //   label:  camera name shown at the left
-  //   ranges: [[startMs, endMs], ...] recorded spans
-  //   events: [{wall_ms, cat, n, dur}] detection counts over [wall_ms, wall_ms + dur)
-  //           (density bars, per-cat colours)
+  //   rows: [{label, ranges, events}]
+  //     ranges: [[startMs, endMs], ...] recorded spans
+  //     events: [{wall_ms, cat, n, dur}] detection counts over [wall_ms, wall_ms + dur)
+  //             (density bars, per-cat colours)
   import { onMount, onDestroy } from 'svelte';
   import { view, play, clock, seek, cancelAnimation, writeHash, ZOOM_MIN_MS, ZOOM_MAX_MS } from './lib/state.svelte.js';
   import { DAY_MS, fmtDate, fmtTimeOfDay, fmtDateTime, fmtDuration, isLocalMidnight } from './lib/time.js';
   import { catColor, DEFAULT_CAT_COLOR } from './lib/colors.js';
 
-  let { label, ranges = [], events = [] } = $props();
+  let { rows = [] } = $props();
 
-  const HEIGHT = 64;
+  // Row geometry: recorded strip, then density; the scale below all rows.
+  const TOP = 4, AV_H = 5, DEN_GAP = 2, DEN_H = 22, ROW_GAP = 7, SCALE_H = 18;
+  const ROW_PITCH = AV_H + DEN_GAP + DEN_H + ROW_GAP;
+  const rowY = i => TOP + i * ROW_PITCH;
   const HOVER_WINDOW_PX = 18;
-  const TOOLTIP_W = 180;
+  const TOOLTIP_W = 260;
 
   let canvas;
   let width = $state(0);
 
-  const eventsSorted = $derived(events.slice().sort((a, b) => a.wall_ms - b.wall_ms));
+  const sorted = $derived(rows.map(r => ({
+    ...r,
+    ranges: r.ranges || [],
+    events: (r.events || []).slice().sort((a, b) => a.wall_ms - b.wall_ms),
+  })));
+  const scaleY = $derived(TOP + sorted.length * ROW_PITCH - ROW_GAP + 4);
+  const height = $derived(scaleY + SCALE_H);
 
   const timeToX = ms => (ms - view.from) / (view.to - view.from) * width;
   const xToTime = x => view.from + (x / width) * (view.to - view.from);
@@ -31,21 +41,21 @@
     if (view.hoverMs === null || !width) return null;
     const t = view.hoverMs;
     const winMs = HOVER_WINDOW_PX * (view.to - view.from) / width;
-    const counts = Object.create(null);
-    let total = 0;
-    for (let i = lowerBound(eventsSorted, t - winMs), hi = lowerBound(eventsSorted, t + winMs); i < hi; i++) {
-      const c = eventsSorted[i].cat || '(unlabelled)';
-      const n = eventsSorted[i].n ?? 1;
-      counts[c] = (counts[c] || 0) + n;
-      total += n;
-    }
-    const recorded = ranges.some(([s, e]) => s <= t && t < e);
     return {
       timeStr: fmtDateTime(t),
       windowStr: `±${fmtDuration(winMs)}`,
-      recorded,
-      total,
-      cats: Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([cat, n]) => ({ cat, n, color: catColor(cat) })),
+      rows: sorted.map(r => {
+        const counts = Object.create(null);
+        for (let i = lowerBound(r.events, t - winMs), hi = lowerBound(r.events, t + winMs); i < hi; i++) {
+          const c = r.events[i].cat || '(unlabelled)';
+          counts[c] = (counts[c] || 0) + (r.events[i].n ?? 1);
+        }
+        return {
+          label: r.label,
+          recorded: r.ranges.some(([s, e]) => s <= t && t < e),
+          cats: Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([cat, n]) => ({ cat, n, color: catColor(cat) })),
+        };
+      }),
     };
   });
 
@@ -101,78 +111,82 @@
   function draw() {
     if (!canvas || width === 0) return;
     const dpr = window.devicePixelRatio || 1;
-    if (canvas.width !== width * dpr || canvas.height !== HEIGHT * dpr) {
+    if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
       canvas.width = width * dpr;
-      canvas.height = HEIGHT * dpr;
+      canvas.height = height * dpr;
     }
     const ctx = canvas.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, width, HEIGHT);
+    ctx.clearRect(0, 0, width, height);
+    sorted.forEach((r, i) => drawRow(ctx, r, rowY(i)));
+    drawScaleAndMarkers(ctx);
+  }
 
-    const RET_Y = 2, RET_H = 10;
-    const DEN_Y = 14, DEN_H = 30;
-    const SCL_Y = 48, SCL_H = 12;
-
+  function drawRow(ctx, r, y0) {
     // Recorded spans.
     ctx.fillStyle = '#2a1f1f';
-    ctx.fillRect(0, RET_Y, width, RET_H);
+    ctx.fillRect(0, y0, width, AV_H);
     ctx.fillStyle = '#3a6e3a';
-    for (const [s, e] of ranges) {
+    for (const [s, e] of r.ranges) {
       const x1 = Math.max(0, timeToX(s));
       const x2 = Math.min(width, timeToX(e));
-      if (x2 > x1) ctx.fillRect(x1, RET_Y, Math.max(1, x2 - x1), RET_H);
+      if (x2 > x1) ctx.fillRect(x1, y0, Math.max(1, x2 - x1), AV_H);
     }
 
     // Detection density: time-aligned buckets (bucket boundaries pinned to
     // absolute time so panning doesn't make bars wobble), stacked by cat.
-    if (eventsSorted.length) {
-      const startIdx = lowerBound(eventsSorted, view.from);
-      const endIdx = lowerBound(eventsSorted, view.to);
-      const msPerPx = (view.to - view.from) / width;
-      // One bar per pixel, but never narrower than the counts' own buckets
-      // (else a steady presence would draw as a comb of thin bars).
-      let evDur = 1;
-      for (let i = startIdx; i < endIdx; i++) evDur = Math.max(evDur, eventsSorted[i].dur ?? 1);
-      const bucketMs = Math.max(evDur, Math.round(msPerPx));
-      const alignedFloor = Math.floor(view.from / bucketMs) * bucketMs;
-      const numBuckets = Math.ceil((view.to - alignedFloor) / bucketMs) + 1;
-      const present = new Set();
-      for (let i = startIdx; i < endIdx; i++) if (eventsSorted[i].cat) present.add(eventsSorted[i].cat);
-      const order = [...present].sort();
-      const catIdx = Object.create(null);
-      order.forEach((c, i) => { catIdx[c] = i; });
-      const numCats = order.length + 1;
-      const buckets = new Uint32Array(numBuckets * numCats);
-      const totals = new Uint32Array(numBuckets);
-      let maxCount = 1;
-      for (let i = startIdx; i < endIdx; i++) {
-        const ev = eventsSorted[i];
-        const b = Math.floor((ev.wall_ms - alignedFloor) / bucketMs);
-        if (b < 0 || b >= numBuckets) continue;
-        const n = ev.n ?? 1;
-        buckets[b * numCats + (catIdx[ev.cat] ?? order.length)] += n;
-        if ((totals[b] += n) > maxCount) maxCount = totals[b];
-      }
-      const barW = bucketMs / msPerPx;
-      const colors = order.map(catColor).concat([DEFAULT_CAT_COLOR]);
-      for (let b = 0; b < numBuckets; b++) {
-        const t = totals[b];
-        if (!t) continue;
-        const x = timeToX(alignedFloor + b * bucketMs);
-        const fullH = Math.max(1, (t / maxCount) * DEN_H);
-        let yBottom = DEN_Y + DEN_H;
-        for (let c = 0; c < numCats; c++) {
-          const n = buckets[b * numCats + c];
-          if (!n) continue;
-          const segH = (n / t) * fullH;
-          ctx.fillStyle = colors[c];
-          ctx.fillRect(x, yBottom - segH, barW, segH);
-          yBottom -= segH;
-        }
+    const ev = r.events;
+    const denY = y0 + AV_H + DEN_GAP;
+    ctx.fillStyle = '#1e1e1e';
+    ctx.fillRect(0, denY, width, DEN_H);
+    if (!ev.length) return;
+    const startIdx = lowerBound(ev, view.from);
+    const endIdx = lowerBound(ev, view.to);
+    const msPerPx = (view.to - view.from) / width;
+    // One bar per pixel, but never narrower than the counts' own buckets
+    // (else a steady presence would draw as a comb of thin bars).
+    let evDur = 1;
+    for (let i = startIdx; i < endIdx; i++) evDur = Math.max(evDur, ev[i].dur ?? 1);
+    const bucketMs = Math.max(evDur, Math.round(msPerPx));
+    const alignedFloor = Math.floor(view.from / bucketMs) * bucketMs;
+    const numBuckets = Math.ceil((view.to - alignedFloor) / bucketMs) + 1;
+    const present = new Set();
+    for (let i = startIdx; i < endIdx; i++) if (ev[i].cat) present.add(ev[i].cat);
+    const order = [...present].sort();
+    const catIdx = Object.create(null);
+    order.forEach((c, i) => { catIdx[c] = i; });
+    const numCats = order.length + 1;
+    const buckets = new Uint32Array(numBuckets * numCats);
+    const totals = new Uint32Array(numBuckets);
+    let maxCount = 1;
+    for (let i = startIdx; i < endIdx; i++) {
+      const b = Math.floor((ev[i].wall_ms - alignedFloor) / bucketMs);
+      if (b < 0 || b >= numBuckets) continue;
+      const n = ev[i].n ?? 1;
+      buckets[b * numCats + (catIdx[ev[i].cat] ?? order.length)] += n;
+      if ((totals[b] += n) > maxCount) maxCount = totals[b];
+    }
+    const barW = bucketMs / msPerPx;
+    const colors = order.map(catColor).concat([DEFAULT_CAT_COLOR]);
+    for (let b = 0; b < numBuckets; b++) {
+      const t = totals[b];
+      if (!t) continue;
+      const x = timeToX(alignedFloor + b * bucketMs);
+      const fullH = Math.max(1, (t / maxCount) * DEN_H);
+      let yBottom = denY + DEN_H;
+      for (let c = 0; c < numCats; c++) {
+        const n = buckets[b * numCats + c];
+        if (!n) continue;
+        const segH = (n / t) * fullH;
+        ctx.fillStyle = colors[c];
+        ctx.fillRect(x, yBottom - segH, barW, segH);
+        yBottom -= segH;
       }
     }
+  }
 
-    // Scale.
+  function drawScaleAndMarkers(ctx) {
+    const SCL_Y = scaleY, SCL_H = 12;
     const step = pickTickStepMs(view.to - view.from, width / 110);
     const ticks = makeTicks(step);
     ctx.strokeStyle = '#444';
@@ -343,17 +357,19 @@
   onDestroy(() => ro && ro.disconnect());
 
   $effect(() => {
-    void events; void ranges; void play.playheadMs; void play.live; void clock.now;
+    void sorted; void height; void play.playheadMs; void play.live; void clock.now;
     void view.from; void view.to; void view.hoverMs; void width;
     scheduleDraw();
   });
 </script>
 
 <div class="timeline">
-  <div class="label">{label}</div>
+  {#each sorted as r, i (r.label)}
+    <div class="label" style="top: {rowY(i) + AV_H + DEN_GAP + 3}px">{r.label}</div>
+  {/each}
   <canvas
     bind:this={canvas}
-    style="height:{HEIGHT}px;"
+    style="height:{height}px;"
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
@@ -363,13 +379,17 @@
   ></canvas>
   {#if hoverInfo && hoverX !== null}
     <div class="tooltip" style={hoverX > width - TOOLTIP_W - 12 ? `right: ${width - hoverX + 8}px` : `left: ${hoverX + 8}px`}>
-      <div class="time">{hoverInfo.timeStr}</div>
-      <div class="dim">{hoverInfo.recorded ? 'recorded' : 'no recording'} · {hoverInfo.windowStr}</div>
-      {#if hoverInfo.total > 0}
-        {#each hoverInfo.cats as { cat, n, color } (cat)}
-          <div class="row"><span class="swatch" style="background: {color};"></span>{cat}: {n}</div>
-        {/each}
-      {/if}
+      <div class="time">{hoverInfo.timeStr} <span class="dim">{hoverInfo.windowStr}</span></div>
+      {#each hoverInfo.rows as r (r.label)}
+        <div class="row">
+          <span class="cam">{r.label}</span>
+          {#if !r.recorded}<span class="dim">no recording</span>{/if}
+          {#each r.cats as { cat, n, color } (cat)}
+            <span class="cat"><span class="swatch" style="background: {color};"></span>{cat} {n}</span>
+          {/each}
+          {#if r.recorded && !r.cats.length}<span class="dim">—</span>{/if}
+        </div>
+      {/each}
     </div>
   {/if}
 </div>
@@ -384,7 +404,6 @@
   .label {
     position: absolute;
     left: 6px;
-    top: 14px;
     font: 0.75rem ui-monospace, monospace;
     color: #aaa;
     pointer-events: none;
@@ -397,7 +416,7 @@
     touch-action: none;
   }
   canvas:active { cursor: grabbing; }
-  /* Inside the timeline, next to the hover line, so stacked timelines don't cover each other. */
+  /* Inside the timeline, next to the hover line. */
   .tooltip {
     position: absolute;
     top: 2px;
@@ -409,14 +428,16 @@
     font: 0.75rem/1.3 ui-monospace, monospace;
     pointer-events: none;
     z-index: 5;
-    width: 180px;
+    width: 260px;
     box-sizing: border-box;
     opacity: 0.92;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
   }
   .tooltip .time { color: #cfe2ff; }
   .tooltip .dim { color: #888; }
-  .tooltip .row { display: flex; align-items: center; gap: 0.35rem; }
+  .tooltip .row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.2rem 0.6rem; }
+  .tooltip .cam { color: #cfe2ff; min-width: 3.5em; }
+  .tooltip .cat { display: inline-flex; align-items: center; gap: 0.3rem; }
   .tooltip .swatch {
     width: 0.8em;
     height: 0.8em;

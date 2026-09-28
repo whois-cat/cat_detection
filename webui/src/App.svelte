@@ -199,9 +199,7 @@
 
 <section class="timelines">
   <div class="stack">
-    {#each shown as c (c.id)}
-      <Timeline label={c.id} ranges={cams.ranges[c.id] || []} events={cams.events[c.id] || []} />
-    {/each}
+    <Timeline rows={shown.map(c => ({ label: c.id, ranges: cams.ranges[c.id], events: cams.events[c.id] }))} />
   </div>
   <!-- At the timelines' right end, where "now" is. -->
   <button class="live" class:on={play.live} onclick={goLive} title="Go live (l)">LIVE</button>
