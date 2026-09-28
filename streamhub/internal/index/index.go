@@ -32,6 +32,10 @@ type Index struct {
 
 	mu   sync.RWMutex
 	cams map[string][]Entry // sorted by Start
+	// While a scan walks the tree, added segments are also collected here and
+	// re-applied to its result, so a segment finished mid-scan isn't lost.
+	scanning bool
+	added    []Entry
 }
 
 // New returns an empty index over root.
@@ -41,6 +45,15 @@ func New(root string, log *slog.Logger) *Index {
 
 // Scan rebuilds the index from the directory tree.
 func (x *Index) Scan() error {
+	x.mu.Lock()
+	x.scanning, x.added = true, nil
+	x.mu.Unlock()
+	defer func() {
+		x.mu.Lock()
+		x.scanning, x.added = false, nil
+		x.mu.Unlock()
+	}()
+
 	cams := map[string][]Entry{}
 	err := filepath.WalkDir(x.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -75,8 +88,11 @@ func (x *Index) Scan() error {
 		sortEntries(es)
 	}
 	x.mu.Lock()
+	defer x.mu.Unlock()
 	x.cams = cams
-	x.mu.Unlock()
+	for _, e := range x.added {
+		x.insert(e)
+	}
 	return nil
 }
 
@@ -84,9 +100,21 @@ func (x *Index) Scan() error {
 func (x *Index) Add(info segment.Info, size int64) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	es := x.cams[info.Camera]
-	i, _ := slices.BinarySearchFunc(es, info.Start, func(e Entry, t time.Time) int { return e.Start.Compare(t) })
-	x.cams[info.Camera] = slices.Insert(es, i, Entry{Info: info, Size: size})
+	e := Entry{Info: info, Size: size}
+	if x.scanning {
+		x.added = append(x.added, e)
+	}
+	x.insert(e)
+}
+
+// insert adds e unless already present. Caller holds x.mu.
+func (x *Index) insert(e Entry) {
+	es := x.cams[e.Camera]
+	i, found := slices.BinarySearchFunc(es, e.Start, func(a Entry, t time.Time) int { return a.Start.Compare(t) })
+	if found && es[i].Path == e.Path {
+		return
+	}
+	x.cams[e.Camera] = slices.Insert(es, i, e)
 }
 
 // Remove drops a segment, e.g. after finding its file gone.
