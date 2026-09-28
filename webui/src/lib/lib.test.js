@@ -33,3 +33,27 @@ test('range lookup', () => {
   assert.equal(nextRangeStart(rs, 10), 20);
   assert.equal(nextRangeStart(rs, 45), null);
 });
+
+import { LabelStore, topCat, parseSidecar } from './labels.js';
+
+test('label store lookup', () => {
+  const s = new LabelStore();
+  for (const ms of [100, 300, 200]) s.add({ pts: ms * 90, dets: [{ score: ms }] });
+  assert.equal(s.at(50), null);
+  assert.equal(s.at(100).ms, 100);
+  assert.equal(s.at(250).ms, 200);
+  assert.equal(s.at(1000).ms, 300);
+  s.add({ pts: 200 * 90, dets: [] }); // duplicate ignored
+  assert.equal(s.items.length, 3);
+});
+
+test('topCat', () => {
+  assert.equal(topCat({ cats: { a: 0.7, b: 0.3 } }), 'a');
+  assert.equal(topCat({ cats: { a: 0.4, b: 0.35, c: 0.25 } }), 'unknown');
+  assert.equal(topCat({}), 'cat');
+});
+
+test('parseSidecar skips other types and partial lines', () => {
+  const r = parseSidecar('{"t":"cv","pts":1,"dets":[]}\n{"t":"decision"}\n{"t":"cv","pt');
+  assert.deepEqual(r, [{ t: 'cv', pts: 1, dets: [] }]);
+});

@@ -6,8 +6,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,11 +33,15 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 type Camera struct {
 	ID   string `yaml:"id"`
 	RTSP string `yaml:"rtsp"`
+	// CV is passed as-is to CV workers (e.g. rotate_deg, detect_roi).
+	CV map[string]any `yaml:"cv"`
 }
 
 // Streamhub holds streamhub's settings.
 type Streamhub struct {
-	Listen     string     `yaml:"listen"`
+	Listen string `yaml:"listen"`
+	// HubListen is the address CV workers (and the decider) connect to.
+	HubListen  string     `yaml:"hub_listen"`
 	Recordings Recordings `yaml:"recordings"`
 	// WebUIDir is the built webui to serve; empty disables it.
 	WebUIDir string `yaml:"webui_dir"`
@@ -51,6 +57,57 @@ type Recordings struct {
 	Rescan Duration `yaml:"rescan"`
 }
 
+// Pruner holds the pruner's settings.
+type Pruner struct {
+	// KeepRecent: recordings newer than this are never sparsified.
+	KeepRecent Duration `yaml:"keep_recent"`
+	// EventMargin: older recordings are kept this far around detections.
+	EventMargin Duration `yaml:"event_margin"`
+	// DeleteUnprocessed deletes old recordings CV never looked at.
+	DeleteUnprocessed bool `yaml:"delete_unprocessed"`
+	// MaxSize caps the recordings' total size, e.g. "50GB"; 0 disables.
+	MaxSize ByteSize `yaml:"max_size"`
+	// Interval between passes.
+	Interval Duration `yaml:"interval"`
+	DryRun   bool     `yaml:"dry_run"`
+}
+
+// ByteSize unmarshals sizes like "50GB", "500MiB" or a plain byte count.
+type ByteSize int64
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (b *ByteSize) UnmarshalYAML(n *yaml.Node) error {
+	v, err := parseSize(n.Value)
+	if err != nil {
+		return fmt.Errorf("line %d: %w", n.Line, err)
+	}
+	*b = ByteSize(v)
+	return nil
+}
+
+// Matched against the upper-cased input.
+var sizeRe = regexp.MustCompile(`^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?)(I?)B?\s*$`)
+
+func parseSize(s string) (int64, error) {
+	m := sizeRe.FindStringSubmatch(strings.ToUpper(s))
+	if m == nil {
+		return 0, fmt.Errorf("bad size %q (want e.g. 50GB)", s)
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, err
+	}
+	base := 1000.0
+	if m[3] == "I" {
+		base = 1024
+	}
+	exp := 0
+	if m[2] != "" {
+		exp = strings.Index("KMGT", m[2]) + 1
+	}
+	return int64(v * math.Pow(base, float64(exp))), nil
+}
+
 // Config is the whole config file; unknown top-level keys belong to other
 // components and are ignored here.
 type Config struct {
@@ -58,10 +115,14 @@ type Config struct {
 	DataDir   string    `yaml:"data_dir"`
 	Cameras   []Camera  `yaml:"cameras"`
 	Streamhub Streamhub `yaml:"streamhub"`
+	Pruner    Pruner    `yaml:"pruner"`
 }
 
 // RecordingsDir returns the recordings root.
 func (c *Config) RecordingsDir() string { return c.DataDir + "/recordings" }
+
+// PinsFile returns the pinned-ranges file.
+func (c *Config) PinsFile() string { return c.DataDir + "/pins.json" }
 
 var (
 	envRef   = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
@@ -95,11 +156,19 @@ func Parse(raw []byte) (*Config, error) {
 	c := Config{
 		DataDir: "data",
 		Streamhub: Streamhub{
-			Listen: ":8090",
+			Listen:    ":8090",
+			HubListen: ":9000",
 			Recordings: Recordings{
 				SegmentTarget: Duration(10 * time.Second),
 				Rescan:        Duration(time.Minute),
 			},
+		},
+		Pruner: Pruner{
+			KeepRecent:        Duration(3 * time.Hour),
+			EventMargin:       Duration(30 * time.Second),
+			DeleteUnprocessed: true,
+			MaxSize:           50_000_000_000,
+			Interval:          Duration(10 * time.Minute),
 		},
 	}
 	if err := yaml.Unmarshal([]byte(expanded), &c); err != nil {

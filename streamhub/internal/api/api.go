@@ -2,6 +2,7 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,9 +20,11 @@ import (
 	"github.com/whois-cat/cat_detection/streamhub/internal/config"
 	"github.com/whois-cat/cat_detection/streamhub/internal/index"
 	"github.com/whois-cat/cat_detection/streamhub/internal/ingest"
+	"github.com/whois-cat/cat_detection/streamhub/internal/labels"
 	"github.com/whois-cat/cat_detection/streamhub/internal/live"
 	"github.com/whois-cat/cat_detection/streamhub/internal/media"
 	"github.com/whois-cat/cat_detection/streamhub/internal/segment"
+	"github.com/whois-cat/cat_detection/streamhub/internal/sidecar"
 )
 
 const (
@@ -35,6 +39,8 @@ type Server struct {
 	Cameras []config.Camera
 	Sources map[string]*ingest.Source
 	Streams map[string]*media.Stream
+	Bus     *labels.Bus
+	Summary *sidecar.Summary
 	Index   *index.Index
 	Root    string // recordings root
 	// WebUIDir holds the built webui; empty disables serving it.
@@ -50,6 +56,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/status", s.status)
 	mux.HandleFunc("GET /api/recordings/{camera}", s.recordings)
 	mux.HandleFunc("GET /api/ranges/{camera}", s.ranges)
+	mux.HandleFunc("GET /api/detections/{camera}", s.detections)
 	mux.HandleFunc("GET /api/live/{camera}", s.live)
 	mux.HandleFunc("GET /recordings/{path...}", s.recordingFile)
 	if s.WebUIDir != "" {
@@ -83,6 +90,8 @@ type segmentJSON struct {
 	End   int64  `json:"end"`   // Unix ms
 	URL   string `json:"url"`
 	Size  int64  `json:"size"`
+	// Labels is the segment's CV result sidecar (404 if none was written).
+	Labels string `json:"labels"`
 }
 
 // cameraAndRange parses the {camera} path value and from/to query parameters,
@@ -116,10 +125,11 @@ func (s *Server) recordings(w http.ResponseWriter, r *http.Request) {
 	out := make([]segmentJSON, len(entries))
 	for i, e := range entries {
 		out[i] = segmentJSON{
-			Start: e.Start.UnixMilli(),
-			End:   e.End().UnixMilli(),
-			URL:   "/recordings/" + e.Path,
-			Size:  e.Size,
+			Start:  e.Start.UnixMilli(),
+			End:    e.End().UnixMilli(),
+			URL:    "/recordings/" + e.Path,
+			Size:   e.Size,
+			Labels: "/recordings/" + e.Sidecar(),
 		}
 	}
 	writeJSON(w, out)
@@ -147,8 +157,48 @@ func (s *Server) ranges(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+// detections returns detection counts per cat, aggregated into buckets of
+// `bucket` ms (default and minimum 1000): [[bucketStartMs, cat, count], ...]
+// sorted by time, then cat.
+func (s *Server) detections(w http.ResponseWriter, r *http.Request) {
+	camera, from, to, ok := s.cameraAndRange(w, r)
+	if !ok {
+		return
+	}
+	bucket := int64(1000)
+	if v := r.URL.Query().Get("bucket"); v != "" {
+		ms, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || ms <= 0 {
+			http.Error(w, "bucket: want milliseconds", http.StatusBadRequest)
+			return
+		}
+		bucket = max(bucket, ms)
+	}
+	type key struct {
+		start int64
+		cat   string
+	}
+	counts := map[key]int{}
+	var order []key
+	for _, b := range s.Summary.Query(camera, from, to) {
+		k := key{b.Sec * 1000 / bucket * bucket, b.Cat}
+		if _, seen := counts[k]; !seen {
+			order = append(order, k)
+		}
+		counts[k] += b.N
+	}
+	// Query is sorted by (second, cat); keep time order across merged buckets.
+	slices.SortStableFunc(order, func(a, b key) int { return cmp.Or(cmp.Compare(a.start, b.start), strings.Compare(a.cat, b.cat)) })
+	out := make([][3]any, len(order))
+	for i, k := range order {
+		out[i] = [3]any{k.start, k.cat, counts[k]}
+	}
+	writeJSON(w, out)
+}
+
 func (s *Server) live(w http.ResponseWriter, r *http.Request) {
-	stream, ok := s.Streams[r.PathValue("camera")]
+	camera := r.PathValue("camera")
+	stream, ok := s.Streams[camera]
 	if !ok {
 		http.Error(w, "unknown camera", http.StatusNotFound)
 		return
@@ -161,7 +211,7 @@ func (s *Server) live(w http.ResponseWriter, r *http.Request) {
 	// Nothing is read from the client; CloseRead handles control frames and
 	// cancels ctx when the client goes away.
 	ctx := conn.CloseRead(r.Context())
-	if err := live.Serve(ctx, conn, stream, s.Log.With("camera", r.PathValue("camera"))); err != nil {
+	if err := live.Serve(ctx, conn, camera, stream, s.Bus, s.Log.With("camera", camera)); err != nil {
 		s.Log.Debug("live viewer disconnected", "err", err)
 	}
 	conn.Close(websocket.StatusNormalClosure, "")
@@ -198,14 +248,17 @@ func parseTime(v string, def time.Time) (time.Time, error) {
 
 func (s *Server) recordingFile(w http.ResponseWriter, r *http.Request) {
 	rel := r.PathValue("path")
-	// Only well-formed segment paths are served; this also rules out traversal.
-	if _, err := segment.Parse(rel); err != nil {
+	// Only well-formed segment and sidecar paths are served; this also rules
+	// out traversal.
+	_, segErr := segment.Parse(rel)
+	_, _, sidecarErr := segment.ParseSidecar(rel)
+	if segErr != nil && sidecarErr != nil {
 		http.NotFound(w, r)
 		return
 	}
 	f, err := os.Open(filepath.Join(s.Root, filepath.FromSlash(rel)))
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if errors.Is(err, fs.ErrNotExist) && segErr == nil {
 			s.Index.Remove(rel)
 		}
 		http.NotFound(w, r)
@@ -217,9 +270,15 @@ func (s *Server) recordingFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "video/mp4")
-	// Finished segments never change.
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if segErr == nil {
+		w.Header().Set("Content-Type", "video/mp4")
+		// Finished segments never change.
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		// Sidecars grow while results arrive.
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Cache-Control", "no-cache")
+	}
 	http.ServeContent(w, r, "", st.ModTime(), f)
 }
 

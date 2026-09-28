@@ -71,7 +71,7 @@ func feed(t *testing.T, root string, target time.Duration, sessionBreak int) (fe
 	t.Helper()
 	aus := loadAUs(t)
 	var finished []segment.Info
-	rec := New("cam", root, target, func(info segment.Info, _ int64) { finished = append(finished, info) }, testLog)
+	rec := New("cam", root, target, Hooks{Finished: func(info segment.Info, _ int64) { finished = append(finished, info) }}, testLog)
 	stream := media.NewStream()
 	sub := stream.Subscribe(len(aus) + 1)
 

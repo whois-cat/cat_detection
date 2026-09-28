@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,11 +18,14 @@ import (
 
 	"github.com/whois-cat/cat_detection/streamhub/internal/api"
 	"github.com/whois-cat/cat_detection/streamhub/internal/config"
+	"github.com/whois-cat/cat_detection/streamhub/internal/hub"
 	"github.com/whois-cat/cat_detection/streamhub/internal/index"
 	"github.com/whois-cat/cat_detection/streamhub/internal/ingest"
+	"github.com/whois-cat/cat_detection/streamhub/internal/labels"
 	"github.com/whois-cat/cat_detection/streamhub/internal/media"
 	"github.com/whois-cat/cat_detection/streamhub/internal/recorder"
 	"github.com/whois-cat/cat_detection/streamhub/internal/segment"
+	"github.com/whois-cat/cat_detection/streamhub/internal/sidecar"
 )
 
 // recorderBuffer is how many frames a recorder may lag behind ingest before
@@ -72,6 +76,12 @@ func run(configPath string, log *slog.Logger) error {
 	if err := idx.Scan(); err != nil {
 		return err
 	}
+	summary := sidecar.NewSummary(root, log)
+	if err := summary.Sync(); err != nil {
+		return err
+	}
+	bus := labels.NewBus()
+	sidecars := sidecar.NewWriter(root, summary, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -87,9 +97,12 @@ func run(configPath string, log *slog.Logger) error {
 		src := ingest.NewSource(cam.ID, cam.RTSP, stream, log)
 		sources[cam.ID] = src
 		streams[cam.ID] = stream
-		rec := recorder.New(cam.ID, root, target, func(info segment.Info, size int64) {
-			idx.Add(info, size)
-			log.Debug("segment finished", "path", info.Path, "duration", info.Duration, "size", size)
+		rec := recorder.New(cam.ID, root, target, recorder.Hooks{
+			Started: func(startPTS int64) { sidecars.SegmentStarted(cam.ID, startPTS) },
+			Finished: func(info segment.Info, size int64) {
+				idx.Add(info, size)
+				log.Debug("segment finished", "path", info.Path, "duration", info.Duration, "size", size)
+			},
 		}, log)
 		sub := stream.Subscribe(recorderBuffer)
 		wg.Go(func() { src.Run(ctx) })
@@ -101,12 +114,32 @@ func run(configPath string, log *slog.Logger) error {
 			}
 		})
 	}
-	wg.Go(func() { idx.RescanEvery(ctx, time.Duration(cfg.Streamhub.Recordings.Rescan)) })
+	rescan := time.Duration(cfg.Streamhub.Recordings.Rescan)
+	wg.Go(func() { idx.RescanEvery(ctx, rescan) })
+	wg.Go(func() { summary.SyncEvery(ctx, rescan) })
+	results := bus.Subscribe(1024)
+	wg.Go(func() { sidecars.Run(ctx, results) })
+
+	cvConfig := map[string]map[string]any{}
+	for _, cam := range cfg.Cameras {
+		cvConfig[cam.ID] = cam.CV
+	}
+	hubLn, err := net.Listen("tcp", cfg.Streamhub.HubListen)
+	if err != nil {
+		return err
+	}
+	hubSrv := &hub.Server{Streams: streams, Config: cvConfig, Bus: bus, Log: log}
+	wg.Go(func() {
+		if err := hubSrv.Serve(ctx, hubLn); err != nil {
+			fatal <- fmt.Errorf("hub: %w", err)
+			stop()
+		}
+	})
 
 	srv := &http.Server{
 		Addr: cfg.Streamhub.Listen,
 		Handler: (&api.Server{
-			Cameras: cfg.Cameras, Sources: sources, Streams: streams, Index: idx, Root: root,
+			Cameras: cfg.Cameras, Sources: sources, Streams: streams, Bus: bus, Summary: summary, Index: idx, Root: root,
 			WebUIDir: cfg.Streamhub.WebUIDir, Log: log,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -117,7 +150,8 @@ func run(configPath string, log *slog.Logger) error {
 			stop()
 		}
 	}()
-	log.Info("streamhub started", "listen", cfg.Streamhub.Listen, "cameras", len(cfg.Cameras), "recordings", root)
+	log.Info("streamhub started", "listen", cfg.Streamhub.Listen, "hub", cfg.Streamhub.HubListen,
+		"cameras", len(cfg.Cameras), "recordings", root)
 
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

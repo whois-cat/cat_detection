@@ -27,6 +27,10 @@ const (
 	Ext = ".mp4"
 	// PartExt is the extension of segments still being written.
 	PartExt = ".part"
+	// SidecarExt is the extension of a segment's label sidecar
+	// (<start>.labels.jsonl): named by start time only, so it pairs with the
+	// segment both while it's a .part and once finished.
+	SidecarExt = ".labels.jsonl"
 )
 
 // Info describes a finished segment.
@@ -56,6 +60,36 @@ func PartPath(camera string, start time.Time) string {
 func FinalPath(camera string, start time.Time, duration time.Duration) string {
 	return filepath.Join(dir(camera, start), fmt.Sprintf("%s_%dms%s",
 		start.UTC().Format(stampLayout), duration.Milliseconds(), Ext))
+}
+
+// SidecarPath returns the relative path of the label sidecar of the segment
+// starting at start.
+func SidecarPath(camera string, start time.Time) string {
+	return filepath.Join(dir(camera, start), start.UTC().Format(stampLayout)+SidecarExt)
+}
+
+// Sidecar returns the relative path (forward slashes) of i's label sidecar.
+func (i Info) Sidecar() string { return filepath.ToSlash(SidecarPath(i.Camera, i.Start)) }
+
+// ParseSidecar parses the relative path of a label sidecar.
+func ParseSidecar(relPath string) (camera string, start time.Time, err error) {
+	relPath = filepath.ToSlash(relPath)
+	parts := strings.Split(relPath, "/")
+	if len(parts) != 4 {
+		return "", time.Time{}, fmt.Errorf("sidecar path %q: want <camera>/<date>/<hour>/<file>", relPath)
+	}
+	stamp, ok := strings.CutSuffix(parts[3], SidecarExt)
+	if !ok {
+		return "", time.Time{}, fmt.Errorf("sidecar path %q: not a %s file", relPath, SidecarExt)
+	}
+	start, err = time.Parse(stampLayout, stamp)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("sidecar path %q: %w", relPath, err)
+	}
+	if want := filepath.ToSlash(SidecarPath(parts[0], start)); want != relPath {
+		return "", time.Time{}, fmt.Errorf("sidecar path %q: directory does not match start time", relPath)
+	}
+	return parts[0], start, nil
 }
 
 // Parse parses the relative path of a finished segment.

@@ -5,26 +5,17 @@
   // Props:
   //   label:  camera name shown at the left
   //   ranges: [[startMs, endMs], ...] recorded spans
-  //   events: [{wall_ms, cat}] detections (density bars, per-cat colours)
+  //   events: [{wall_ms, cat, n}] detection counts (density bars, per-cat colours)
   import { onMount, onDestroy } from 'svelte';
   import { view, play, clock, seek, cancelAnimation, writeHash, ZOOM_MIN_MS, ZOOM_MAX_MS } from './lib/state.svelte.js';
   import { DAY_MS, fmtDate, fmtTimeOfDay, fmtDateTime, fmtDuration, isLocalMidnight } from './lib/time.js';
+  import { catColor, DEFAULT_CAT_COLOR } from './lib/colors.js';
 
   let { label, ranges = [], events = [] } = $props();
 
   const HEIGHT = 64;
   const HOVER_WINDOW_PX = 18;
   const TOOLTIP_W = 180;
-
-  // Colour per identity label, derived from the label string: stable per name,
-  // no hardcoded cat names. Null/empty (no identity) uses the neutral default.
-  const DEFAULT_CAT_COLOR = '#00ff88';
-  function catColor(c) {
-    if (!c) return DEFAULT_CAT_COLOR;
-    let h = 0;
-    for (let i = 0; i < c.length; i++) h = (h * 31 + c.charCodeAt(i)) >>> 0;
-    return `hsl(${h % 360} ${55 + (h >> 9) % 25}% ${50 + (h >> 17) % 20}%)`;
-  }
 
   let canvas;
   let width = $state(0);
@@ -43,8 +34,9 @@
     let total = 0;
     for (let i = lowerBound(eventsSorted, t - winMs), hi = lowerBound(eventsSorted, t + winMs); i < hi; i++) {
       const c = eventsSorted[i].cat || '(unlabelled)';
-      counts[c] = (counts[c] || 0) + 1;
-      total++;
+      const n = eventsSorted[i].n ?? 1;
+      counts[c] = (counts[c] || 0) + n;
+      total += n;
     }
     const recorded = ranges.some(([s, e]) => s <= t && t < e);
     return {
@@ -145,15 +137,16 @@
       const catIdx = Object.create(null);
       order.forEach((c, i) => { catIdx[c] = i; });
       const numCats = order.length + 1;
-      const buckets = new Uint16Array(numBuckets * numCats);
-      const totals = new Uint16Array(numBuckets);
+      const buckets = new Uint32Array(numBuckets * numCats);
+      const totals = new Uint32Array(numBuckets);
       let maxCount = 1;
       for (let i = startIdx; i < endIdx; i++) {
         const ev = eventsSorted[i];
         const b = Math.floor((ev.wall_ms - alignedFloor) / bucketMs);
         if (b < 0 || b >= numBuckets) continue;
-        buckets[b * numCats + (catIdx[ev.cat] ?? order.length)]++;
-        if (++totals[b] > maxCount) maxCount = totals[b];
+        const n = ev.n ?? 1;
+        buckets[b * numCats + (catIdx[ev.cat] ?? order.length)] += n;
+        if ((totals[b] += n) > maxCount) maxCount = totals[b];
       }
       const barW = bucketMs / msPerPx;
       const colors = order.map(catColor).concat([DEFAULT_CAT_COLOR]);

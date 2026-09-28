@@ -37,3 +37,24 @@ func TestParseRejects(t *testing.T) {
 		}
 	}
 }
+
+func TestSidecar(t *testing.T) {
+	start := time.Date(2026, 9, 27, 23, 55, 18, 123_456_789, time.UTC)
+	info, err := Parse(FinalPath("grey", start, 10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Sidecar(); got != "grey/2026-09-27/23/2026-09-27T23-55-18.123Z.labels.jsonl" {
+		t.Fatalf("Sidecar = %q", got)
+	}
+	if got := SidecarPath("grey", start); got != info.Sidecar() {
+		t.Errorf("SidecarPath from exact start %q != from parsed info %q", got, info.Sidecar())
+	}
+	cam, st, err := ParseSidecar(info.Sidecar())
+	if err != nil || cam != "grey" || !st.Equal(info.Start) {
+		t.Errorf("ParseSidecar = %q %v %v", cam, st, err)
+	}
+	if _, err := Parse(info.Sidecar()); err == nil {
+		t.Error("Parse accepted a sidecar path")
+	}
+}

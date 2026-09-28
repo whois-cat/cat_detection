@@ -3,6 +3,7 @@
 
 import { MseSink } from './mse.js';
 import { rangeIndexAt } from './time.js';
+import { parseSidecar } from './labels.js';
 
 // Live latency: jump to the live edge when further behind than this…
 const LIVE_MAX_LAG_S = 1.0;
@@ -12,9 +13,10 @@ const TRIM_BEHIND_MS = 30_000;
 const RECONNECT_MAX_MS = 10_000;
 
 export class LiveSource {
-  constructor(video, camera) {
+  constructor(video, camera, labels) {
     this.video = video;
     this.camera = camera;
+    this.labels = labels;
     this.sink = new MseSink(video);
     this.connected = false;
     this.closed = false;
@@ -29,7 +31,11 @@ export class LiveSource {
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => { this.connected = true; this.backoff = 500; };
     ws.onmessage = ev => {
-      if (typeof ev.data === 'string') return; // metadata: used from M4 on
+      if (typeof ev.data === 'string') {
+        const m = JSON.parse(ev.data);
+        if (m.type === 'labels') this.labels.add(m);
+        return;
+      }
       this.sink.append(new Uint8Array(ev.data)).then(() => this.keepUp(), err => console.warn(this.camera, err));
     };
     ws.onclose = () => {
@@ -53,6 +59,7 @@ export class LiveSource {
     if (now - this.lastTrim > TRIM_BEHIND_MS) {
       this.lastTrim = now;
       this.sink.remove(0, now - TRIM_BEHIND_MS);
+      this.labels.prune(now);
     }
   }
 
@@ -76,9 +83,10 @@ const DRIFT_GAIN = 0.0002; // rate change per ms of drift
 const DRIFT_MAX_NUDGE = 0.1;
 
 export class HistorySource {
-  constructor(video, camera) {
+  constructor(video, camera, labels) {
     this.video = video;
     this.camera = camera;
+    this.labels = labels;
     this.sink = new MseSink(video);
     this.segments = [];       // sorted by start: {start, end, url}
     this.listed = null;       // [from, to] covered by this.segments
@@ -141,11 +149,21 @@ export class HistorySource {
     if (!next) return;
     this.loading = true;
     this.appended.add(next.url);
+    this.loadLabels(next);
     fetch(next.url)
       .then(r => { if (!r.ok) throw new Error(`${r.status} ${next.url}`); return r.arrayBuffer(); })
       .then(buf => !this.destroyed && this.sink.append(new Uint8Array(buf)))
       .catch(err => { this.appended.delete(next.url); console.warn(this.camera, err); })
       .finally(() => { this.loading = false; });
+  }
+
+  // loadLabels fetches a segment's CV results (a missing sidecar just means
+  // no CV ran then).
+  loadLabels(seg) {
+    fetch(seg.labels)
+      .then(r => (r.ok ? r.text() : ''))
+      .then(text => { if (!this.destroyed) for (const r of parseSidecar(text)) this.labels.add(r); })
+      .catch(() => {});
   }
 
   trim(t) {
@@ -157,6 +175,7 @@ export class HistorySource {
     this.sink.remove(hi, Number.MAX_SAFE_INTEGER / 2);
     // Partly removed segments must be fetched again if needed.
     for (const s of this.segments) if (s.start < lo || s.end > hi) this.appended.delete(s.url);
+    this.labels.prune(t);
   }
 
   wallMs() { return this.sink.wallMs(); }

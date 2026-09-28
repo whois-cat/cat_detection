@@ -5,13 +5,21 @@
   import { LiveSource, HistorySource } from './lib/sources.js';
   import { play, cams } from './lib/state.svelte.js';
   import { fmtDateTime } from './lib/time.js';
+  import { LabelStore, topCat } from './lib/labels.js';
+  import { catColor } from './lib/colors.js';
 
   let { camera, onselect } = $props();
 
   // History players re-sync to the playhead this often.
   const UPDATE_MS = 200;
+  // A label older than this (relative to the frame shown) is drawn dashed:
+  // the CV hasn't seen this frame, the box may have moved.
+  const STALE_MS = 400;
 
   let video;
+  let canvas;
+  const labels = new LabelStore();
+  let frameHandle;
   let source = null;
   let mode = null;
   let hasData = $state(true);
@@ -27,7 +35,8 @@
     untrack(() => {
       if (!video || mode === want) return;
       source?.destroy();
-      source = want === 'live' ? new LiveSource(video, camera) : new HistorySource(video, camera);
+      labels.clear();
+      source = want === 'live' ? new LiveSource(video, camera, labels) : new HistorySource(video, camera, labels);
       mode = want;
       hasData = true;
     });
@@ -44,11 +53,60 @@
       if (play.waiting[camera]) play.waiting[camera] = false;
     }
     shownMs = source.wallMs();
+    // Also redraw here: labels can arrive after a paused frame was shown.
+    drawOverlay(video.currentTime);
   }
 
-  onMount(() => { timer = setInterval(update, UPDATE_MS); });
+  // drawOverlay draws the boxes of the newest result at or before the frame
+  // at mediaTime, in the video's displayed (letterboxed) area.
+  function drawOverlay(mediaTime) {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const ew = canvas.clientWidth, eh = canvas.clientHeight;
+    if (canvas.width !== ew * dpr || canvas.height !== eh * dpr) {
+      canvas.width = ew * dpr;
+      canvas.height = eh * dpr;
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, ew, eh);
+    const frameMs = source?.sink.frameWallMs(mediaTime);
+    const r = frameMs != null && labels.at(frameMs);
+    if (!r || !r.dets.length || !video.videoWidth) return;
+    const scale = Math.min(ew / video.videoWidth, eh / video.videoHeight);
+    const dw = video.videoWidth * scale, dh = video.videoHeight * scale;
+    const ox = (ew - dw) / 2, oy = (eh - dh) / 2;
+    ctx.setLineDash(frameMs - r.ms > STALE_MS ? [6, 4] : []);
+    ctx.lineWidth = 2;
+    ctx.font = '12px ui-monospace, monospace';
+    for (const d of r.dets) {
+      const [bx, by, bw, bh] = d.box;
+      const x = ox + bx * dw, y = oy + by * dh;
+      const cat = topCat(d);
+      const p = d.cats?.[cat];
+      const text = `${cat}${p != null ? ` ${Math.round(p * 100)}%` : ''} · ${d.score.toFixed(2)}`;
+      ctx.strokeStyle = ctx.fillStyle = catColor(cat);
+      ctx.strokeRect(x, y, bw * dw, bh * dh);
+      const tw = ctx.measureText(text).width + 6;
+      const ty = y >= 16 ? y - 16 : y + bh * dh;
+      ctx.fillRect(x - 1, ty, tw, 16);
+      ctx.fillStyle = '#000';
+      ctx.fillText(text, x + 2, ty + 12);
+    }
+  }
+
+  function onVideoFrame(_now, meta) {
+    drawOverlay(meta.mediaTime);
+    frameHandle = video.requestVideoFrameCallback(onVideoFrame);
+  }
+
+  onMount(() => {
+    timer = setInterval(update, UPDATE_MS);
+    if ('requestVideoFrameCallback' in video) frameHandle = video.requestVideoFrameCallback(onVideoFrame);
+  });
   onDestroy(() => {
     clearInterval(timer);
+    if (frameHandle) video.cancelVideoFrameCallback(frameHandle);
     source?.destroy();
     delete play.waiting[camera];
   });
@@ -57,6 +115,7 @@
 <div class="player">
   <!-- svelte-ignore a11y_media_has_caption -->
   <video bind:this={video} muted playsinline></video>
+  <canvas class="overlay" bind:this={canvas}></canvas>
   <button class="label" onclick={onselect} title="Show only this camera">{camera}</button>
   {#if shownMs}<div class="time">{fmtDateTime(shownMs)}</div>{/if}
   {#if offline}
@@ -77,13 +136,14 @@
     overflow: hidden;
     min-width: 0;
   }
-  video {
+  video, .overlay {
     position: absolute;
     inset: 0;
     width: 100%;
     height: 100%;
     object-fit: contain;
   }
+  .overlay { pointer-events: none; }
   .label, .time {
     position: absolute;
     bottom: 6px;

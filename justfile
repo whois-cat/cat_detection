@@ -82,11 +82,13 @@ sh-logs:
 sh-status PORT=env_var_or_default("STREAMHUB_PORT", "8096"):
     curl -s http://127.0.0.1:{{PORT}}/api/status | python3 -m json.tool
 
-# Run streamhub's and the webui's tests.
+# Run the new stack's tests (streamhub, webui, hubclient, cv-worker).
 [group('streamhub')]
 sh-test:
     cd streamhub && go vet ./... && go test ./...
     cd webui && npm test
+    cd hubclient && uv run --quiet --python 3.12 --group dev pytest -q
+    cd cv-worker && uv run --quiet --python 3.12 --group dev pytest -q
 
 # Webui dev server (hot reload) against a running streamhub.
 [group('streamhub')]

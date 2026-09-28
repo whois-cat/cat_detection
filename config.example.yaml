@@ -12,10 +12,16 @@ data_dir: /data
 cameras:
   - id: grey
     rtsp: "rtsp://camera:${CAM_GREY_PASSWORD}@192.168.0.213:554/stream1"
+    # Passed as-is to CV workers. rotate_deg: the model's input is rotated
+    # clockwise by this (sideways-mounted camera); detect_roi: [x0, y0, x1, y1]
+    # fractions of the frame to run detection on.
+    cv: {rotate_deg: 90}
   - id: beige
     rtsp: "rtsp://camera:${CAM_BEIGE_PASSWORD}@192.168.0.214:554/stream1"
+    cv: {rotate_deg: 90}
   - id: black
     rtsp: "rtsp://camera:${CAM_BLACK_PASSWORD}@192.168.0.215:554/stream1"
+    cv: {rotate_deg: 90}
 
 streamhub:
   listen: ":8090"
@@ -28,3 +34,17 @@ streamhub:
     cachedir_tag: true
     # How often to rescan the recordings dir for files deleted by others.
     rescan: 1m
+  # CV workers (and later the decider) connect here.
+  hub_listen: ":9000"
+
+pruner:
+  # Never sparsify recordings newer than this.
+  keep_recent: 3h
+  # Older recordings are kept this far around any detection.
+  event_margin: 30s
+  # Delete old recordings CV never looked at (e.g. no worker was running).
+  delete_unprocessed: true
+  # Total size cap; the oldest (unpinned) recordings go first.
+  max_size: 50GB
+  interval: 10m
+  dry_run: false

@@ -4,17 +4,26 @@
 // Binary messages are fMP4 pieces, in order: an init segment (sent first and
 // again whenever the parameter sets change), then one fragment per frame.
 // Timestamps are the frames' wall-clock PTS, the same as in recorded segments.
-// Text messages are reserved for JSON metadata (labels, status).
+//
+// Text messages are JSON CV results for the camera:
+//
+//	{"type":"labels","pts":…,"model":…,"infer_ms":…,"dets":[…]}
+//
+// While a CV worker serves the camera, frames are held back until a result
+// for them (or a later frame) has been sent, at most maxHold — so labels
+// always arrive before the frames they describe.
 package live
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
 	"github.com/coder/websocket"
 
+	"github.com/whois-cat/cat_detection/streamhub/internal/labels"
 	"github.com/whois-cat/cat_detection/streamhub/internal/media"
 	"github.com/whois-cat/cat_detection/streamhub/internal/mux"
 )
@@ -24,19 +33,54 @@ const (
 	// (it then resumes at the next keyframe).
 	buffer       = 120
 	writeTimeout = 5 * time.Second
+	// maxHold bounds how long a frame waits for its label.
+	maxHold   = 2 * time.Second
+	checkHold = 50 * time.Millisecond
 )
 
-// Serve streams stream to conn until ctx is done or the connection fails.
-func Serve(ctx context.Context, conn *websocket.Conn, stream *media.Stream, log *slog.Logger) error {
+type held struct {
+	f   *media.Frame
+	gap bool
+	at  time.Time
+}
+
+type labelsMsg struct {
+	Type string `json:"type"`
+	labels.Result
+}
+
+// Serve streams camera to conn until ctx is done or the connection fails.
+func Serve(ctx context.Context, conn *websocket.Conn, camera string, stream *media.Stream, bus *labels.Bus, log *slog.Logger) error {
+	results := bus.Subscribe(buffer)
+	defer bus.Unsubscribe(results)
 	sub, gop := stream.SubscribeFromGOP(buffer)
 	defer stream.Unsubscribe(sub)
 
 	w := &writer{ctx: ctx, conn: conn, waitingIDR: true}
+	// The cached GOP is already in the past: no point holding it.
 	for _, f := range gop {
 		if err := w.push(f, false); err != nil {
 			return err
 		}
 	}
+	var queue []held
+	labeled := int64(-1) // newest PTS with a result sent
+	release := func() error {
+		active := bus.CVActive(camera)
+		for len(queue) > 0 {
+			h := queue[0]
+			if active && h.f.PTS > labeled && time.Since(h.at) < maxHold {
+				break
+			}
+			if err := w.push(h.f, h.gap); err != nil {
+				return err
+			}
+			queue = queue[1:]
+		}
+		return nil
+	}
+	tick := time.NewTicker(checkHold)
+	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -48,9 +92,23 @@ func Serve(ctx context.Context, conn *websocket.Conn, stream *media.Stream, log 
 			if d.Gap {
 				log.Debug("live viewer fell behind, frames dropped")
 			}
-			if err := w.push(d.Frame, d.Gap); err != nil {
+			queue = append(queue, held{f: d.Frame, gap: d.Gap, at: time.Now()})
+		case r := <-results:
+			if r.Camera != camera {
+				continue
+			}
+			b, err := json.Marshal(labelsMsg{Type: "labels", Result: r})
+			if err != nil {
 				return err
 			}
+			if err := w.writeMsg(websocket.MessageText, b); err != nil {
+				return err
+			}
+			labeled = max(labeled, r.PTS)
+		case <-tick.C:
+		}
+		if err := release(); err != nil {
+			return err
 		}
 	}
 }
@@ -116,7 +174,11 @@ func (w *writer) emit(f *media.Frame, dur int64) error {
 }
 
 func (w *writer) write(b []byte) error {
+	return w.writeMsg(websocket.MessageBinary, b)
+}
+
+func (w *writer) writeMsg(typ websocket.MessageType, b []byte) error {
 	ctx, cancel := context.WithTimeout(w.ctx, writeTimeout)
 	defer cancel()
-	return w.conn.Write(ctx, websocket.MessageBinary, b)
+	return w.conn.Write(ctx, typ, b)
 }

@@ -32,16 +32,21 @@ import (
 // crash) when a camera's GOP is unusually long.
 const maxFragment = 5 * time.Second
 
-// FinishFunc is called for every finished segment.
-type FinishFunc func(info segment.Info, size int64)
+// Hooks are called by the recorder's goroutine; they must not block.
+type Hooks struct {
+	// Started is called when a segment is opened, with its first frame's PTS.
+	Started func(startPTS int64)
+	// Finished is called for every finished segment.
+	Finished func(info segment.Info, size int64)
+}
 
 // Recorder records one camera.
 type Recorder struct {
-	camera   string
-	root     string
-	target   int64 // ticks
-	onFinish FinishFunc
-	log      *slog.Logger
+	camera string
+	root   string
+	target int64 // ticks
+	hooks  Hooks
+	log    *slog.Logger
 
 	cur     *segWriter
 	prev    *media.Frame
@@ -49,13 +54,13 @@ type Recorder struct {
 }
 
 // New returns a Recorder writing segments of roughly target length under root.
-func New(camera, root string, target time.Duration, onFinish FinishFunc, log *slog.Logger) *Recorder {
+func New(camera, root string, target time.Duration, hooks Hooks, log *slog.Logger) *Recorder {
 	return &Recorder{
-		camera:   camera,
-		root:     root,
-		target:   int64(target.Seconds() * timeline.ClockRate),
-		onFinish: onFinish,
-		log:      log.With("camera", camera),
+		camera: camera,
+		root:   root,
+		target: int64(target.Seconds() * timeline.ClockRate),
+		hooks:  hooks,
+		log:    log.With("camera", camera),
 	}
 }
 
@@ -123,6 +128,9 @@ func (r *Recorder) write(f *media.Frame, dur int64) error {
 				return err
 			}
 			r.cur = w
+			if r.hooks.Started != nil {
+				r.hooks.Started(f.PTS)
+			}
 		}
 	}
 	if r.cur == nil {
@@ -142,7 +150,9 @@ func (r *Recorder) closeSegment() error {
 	if err != nil {
 		return fmt.Errorf("finish segment %s: %w", w.partPath, err)
 	}
-	r.onFinish(info, size)
+	if r.hooks.Finished != nil {
+		r.hooks.Finished(info, size)
+	}
 	return nil
 }
 

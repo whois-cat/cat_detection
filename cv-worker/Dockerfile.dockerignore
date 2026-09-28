@@ -1,0 +1,7 @@
+*
+!cv-worker/pyproject.toml
+!cv-worker/uv.lock
+!cv-worker/cv_worker
+!hubclient/pyproject.toml
+!hubclient/hubclient
+**/__pycache__

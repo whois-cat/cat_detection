@@ -30,13 +30,22 @@
     } catch { /* keep last known */ }
   }
 
+  // loadRanges loads recorded spans and detection counts around the viewport.
   async function loadRanges() {
     const span = view.to - view.from;
     const from = Math.round(view.from - span), to = Math.round(view.to + span);
+    // About one detection bucket per timeline pixel.
+    const bucket = Math.max(1000, Math.floor(span / 2000));
+    const q = `from=${from}&to=${to}`;
     await Promise.all(cams.list.map(async c => {
+      const id = encodeURIComponent(c.id);
       try {
-        const r = await fetch(`/api/ranges/${encodeURIComponent(c.id)}?from=${from}&to=${to}`);
-        cams.ranges[c.id] = await r.json();
+        const [ranges, dets] = await Promise.all([
+          fetch(`/api/ranges/${id}?${q}`).then(r => r.json()),
+          fetch(`/api/detections/${id}?${q}&bucket=${bucket}`).then(r => r.json()),
+        ]);
+        cams.ranges[c.id] = ranges;
+        cams.events[c.id] = dets.map(([wall_ms, cat, n]) => ({ wall_ms, cat, n }));
       } catch { /* keep last known */ }
     }));
   }
@@ -188,7 +197,7 @@
 
 <section class="timelines">
   {#each shown as c (c.id)}
-    <Timeline label={c.id} ranges={cams.ranges[c.id] || []} />
+    <Timeline label={c.id} ranges={cams.ranges[c.id] || []} events={cams.events[c.id] || []} />
   {/each}
 </section>
 

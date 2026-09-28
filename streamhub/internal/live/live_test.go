@@ -19,6 +19,7 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/coder/websocket"
 
+	"github.com/whois-cat/cat_detection/streamhub/internal/labels"
 	"github.com/whois-cat/cat_detection/streamhub/internal/media"
 )
 
@@ -76,7 +77,7 @@ func TestLiveStream(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
-		Serve(conn.CloseRead(r.Context()), conn, stream, log)
+		Serve(conn.CloseRead(r.Context()), conn, "grey", stream, labels.NewBus(), log)
 	}))
 	defer srv.Close()
 
@@ -130,5 +131,104 @@ func TestLiveStream(t *testing.T) {
 	}
 	if e, _ := exec.Command("ffmpeg", "-v", "error", "-i", file, "-enc_time_base:v", "1/90000", "-f", "null", "-").CombinedOutput(); len(e) > 0 {
 		t.Errorf("decode errors: %s", e)
+	}
+}
+
+func TestLabelsHoldFrames(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	aus := loadAUs(t)
+	stream := media.NewStream()
+	bus := labels.NewBus()
+	detach := bus.Attach("grey")
+	defer detach()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		Serve(conn.CloseRead(r.Context()), conn, "grey", stream, bus, log)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	// A read with a deadline would close the connection, so read in the background.
+	type msg struct {
+		typ websocket.MessageType
+		b   []byte
+	}
+	msgs := make(chan msg, 16)
+	go func() {
+		for {
+			typ, b, err := conn.Read(ctx)
+			if err != nil {
+				close(msgs)
+				return
+			}
+			msgs <- msg{typ, b}
+		}
+	}()
+	next := func() msg {
+		t.Helper()
+		select {
+		case m, ok := <-msgs:
+			if !ok {
+				t.Fatal("connection closed")
+			}
+			return m
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for a message")
+		}
+		return msg{}
+	}
+	time.Sleep(100 * time.Millisecond) // let Serve subscribe
+
+	var sps, pps []byte
+	for _, n := range aus[0] {
+		switch h264.NALUType(n[0] & 0x1f) {
+		case h264.NALUTypeSPS:
+			sps = n
+		case h264.NALUTypePPS:
+			pps = n
+		}
+	}
+	base := int64(160_000_000_000_000)
+	for i := range 5 {
+		stream.Publish(&media.Frame{PTS: base + int64(i)*6000, AU: aus[i], IDR: i == 0, SPS: sps, PPS: pps, NewSession: i == 0})
+	}
+
+	// Nothing may arrive before a label: frames are held.
+	select {
+	case m := <-msgs:
+		t.Fatalf("message %q sent before any label", m.b[:8])
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// A result for frame 2 releases frames 0..2; frame 2 goes out once its
+	// successor (3) is released, so expect init + frames 0, 1 after the label.
+	bus.Publish(labels.Result{Camera: "grey", PTS: base + 2*6000, Dets: []labels.Det{{Score: 0.9}}})
+	bus.Publish(labels.Result{Camera: "beige", PTS: base}) // other camera: not sent
+	if m := next(); m.typ != websocket.MessageText || !strings.Contains(string(m.b), `"type":"labels"`) {
+		t.Fatalf("want labels first, got %v %q", m.typ, m.b)
+	}
+	for _, want := range []string{"ftyp", "moof", "moof"} {
+		if m := next(); m.typ != websocket.MessageBinary || string(m.b[4:8]) != want {
+			t.Fatalf("want %s, got %v %q", want, m.typ, m.b[4:8])
+		}
+	}
+	// Unlabeled frames 3, 4 still come out after maxHold (frame 2 then 3).
+	start := time.Now()
+	for range 2 {
+		if m := next(); string(m.b[4:8]) != "moof" {
+			t.Fatalf("want a held frame, got %q", m.b[4:8])
+		}
+	}
+	if waited := time.Since(start); waited < maxHold-500*time.Millisecond {
+		t.Errorf("unlabeled frames released after %v, want ~%v", waited, maxHold)
 	}
 }

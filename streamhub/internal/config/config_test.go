@@ -49,3 +49,18 @@ func TestParseErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestSizes(t *testing.T) {
+	for in, want := range map[string]int64{"50GB": 50e9, "1.5GiB": 1.5 * (1 << 30), "123": 123, "10 kb": 10e3, "2TB": 2e12} {
+		if got, err := parseSize(in); err != nil || got != want {
+			t.Errorf("parseSize(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	if _, err := parseSize("lots"); err == nil {
+		t.Error("parseSize accepted garbage")
+	}
+	c, err := Parse([]byte("cameras: [{id: a, rtsp: 'rtsp://x'}]\npruner: {max_size: 20GB, keep_recent: 1h}"))
+	if err != nil || c.Pruner.MaxSize != 20e9 || time.Duration(c.Pruner.KeepRecent) != time.Hour || !c.Pruner.DeleteUnprocessed {
+		t.Errorf("pruner config: %+v %v", c.Pruner, err)
+	}
+}

@@ -51,6 +51,12 @@ export class MseSink {
     return this.base === null ? null : (this.base + this.video.currentTime) * 1000;
   }
 
+  // frameWallMs converts a video media time (e.g. from
+  // requestVideoFrameCallback) to wall-clock ms.
+  frameWallMs(mediaTime) {
+    return this.base === null ? null : (this.base + mediaTime) * 1000;
+  }
+
   // mediaTime converts wall-clock ms to video.currentTime.
   mediaTime(wallMs) {
     return wallMs / 1000 - this.base;

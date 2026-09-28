@@ -22,3 +22,37 @@ services:
     env_file:
       - path: ./secrets/streamhub.env
         required: false
+
+  # CV for all cameras. More workers (e.g. on a GPU machine) can connect to the
+  # hub port too; it isn't published by default since it carries raw video.
+  cv-worker:
+    build:
+      context: .
+      dockerfile: cv-worker/Dockerfile
+    restart: unless-stopped
+    depends_on: [streamhub]
+    environment:
+      STREAMHUB_HUB: streamhub:9000
+      CV_MODEL: yolo_cat
+      CLASSIFIER_DIR: /opt/models/classifier/current
+      # Must match the crop padding the classifier was trained with.
+      CLASSIFIER_PAD_FRAC: "0.05"
+    volumes:
+      # Mount the parent dir (not the `current` symlink) so a promoted version
+      # switch is visible on restart.
+      - ./models/classifier:/opt/models/classifier:ro
+
+  # Sparsifies old recordings and enforces the size cap (config.yaml: pruner).
+  pruner:
+    build:
+      context: .
+      dockerfile: streamhub/Dockerfile
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    entrypoint: ["pruner"]
+    command: ["-config", "/config.yaml"]
+    healthcheck:
+      disable: true
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - ./data/streamhub:/data
