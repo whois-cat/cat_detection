@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,23 @@ func TestWriteRouteAndSummarize(t *testing.T) {
 		}
 	}
 
+	// Decisions go to the same sidecar and never count as detections.
+	if err := w.WriteDecision(labels.Decision{Camera: "grey", PTS: ticks(time.Second),
+		Fields: map[string]any{"camera": "grey", "pts": ticks(time.Second), "state": "open"}}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(root, segment.SidecarPath("grey", t0)))
+	if !strings.Contains(string(raw), `"t":"decision"`) {
+		t.Fatalf("decision not written: %s", raw)
+	}
+	// A new segment carries the latest decision along.
+	later := t0.Add(time.Minute)
+	os.MkdirAll(filepath.Join(root, filepath.Dir(segment.SidecarPath("grey", later))), 0o755)
+	w.SegmentStarted("grey", ticks(time.Minute))
+	raw, _ = os.ReadFile(filepath.Join(root, segment.SidecarPath("grey", later)))
+	if !strings.Contains(string(raw), `"state":"open"`) {
+		t.Fatalf("decision not carried into the new segment: %q", raw)
+	}
 	lines := readLines(t, filepath.Join(root, segment.SidecarPath("grey", t0)))
 	if len(lines) != 3 || lines[2].PTS != ticks(3*time.Second) || len(lines[2].Dets) != 0 {
 		t.Fatalf("segment 1 sidecar: %+v", lines)
@@ -96,10 +114,12 @@ func readLines(t *testing.T, path string) []Line {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		var l Line
-		if err := json.Unmarshal(sc.Bytes(), &l); err != nil || l.T != TypeCV {
+		if err := json.Unmarshal(sc.Bytes(), &l); err != nil {
 			t.Fatalf("bad line %q: %v", sc.Text(), err)
 		}
-		out = append(out, l)
+		if l.T == TypeCV {
+			out = append(out, l)
+		}
 	}
 	return out
 }

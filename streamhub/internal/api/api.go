@@ -39,7 +39,7 @@ type Server struct {
 	Cameras []config.Camera
 	Sources map[string]*ingest.Source
 	Streams map[string]*media.Stream
-	Bus     *labels.Bus
+	Ch      *labels.Channels
 	Summary *sidecar.Summary
 	Index   *index.Index
 	Root    string // recordings root
@@ -211,7 +211,7 @@ func (s *Server) live(w http.ResponseWriter, r *http.Request) {
 	// Nothing is read from the client; CloseRead handles control frames and
 	// cancels ctx when the client goes away.
 	ctx := conn.CloseRead(r.Context())
-	if err := live.Serve(ctx, conn, camera, stream, s.Bus, s.Log.With("camera", camera)); err != nil {
+	if err := live.Serve(ctx, conn, camera, stream, s.Ch, s.Log.With("camera", camera)); err != nil {
 		s.Log.Debug("live viewer disconnected", "err", err)
 	}
 	conn.Close(websocket.StatusNormalClosure, "")

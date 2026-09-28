@@ -9,6 +9,7 @@ import (
 func TestParse(t *testing.T) {
 	t.Setenv("CAM_PASS", "s3cret")
 	c, err := Parse([]byte(`
+# comments may mention ${UNSET_IN_A_COMMENT}
 data_dir: /data
 cameras:
   - id: grey
@@ -62,5 +63,18 @@ func TestSizes(t *testing.T) {
 	c, err := Parse([]byte("cameras: [{id: a, rtsp: 'rtsp://x'}]\npruner: {max_size: 20GB, keep_recent: 1h}"))
 	if err != nil || c.Pruner.MaxSize != 20e9 || time.Duration(c.Pruner.KeepRecent) != time.Hour || !c.Pruner.DeleteUnprocessed {
 		t.Errorf("pruner config: %+v %v", c.Pruner, err)
+	}
+}
+
+func TestExampleConfig(t *testing.T) {
+	for _, v := range []string{"CAM_GREY_PASSWORD", "CAM_BEIGE_PASSWORD", "CAM_BLACK_PASSWORD"} {
+		t.Setenv(v, "x")
+	}
+	c, err := Load("../../../config.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Cameras) != 3 || c.Cameras[0].CV["rotate_deg"] != 90 || c.Streamhub.WebUIDir != "/webui" {
+		t.Errorf("example config: %+v", c)
 	}
 }

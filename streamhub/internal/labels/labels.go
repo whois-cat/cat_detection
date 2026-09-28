@@ -1,6 +1,6 @@
-// Package labels holds CV results and fans them out inside streamhub (to
-// sidecar files, live viewers and the decider), and tracks which cameras have
-// a CV worker attached.
+// Package labels holds CV results and decider decisions, fans them out inside
+// streamhub (to sidecar files, live viewers and the decider), and tracks which
+// cameras have a CV worker attached.
 package labels
 
 import (
@@ -58,22 +58,30 @@ func (d Det) TopCat() string {
 	return best
 }
 
-// Bus fans results out to subscribers and tracks attached CV workers.
-// Publishing never blocks; a slow subscriber misses results.
-type Bus struct {
+// Decision is a decider's report (door state, reason, identity, …). Fields
+// holds the whole record as sent, including camera and pts; streamhub only
+// routes and stores it.
+type Decision struct {
+	Camera string
+	PTS    int64
+	Fields map[string]any
+}
+
+// Bus fans values out to subscribers. Publishing never blocks; a slow
+// subscriber misses values.
+type Bus[T any] struct {
 	mu   sync.Mutex
-	subs map[chan Result]struct{}
-	cv   map[string]int // camera -> attached workers
+	subs map[chan T]struct{}
 }
 
 // NewBus returns an empty Bus.
-func NewBus() *Bus {
-	return &Bus{subs: map[chan Result]struct{}{}, cv: map[string]int{}}
+func NewBus[T any]() *Bus[T] {
+	return &Bus[T]{subs: map[chan T]struct{}{}}
 }
 
-// Subscribe returns a channel receiving all results.
-func (b *Bus) Subscribe(buffer int) chan Result {
-	ch := make(chan Result, buffer)
+// Subscribe returns a channel receiving all values.
+func (b *Bus[T]) Subscribe(buffer int) chan T {
+	ch := make(chan T, buffer)
 	b.mu.Lock()
 	b.subs[ch] = struct{}{}
 	b.mu.Unlock()
@@ -81,7 +89,7 @@ func (b *Bus) Subscribe(buffer int) chan Result {
 }
 
 // Unsubscribe removes and closes a subscription.
-func (b *Bus) Unsubscribe(ch chan Result) {
+func (b *Bus[T]) Unsubscribe(ch chan T) {
 	b.mu.Lock()
 	if _, ok := b.subs[ch]; ok {
 		delete(b.subs, ch)
@@ -90,36 +98,85 @@ func (b *Bus) Unsubscribe(ch chan Result) {
 	b.mu.Unlock()
 }
 
-// Publish delivers r to all subscribers.
-func (b *Bus) Publish(r Result) {
+// Publish delivers v to all subscribers.
+func (b *Bus[T]) Publish(v T) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for ch := range b.subs {
 		select {
-		case ch <- r:
+		case ch <- v:
 		default:
 		}
 	}
 }
 
+// CVTracker tracks which cameras have a CV worker attached.
+type CVTracker struct {
+	mu sync.Mutex
+	cv map[string]int // camera -> attached workers
+}
+
 // Attach records a CV worker serving camera; the returned func detaches it.
-func (b *Bus) Attach(camera string) (detach func()) {
-	b.mu.Lock()
-	b.cv[camera]++
-	b.mu.Unlock()
+func (t *CVTracker) Attach(camera string) (detach func()) {
+	t.mu.Lock()
+	if t.cv == nil {
+		t.cv = map[string]int{}
+	}
+	t.cv[camera]++
+	t.mu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			b.mu.Lock()
-			b.cv[camera]--
-			b.mu.Unlock()
+			t.mu.Lock()
+			t.cv[camera]--
+			t.mu.Unlock()
 		})
 	}
 }
 
-// CVActive reports whether a CV worker serves camera.
-func (b *Bus) CVActive(camera string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.cv[camera] > 0
+// Active reports whether a CV worker serves camera.
+func (t *CVTracker) Active(camera string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.cv[camera] > 0
+}
+
+// Channels bundles what flows between hub clients and streamhub's consumers.
+type Channels struct {
+	Results   *Bus[Result]
+	Decisions *Bus[Decision]
+	CV        *CVTracker
+
+	mu   sync.Mutex
+	last map[string]map[string]Decision // camera -> feeder -> latest decision
+}
+
+// NewChannels returns empty Channels.
+func NewChannels() *Channels {
+	return &Channels{Results: NewBus[Result](), Decisions: NewBus[Decision](), CV: &CVTracker{},
+		last: map[string]map[string]Decision{}}
+}
+
+// PublishDecision remembers d as its feeder's latest and publishes it.
+// Deciders report on change only, so the latest one is the current state.
+func (c *Channels) PublishDecision(d Decision) {
+	feeder, _ := d.Fields["feeder"].(string)
+	c.mu.Lock()
+	if c.last[d.Camera] == nil {
+		c.last[d.Camera] = map[string]Decision{}
+	}
+	c.last[d.Camera][feeder] = d
+	c.mu.Unlock()
+	c.Decisions.Publish(d)
+}
+
+// LatestDecisions returns the latest decision of each feeder of camera.
+func (c *Channels) LatestDecisions(camera string) []Decision {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]Decision, 0, len(c.last[camera]))
+	for _, d := range c.last[camera] {
+		out = append(out, d)
+	}
+	return out
 }

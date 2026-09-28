@@ -12,7 +12,7 @@ export class LabelStore {
 
   // add accepts a hub/sidecar result (pts in 90 kHz ticks).
   add(r) {
-    const item = { ms: r.pts / (CLOCK_RATE / 1000), dets: r.dets || [], model: r.model, infer_ms: r.infer_ms };
+    const item = { ms: r.pts / (CLOCK_RATE / 1000), dets: r.dets || [], model: r.model, infer_ms: r.infer_ms, decision: r.decision };
     const a = this.items;
     if (!a.length || a[a.length - 1].ms < item.ms) { a.push(item); return; }
     const i = this.index(item.ms);
@@ -48,15 +48,50 @@ export function topCat(det) {
   return cats[0][1] >= 0.5 ? cats[0][0] : 'unknown';
 }
 
-// parseSidecar parses a segment's .labels.jsonl into results.
+// DecisionStore keeps decider decisions per feeder, looked up by frame time.
+export class DecisionStore {
+  constructor() {
+    this.feeders = new Map(); // feeder id -> LabelStore of decisions
+  }
+
+  add(d) {
+    let s = this.feeders.get(d.feeder);
+    if (!s) this.feeders.set(d.feeder, (s = new LabelStore()));
+    s.add({ pts: d.pts, dets: [], decision: d });
+  }
+
+  // at returns the latest decision of each feeder at or before ms.
+  at(ms) {
+    const out = [];
+    for (const s of this.feeders.values()) {
+      const r = s.at(ms);
+      if (r) out.push(r.decision);
+    }
+    return out.sort((a, b) => a.feeder.localeCompare(b.feeder));
+  }
+
+  prune(ms) { for (const s of this.feeders.values()) s.prune(ms); }
+  clear() { this.feeders.clear(); }
+}
+
+// describeDecision renders a decision as one short line.
+export function describeDecision(d) {
+  const who = d.identity ? `${d.identity}${d.conf != null ? ` ${Math.round(d.conf * 100)}%` : ''}` : '';
+  const why = d.action === 'open' ? '' : d.reason;
+  return [`${d.feeder}: ${d.state}`, who, why, d.display ? `[${d.display}]` : '']
+    .filter(Boolean).join(' · ');
+}
+
+// parseSidecar parses a segment's .labels.jsonl into CV results and decisions.
 export function parseSidecar(text) {
-  const out = [];
+  const results = [], decisions = [];
   for (const line of text.split('\n')) {
     if (!line) continue;
     try {
       const r = JSON.parse(line);
-      if (r.t === 'cv') out.push(r);
+      if (r.t === 'cv') results.push(r);
+      else if (r.t === 'decision') decisions.push(r);
     } catch { /* partial last line while the segment is still being labeled */ }
   }
-  return out;
+  return { results, decisions };
 }

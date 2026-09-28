@@ -5,9 +5,13 @@
 // one JSON object per line, typed by "t":
 //
 //	{"t":"cv","pts":…,"model":…,"worker":…,"infer_ms":…,"dets":[…]}
+//	{"t":"decision","pts":…,"feeder":…,"state":…,"reason":…,…}
 //
-// written as results arrive, for every processed frame (so "looked, found
-// nothing" is distinguishable from "didn't look").
+// written as they arrive. CV results are written for every processed frame
+// (so "looked, found nothing" is distinguishable from "didn't look");
+// decisions when a decider's state changes, and each feeder's latest decision
+// again at the start of every segment (with its original pts), so any segment
+// on its own shows the state in effect.
 package sidecar
 
 import (
@@ -17,6 +21,7 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,8 +34,11 @@ import (
 	"github.com/whois-cat/cat_detection/streamhub/internal/timeline"
 )
 
-// TypeCV is the line type of CV results.
-const TypeCV = "cv"
+// Line types.
+const (
+	TypeCV       = "cv"
+	TypeDecision = "decision"
+)
 
 // recentStarts is how many segment starts per camera are remembered for
 // routing late results.
@@ -49,24 +57,32 @@ type Writer struct {
 	log  *slog.Logger
 
 	mu     sync.Mutex
-	starts map[string][]int64 // camera -> recent segment start PTS, ascending
+	starts map[string][]int64                    // camera -> recent segment start PTS, ascending
+	last   map[string]map[string]labels.Decision // camera -> feeder -> latest decision
 }
 
 // NewWriter returns a Writer under the recordings root.
 func NewWriter(root string, sum *Summary, log *slog.Logger) *Writer {
-	return &Writer{root: root, sum: sum, log: log, starts: map[string][]int64{}}
+	return &Writer{root: root, sum: sum, log: log, starts: map[string][]int64{}, last: map[string]map[string]labels.Decision{}}
 }
 
 // SegmentStarted tells the writer that camera's recorder opened a segment
 // whose first frame has startPTS.
 func (w *Writer) SegmentStarted(camera string, startPTS int64) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	s := append(w.starts[camera], startPTS)
 	if len(s) > recentStarts {
 		s = s[len(s)-recentStarts:]
 	}
 	w.starts[camera] = s
+	carried := slices.Collect(maps.Values(w.last[camera]))
+	w.mu.Unlock()
+	rel := filepath.ToSlash(segment.SidecarPath(camera, timeline.TicksToTime(startPTS)))
+	for _, d := range carried {
+		if err := w.appendTo(rel, decisionLine(d)); err != nil {
+			w.log.Warn("carrying decision into new sidecar", "camera", camera, "err", err)
+		}
+	}
 }
 
 // segmentOf returns the start PTS of the segment holding pts.
@@ -84,36 +100,68 @@ func (w *Writer) segmentOf(camera string, pts int64) (int64, bool) {
 	return s[i-1], true
 }
 
-// Run writes results until ctx is done or results is closed.
-func (w *Writer) Run(ctx context.Context, results <-chan labels.Result) {
+// Run writes results and decisions until ctx is done.
+func (w *Writer) Run(ctx context.Context, results <-chan labels.Result, decisions <-chan labels.Decision) {
 	for {
+		var err error
+		var camera string
 		select {
 		case <-ctx.Done():
 			return
-		case r, ok := <-results:
-			if !ok {
-				return
-			}
-			if err := w.Write(r); err != nil {
-				w.log.Warn("writing sidecar", "camera", r.Camera, "err", err)
-			}
+		case r := <-results:
+			camera, err = r.Camera, w.Write(r)
+		case d := <-decisions:
+			camera, err = d.Camera, w.WriteDecision(d)
+		}
+		if err != nil {
+			w.log.Warn("writing sidecar", "camera", camera, "err", err)
 		}
 	}
 }
 
 // Write stores one result.
 func (w *Writer) Write(r labels.Result) error {
-	start, ok := w.segmentOf(r.Camera, r.PTS)
-	if !ok {
-		return nil
-	}
-	rel := filepath.ToSlash(segment.SidecarPath(r.Camera, timeline.TicksToTime(start)))
 	line, err := json.Marshal(Line{T: TypeCV, Result: r})
 	if err != nil {
 		return err
 	}
-	// Summarize first so a concurrent Summary.Sync never loads this line too.
-	w.sum.Add(rel, r)
+	// Summarize before writing so a concurrent Summary.Sync never loads this line too.
+	return w.append(r.Camera, r.PTS, line, func(rel string) { w.sum.Add(rel, r) })
+}
+
+// WriteDecision stores one decision.
+func (w *Writer) WriteDecision(d labels.Decision) error {
+	feeder, _ := d.Fields["feeder"].(string)
+	w.mu.Lock()
+	if w.last[d.Camera] == nil {
+		w.last[d.Camera] = map[string]labels.Decision{}
+	}
+	w.last[d.Camera][feeder] = d
+	w.mu.Unlock()
+	return w.append(d.Camera, d.PTS, decisionLine(d), nil)
+}
+
+func decisionLine(d labels.Decision) []byte {
+	m := maps.Clone(d.Fields)
+	m["t"] = TypeDecision
+	line, _ := json.Marshal(m) // Fields came from msgpack: always encodable
+	return line
+}
+
+// append adds a line to the sidecar of the segment holding pts.
+func (w *Writer) append(camera string, pts int64, line []byte, before func(rel string)) error {
+	start, ok := w.segmentOf(camera, pts)
+	if !ok {
+		return nil
+	}
+	rel := filepath.ToSlash(segment.SidecarPath(camera, timeline.TicksToTime(start)))
+	if before != nil {
+		before(rel)
+	}
+	return w.appendTo(rel, line)
+}
+
+func (w *Writer) appendTo(rel string, line []byte) error {
 	full := filepath.Join(w.root, filepath.FromSlash(rel))
 	f, err := os.OpenFile(full, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 	if err != nil {

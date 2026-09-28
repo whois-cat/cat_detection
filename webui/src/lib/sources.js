@@ -13,10 +13,11 @@ const TRIM_BEHIND_MS = 30_000;
 const RECONNECT_MAX_MS = 10_000;
 
 export class LiveSource {
-  constructor(video, camera, labels) {
+  constructor(video, camera, labels, decisions) {
     this.video = video;
     this.camera = camera;
     this.labels = labels;
+    this.decisions = decisions;
     this.sink = new MseSink(video);
     this.connected = false;
     this.closed = false;
@@ -34,6 +35,7 @@ export class LiveSource {
       if (typeof ev.data === 'string') {
         const m = JSON.parse(ev.data);
         if (m.type === 'labels') this.labels.add(m);
+        else if (m.type === 'decision') this.decisions.add(m);
         return;
       }
       this.sink.append(new Uint8Array(ev.data)).then(() => this.keepUp(), err => console.warn(this.camera, err));
@@ -60,6 +62,7 @@ export class LiveSource {
       this.lastTrim = now;
       this.sink.remove(0, now - TRIM_BEHIND_MS);
       this.labels.prune(now);
+      this.decisions.prune(now);
     }
   }
 
@@ -83,10 +86,11 @@ const DRIFT_GAIN = 0.0002; // rate change per ms of drift
 const DRIFT_MAX_NUDGE = 0.1;
 
 export class HistorySource {
-  constructor(video, camera, labels) {
+  constructor(video, camera, labels, decisions) {
     this.video = video;
     this.camera = camera;
     this.labels = labels;
+    this.decisions = decisions;
     this.sink = new MseSink(video);
     this.segments = [];       // sorted by start: {start, end, url}
     this.listed = null;       // [from, to] covered by this.segments
@@ -162,7 +166,12 @@ export class HistorySource {
   loadLabels(seg) {
     fetch(seg.labels)
       .then(r => (r.ok ? r.text() : ''))
-      .then(text => { if (!this.destroyed) for (const r of parseSidecar(text)) this.labels.add(r); })
+      .then(text => {
+        if (this.destroyed) return;
+        const { results, decisions } = parseSidecar(text);
+        for (const r of results) this.labels.add(r);
+        for (const d of decisions) this.decisions.add(d);
+      })
       .catch(() => {});
   }
 
@@ -176,6 +185,7 @@ export class HistorySource {
     // Partly removed segments must be fetched again if needed.
     for (const s of this.segments) if (s.start < lo || s.end > hi) this.appended.delete(s.url);
     this.labels.prune(t);
+    this.decisions.prune(t);
   }
 
   wallMs() { return this.sink.wallMs(); }

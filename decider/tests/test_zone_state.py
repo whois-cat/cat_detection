@@ -1,0 +1,89 @@
+"""ZoneState sliding-window aggregator tests.
+
+Covers the two smoothing guarantees the door FSM relies on: single-frame box
+doubling never reports multi_cat, and the weighted identity vote ignores
+low-confidence and "unknown" labels.
+"""
+from decider.zone_state import ZoneState
+
+
+def _zone():
+    return ZoneState(window_sec=5, door_close_timeout_sec=30, classifier_min_conf=0.5)
+
+
+def test_single_frame_double_box_is_not_multi():
+    z = _zone()
+    # Two boxes in ONE frame (same wall_t) — a YOLO double-detection glitch.
+    z.update(0.0, "alisa", 0.9, True)
+    z.update(0.0, "alisa", 0.9, True)
+    assert z.snapshot(0.0).n_cats == 1
+
+
+def test_two_frames_with_two_boxes_is_multi():
+    z = _zone()
+    for t in (0.0, 1.0):
+        z.update(t, "alisa", 0.9, True)
+        z.update(t, "ellie", 0.9, True)
+    assert z.snapshot(1.0).n_cats == 2
+
+
+def test_identity_vote_excludes_unknown_and_low_conf():
+    z = _zone()
+    z.update(0.0, "alisa", 0.9, True)     # counts
+    z.update(0.0, "unknown", 0.99, True)  # excluded (unknown)
+    z.update(1.0, "ellie", 0.3, True)     # excluded (< min_conf)
+    z.update(1.0, "alisa", 0.8, True)     # counts
+    assert z.snapshot(1.0).identity == "alisa"
+
+
+def test_weighted_vote_beats_frequent_low_weight_label():
+    z = _zone()
+    # ellie appears more often but only just above threshold; alisa is confident.
+    z.update(0.0, "ellie", 0.55, True)
+    z.update(1.0, "ellie", 0.55, True)
+    z.update(2.0, "alisa", 0.95, True)
+    z.update(3.0, "alisa", 0.95, True)
+    assert z.snapshot(3.0).identity == "alisa"
+
+
+def test_presence_expires_after_timeout():
+    z = _zone()
+    z.update(0.0, "alisa", 0.9, True)
+    assert z.snapshot(10.0).present is True       # within 30s timeout
+    assert z.snapshot(31.0).present is False      # past it
+
+
+def test_identity_score_is_mean_of_winning_cat_scores():
+    z = _zone()
+    z.update(0.0, "cat_a", 0.8, True)
+    z.update(1.0, "cat_a", 0.9, True)
+    z.update(2.0, "cat_b", 0.95, True)   # loses the vote (one frame vs two)
+    snap = z.snapshot(2.0)
+    assert snap.identity == "cat_a"
+    assert round(snap.identity_score, 3) == 0.85   # mean(0.8, 0.9)
+    assert snap.margin is None                      # top-2 not in the event stream
+
+
+def test_identity_score_none_for_scoreless_path():
+    z = _zone()
+    z.update(0.0, "cat_a", None, True)   # non-classifier path (blob/yolo)
+    z.update(1.0, "cat_a", None, True)
+    snap = z.snapshot(1.0)
+    assert snap.identity == "cat_a"
+    assert snap.identity_score is None
+
+
+def test_unknown_votes_when_enabled():
+    z = ZoneState(window_sec=5, door_close_timeout_sec=30, classifier_min_conf=0.5,
+                  unknown_votes=True)
+    z.update(0.0, "unknown", 0.4, True)
+    z.update(1.0, "alisa", 0.3, True)     # below min_conf → counts as unknown
+    assert z.snapshot(1.0).identity == "unknown"
+
+
+def test_confident_cat_beats_unknown_votes():
+    z = ZoneState(window_sec=5, door_close_timeout_sec=30, classifier_min_conf=0.5,
+                  unknown_votes=True)
+    z.update(0.0, "unknown", 0.4, True)
+    z.update(1.0, "alisa", 0.9, True)
+    assert z.snapshot(1.0).identity == "alisa"

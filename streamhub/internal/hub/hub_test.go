@@ -56,11 +56,11 @@ func (c *testClient) recv() map[string]any {
 func TestCVWorkerSession(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	stream := media.NewStream()
-	bus := labels.NewBus()
+	ch := labels.NewChannels()
 	s := &Server{
 		Streams: map[string]*media.Stream{"grey": stream, "beige": media.NewStream()},
 		Config:  map[string]map[string]any{"grey": {"rotate_deg": 90}},
-		Bus:     bus,
+		Ch:      ch,
 		Log:     log,
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -77,7 +77,7 @@ func TestCVWorkerSession(t *testing.T) {
 	stream.Publish(&media.Frame{PTS: 100, IDR: true, AU: [][]byte{{0x65, 1}}, SPS: sps, PPS: pps, NewSession: true})
 	stream.Publish(&media.Frame{PTS: 200, AU: [][]byte{{0x41, 2}}, SPS: sps, PPS: pps})
 
-	results := bus.Subscribe(10)
+	results := ch.Results.Subscribe(10)
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func TestCVWorkerSession(t *testing.T) {
 			t.Fatalf("frame data not Annex-B: %x", data)
 		}
 	}
-	if !bus.CVActive("grey") || bus.CVActive("beige") {
+	if !ch.CV.Active("grey") || ch.CV.Active("beige") {
 		t.Fatal("attachment not tracked")
 	}
 
@@ -124,16 +124,16 @@ func TestCVWorkerSession(t *testing.T) {
 
 	conn.Close()
 	deadline := time.Now().Add(5 * time.Second)
-	for bus.CVActive("grey") && time.Now().Before(deadline) {
+	for ch.CV.Active("grey") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if bus.CVActive("grey") {
+	if ch.CV.Active("grey") {
 		t.Fatal("worker still attached after disconnect")
 	}
 }
 
 func TestRejects(t *testing.T) {
-	s := &Server{Streams: map[string]*media.Stream{"grey": media.NewStream()}, Bus: labels.NewBus(),
+	s := &Server{Streams: map[string]*media.Stream{"grey": media.NewStream()}, Ch: labels.NewChannels(),
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -175,4 +175,51 @@ func toInt(v any) int64 {
 		return int64(x)
 	}
 	return -1
+}
+
+func TestDeciderSession(t *testing.T) {
+	ch := labels.NewChannels()
+	s := &Server{Streams: map[string]*media.Stream{"grey": media.NewStream(), "beige": media.NewStream()},
+		Ch: ch, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Serve(ctx, ln)
+	decisions := ch.Decisions.Subscribe(10)
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	c := &testClient{t: t, conn: conn, r: bufio.NewReader(conn)}
+	c.send(map[string]any{"type": "hello", "role": "decider", "id": "d1", "cameras": []string{"grey"}})
+	time.Sleep(100 * time.Millisecond) // let the hub subscribe
+
+	ch.Results.Publish(labels.Result{Camera: "beige", PTS: 1})
+	ch.Results.Publish(labels.Result{Camera: "grey", PTS: 2, Model: "m", Dets: []labels.Det{{Score: 0.5, Cats: map[string]float64{"chuzh": 1}}}})
+	m := c.recv()
+	if m["type"] != "result" || m["camera"] != "grey" || toInt(m["pts"]) != 2 || m["model"] != "m" {
+		t.Fatalf("decider got %v", m)
+	}
+
+	c.send(map[string]any{"type": "decision", "camera": "grey", "pts": 2, "state": "open"})
+	c.send(map[string]any{"type": "decision", "camera": "beige", "pts": 3}) // not its camera
+	c.send(map[string]any{"type": "result", "camera": "grey", "pts": 4})    // deciders can't send results
+	select {
+	case d := <-decisions:
+		if d.Camera != "grey" || d.PTS != 2 || d.Fields["state"] != "open" || d.Fields["decider"] != "d1" || d.Fields["type"] != nil {
+			t.Fatalf("decision = %+v", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no decision published")
+	}
+	select {
+	case d := <-decisions:
+		t.Fatalf("unexpected decision %+v", d)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if ch.CV.Active("grey") {
+		t.Error("a decider counts as a CV worker")
+	}
 }

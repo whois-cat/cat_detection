@@ -1,0 +1,7 @@
+*
+!decider/pyproject.toml
+!decider/uv.lock
+!decider/decider
+!hubclient/pyproject.toml
+!hubclient/hubclient
+**/__pycache__

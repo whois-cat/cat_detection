@@ -182,7 +182,6 @@
       {#each RATES as r (r)}<option value={r}>{r}×</option>{/each}
     </select>
     <span class="clock">{fmtDateTime(play.playheadMs)}</span>
-    <button class="live" class:on={play.live} onclick={goLive} title="Go live (l)">LIVE</button>
   </div>
 </header>
 
@@ -196,9 +195,13 @@
 </main>
 
 <section class="timelines">
-  {#each shown as c (c.id)}
-    <Timeline label={c.id} ranges={cams.ranges[c.id] || []} events={cams.events[c.id] || []} />
-  {/each}
+  <div class="stack">
+    {#each shown as c (c.id)}
+      <Timeline label={c.id} ranges={cams.ranges[c.id] || []} events={cams.events[c.id] || []} />
+    {/each}
+  </div>
+  <!-- At the timelines' right end, where "now" is. -->
+  <button class="live" class:on={play.live} onclick={goLive} title="Go live (l)">LIVE</button>
 </section>
 
 <style>
@@ -244,7 +247,7 @@
   }
   .dot.ok { background: #3a3; }
   .clock { font-family: ui-monospace, monospace; padding: 0 6px; }
-  .live { font-weight: 700; letter-spacing: 1px; }
+  .live { font-weight: 700; letter-spacing: 1px; padding: 0 1rem; }
   .live.on { background: #c0392b; border-color: #e04535; color: #fff; }
   main {
     position: relative;
@@ -273,5 +276,6 @@
     background: rgba(0, 0, 0, 0.5);
     pointer-events: none;
   }
-  .timelines { display: flex; flex-direction: column; gap: 4px; }
+  .timelines { display: flex; gap: 4px; }
+  .stack { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 </style>

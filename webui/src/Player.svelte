@@ -5,7 +5,7 @@
   import { LiveSource, HistorySource } from './lib/sources.js';
   import { play, cams } from './lib/state.svelte.js';
   import { fmtDateTime } from './lib/time.js';
-  import { LabelStore, topCat } from './lib/labels.js';
+  import { LabelStore, DecisionStore, topCat, describeDecision } from './lib/labels.js';
   import { catColor } from './lib/colors.js';
 
   let { camera, onselect } = $props();
@@ -19,6 +19,8 @@
   let video;
   let canvas;
   const labels = new LabelStore();
+  const decisionStore = new DecisionStore();
+  let decisions = $state([]); // latest per feeder at the shown frame
   let frameHandle;
   let source = null;
   let mode = null;
@@ -36,7 +38,9 @@
       if (!video || mode === want) return;
       source?.destroy();
       labels.clear();
-      source = want === 'live' ? new LiveSource(video, camera, labels) : new HistorySource(video, camera, labels);
+      decisionStore.clear();
+      const Source = want === 'live' ? LiveSource : HistorySource;
+      source = new Source(video, camera, labels, decisionStore);
       mode = want;
       hasData = true;
     });
@@ -53,6 +57,8 @@
       if (play.waiting[camera]) play.waiting[camera] = false;
     }
     shownMs = source.wallMs();
+    const next = shownMs == null ? [] : decisionStore.at(shownMs);
+    if (JSON.stringify(next) !== JSON.stringify(decisions)) decisions = next;
     // Also redraw here: labels can arrive after a paused frame was shown.
     drawOverlay(video.currentTime);
   }
@@ -84,7 +90,8 @@
       const x = ox + bx * dw, y = oy + by * dh;
       const cat = topCat(d);
       const p = d.cats?.[cat];
-      const text = `${cat}${p != null ? ` ${Math.round(p * 100)}%` : ''} · ${d.score.toFixed(2)}`;
+      // identity probability · detector's confidence that this is a cat at all
+      const text = `${cat}${p != null ? ` ${Math.round(p * 100)}%` : ''} · det ${d.score.toFixed(2)}`;
       ctx.strokeStyle = ctx.fillStyle = catColor(cat);
       ctx.strokeRect(x, y, bw * dw, bh * dh);
       const tw = ctx.measureText(text).width + 6;
@@ -118,6 +125,11 @@
   <canvas class="overlay" bind:this={canvas}></canvas>
   <button class="label" onclick={onselect} title="Show only this camera">{camera}</button>
   {#if shownMs}<div class="time">{fmtDateTime(shownMs)}</div>{/if}
+  {#if decisions.length}
+    <div class="decisions">
+      {#each decisions as d (d.feeder)}<div class:open={d.state === 'open'}>{describeDecision(d)}</div>{/each}
+    </div>
+  {/if}
   {#if offline}
     <div class="notice">camera offline{status.last_error ? `: ${status.last_error}` : ''}</div>
   {:else if !hasData}
@@ -156,6 +168,19 @@
   .label { left: 6px; border: none; cursor: pointer; }
   .label:hover { background: rgba(0, 0, 0, 0.8); }
   .time { right: 6px; }
+  .decisions {
+    position: absolute;
+    top: 34px;
+    right: 6px;
+    font: 0.75rem ui-monospace, monospace;
+    color: #eee;
+    background: rgba(0, 0, 0, 0.55);
+    border-radius: 3px;
+    padding: 2px 6px;
+    pointer-events: none;
+    text-align: right;
+  }
+  .decisions .open { color: #6f6; }
   .notice {
     position: absolute;
     inset: 0;

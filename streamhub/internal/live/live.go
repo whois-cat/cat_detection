@@ -5,9 +5,10 @@
 // again whenever the parameter sets change), then one fragment per frame.
 // Timestamps are the frames' wall-clock PTS, the same as in recorded segments.
 //
-// Text messages are JSON CV results for the camera:
+// Text messages are JSON: the camera's CV results and decider decisions:
 //
 //	{"type":"labels","pts":…,"model":…,"infer_ms":…,"dets":[…]}
+//	{"type":"decision","pts":…,"feeder":…,"state":…,"reason":…,…}
 //
 // While a CV worker serves the camera, frames are held back until a result
 // for them (or a later frame) has been sent, at most maxHold — so labels
@@ -18,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"maps"
 	"time"
 
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
@@ -50,9 +52,11 @@ type labelsMsg struct {
 }
 
 // Serve streams camera to conn until ctx is done or the connection fails.
-func Serve(ctx context.Context, conn *websocket.Conn, camera string, stream *media.Stream, bus *labels.Bus, log *slog.Logger) error {
-	results := bus.Subscribe(buffer)
-	defer bus.Unsubscribe(results)
+func Serve(ctx context.Context, conn *websocket.Conn, camera string, stream *media.Stream, ch *labels.Channels, log *slog.Logger) error {
+	results := ch.Results.Subscribe(buffer)
+	defer ch.Results.Unsubscribe(results)
+	decisions := ch.Decisions.Subscribe(buffer)
+	defer ch.Decisions.Unsubscribe(decisions)
 	sub, gop := stream.SubscribeFromGOP(buffer)
 	defer stream.Unsubscribe(sub)
 
@@ -63,10 +67,16 @@ func Serve(ctx context.Context, conn *websocket.Conn, camera string, stream *med
 			return err
 		}
 	}
+	// Current decider state first: deciders report only on change.
+	for _, d := range ch.LatestDecisions(camera) {
+		if err := w.sendDecision(d); err != nil {
+			return err
+		}
+	}
 	var queue []held
 	labeled := int64(-1) // newest PTS with a result sent
 	release := func() error {
-		active := bus.CVActive(camera)
+		active := ch.CV.Active(camera)
 		for len(queue) > 0 {
 			h := queue[0]
 			if active && h.f.PTS > labeled && time.Since(h.at) < maxHold {
@@ -105,6 +115,13 @@ func Serve(ctx context.Context, conn *websocket.Conn, camera string, stream *med
 				return err
 			}
 			labeled = max(labeled, r.PTS)
+		case d := <-decisions:
+			if d.Camera != camera {
+				continue
+			}
+			if err := w.sendDecision(d); err != nil {
+				return err
+			}
 		case <-tick.C:
 		}
 		if err := release(); err != nil {
@@ -171,6 +188,16 @@ func (w *writer) emit(f *media.Frame, dur int64) error {
 	w.seq++
 	w.lastDur = dur
 	return w.write(frag)
+}
+
+func (w *writer) sendDecision(d labels.Decision) error {
+	m := maps.Clone(d.Fields)
+	m["type"] = "decision"
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return w.writeMsg(websocket.MessageText, b)
 }
 
 func (w *writer) write(b []byte) error {

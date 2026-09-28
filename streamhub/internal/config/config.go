@@ -138,17 +138,34 @@ func Load(path string) (*Config, error) {
 	return Parse(raw)
 }
 
+// expandEnv replaces ${VAR} in all string values (not keys or comments).
+func expandEnv(n *yaml.Node, missing *[]string) {
+	if n.Kind == yaml.ScalarNode && n.Tag == "!!str" {
+		n.Value = envRef.ReplaceAllStringFunc(n.Value, func(ref string) string {
+			name := envRef.FindStringSubmatch(ref)[1]
+			v, ok := os.LookupEnv(name)
+			if !ok {
+				*missing = append(*missing, name)
+			}
+			return v
+		})
+	}
+	for i, c := range n.Content {
+		if n.Kind == yaml.MappingNode && i%2 == 0 {
+			continue // key
+		}
+		expandEnv(c, missing)
+	}
+}
+
 // Parse parses and validates config file contents.
 func Parse(raw []byte) (*Config, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
 	var missing []string
-	expanded := envRef.ReplaceAllStringFunc(string(raw), func(ref string) string {
-		name := envRef.FindStringSubmatch(ref)[1]
-		v, ok := os.LookupEnv(name)
-		if !ok {
-			missing = append(missing, name)
-		}
-		return v
-	})
+	expandEnv(&doc, &missing)
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("config references unset environment variables: %s", strings.Join(missing, ", "))
 	}
@@ -171,8 +188,10 @@ func Parse(raw []byte) (*Config, error) {
 			Interval:          Duration(10 * time.Minute),
 		},
 	}
-	if err := yaml.Unmarshal([]byte(expanded), &c); err != nil {
-		return nil, err
+	if doc.Kind != 0 { // empty file: defaults only
+		if err := doc.Decode(&c); err != nil {
+			return nil, err
+		}
 	}
 	if c.Streamhub.Recordings.CachedirTag == nil {
 		t := true

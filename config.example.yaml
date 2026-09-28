@@ -48,3 +48,53 @@ pruner:
   max_size: 50GB
   interval: 10m
   dry_run: false
+
+decider:
+  # While the old feeder services still drive the feeders, keep this on: the
+  # decider then decides and journals but never calls the feeder API.
+  dry_run: true
+  # Default: <data_dir>/feed_journal/journal.db. When taking over from the old
+  # feeder services, point this at their journal (data/feed_journal/journal.db
+  # of the old checkout): scheduled feeding checks it for slots already fed
+  # today — with an empty journal it would feed the latest missed slots again.
+  # journal_db: /data/feed_journal/journal.db
+  feeders:
+    - id: feeder1
+      camera: grey
+      api_base_url: https://feeder.khvoinitsky.org
+      serial_number: AF06003100024B622027DC
+      allowed_cats: [chuzh, ellie]
+      # Previous detector setting (detector_unknown_conf): below this the top
+      # identity counts as "unknown".
+      unknown_conf: 0.5
+      # Other tuning keeps the old feeder defaults: door_close_timeout_sec 30,
+      # min_meal_sec 10, presence_window_sec 5, classifier_min_conf 0.9,
+      # open_debounce_sec 3, multi_debounce_sec 2, stream_blip_grace_sec 25,
+      # action_polygon: whole frame. See decider/decider/config.py.
+      # Opt-in short status code on the feeder display (see decider/display.py).
+      status_display: false
+      feed: {mode: none}
+    - id: feeder2
+      camera: beige
+      api_base_url: https://feeder.khvoinitsky.org
+      serial_number: AF06003100027DFB110L5V
+      allowed_cats: [alisa]
+      unknown_conf: 0.8
+      feed:
+        mode: scheduled
+        grain_num: 1
+        times: ["07:00", "14:00", "18:00", "21:00", "02:00"]
+        tz: America/Chicago
+        catchup_max: 2
+    - id: feeder3
+      camera: black
+      api_base_url: https://feeder.khvoinitsky.org
+      serial_number: AF060103031EA0DA037F
+      allowed_cats: [felisis, unknown]  # TEMP: felisis unrecognisable after haircut; remove once retrained
+      unknown_conf: 0.8
+      feed:
+        mode: scheduled
+        grain_num: 1
+        times: ["07:00", "14:00", "18:00", "21:00", "02:00"]
+        tz: America/Chicago
+        catchup_max: 2

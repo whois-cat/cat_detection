@@ -77,7 +77,7 @@ func TestLiveStream(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
-		Serve(conn.CloseRead(r.Context()), conn, "grey", stream, labels.NewBus(), log)
+		Serve(conn.CloseRead(r.Context()), conn, "grey", stream, labels.NewChannels(), log)
 	}))
 	defer srv.Close()
 
@@ -138,8 +138,8 @@ func TestLabelsHoldFrames(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	aus := loadAUs(t)
 	stream := media.NewStream()
-	bus := labels.NewBus()
-	detach := bus.Attach("grey")
+	ch := labels.NewChannels()
+	detach := ch.CV.Attach("grey")
 	defer detach()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
@@ -147,7 +147,7 @@ func TestLabelsHoldFrames(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
-		Serve(conn.CloseRead(r.Context()), conn, "grey", stream, bus, log)
+		Serve(conn.CloseRead(r.Context()), conn, "grey", stream, ch, log)
 	}))
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -211,8 +211,13 @@ func TestLabelsHoldFrames(t *testing.T) {
 
 	// A result for frame 2 releases frames 0..2; frame 2 goes out once its
 	// successor (3) is released, so expect init + frames 0, 1 after the label.
-	bus.Publish(labels.Result{Camera: "grey", PTS: base + 2*6000, Dets: []labels.Det{{Score: 0.9}}})
-	bus.Publish(labels.Result{Camera: "beige", PTS: base}) // other camera: not sent
+	ch.PublishDecision(labels.Decision{Camera: "grey", PTS: base, Fields: map[string]any{"camera": "grey", "pts": base, "feeder": "f1", "state": "arming"}})
+	ch.Results.Publish(labels.Result{Camera: "grey", PTS: base + 2*6000, Dets: []labels.Det{{Score: 0.9}}})
+	ch.Results.Publish(labels.Result{Camera: "beige", PTS: base}) // other camera: not sent
+	// Decisions don't hold frames and go out right away.
+	if m := next(); m.typ != websocket.MessageText || !strings.Contains(string(m.b), `"type":"decision"`) {
+		t.Fatalf("want decision, got %v %q", m.typ, m.b)
+	}
 	if m := next(); m.typ != websocket.MessageText || !strings.Contains(string(m.b), `"type":"labels"`) {
 		t.Fatalf("want labels first, got %v %q", m.typ, m.b)
 	}
@@ -230,5 +235,33 @@ func TestLabelsHoldFrames(t *testing.T) {
 	}
 	if waited := time.Since(start); waited < maxHold-500*time.Millisecond {
 		t.Errorf("unlabeled frames released after %v, want ~%v", waited, maxHold)
+	}
+}
+
+func TestNewViewerGetsLatestDecision(t *testing.T) {
+	ch := labels.NewChannels()
+	for _, st := range []string{"arming", "open"} { // only the latest per feeder is replayed
+		ch.PublishDecision(labels.Decision{Camera: "grey", PTS: 1, Fields: map[string]any{"feeder": "f1", "state": st}})
+	}
+	ch.PublishDecision(labels.Decision{Camera: "beige", PTS: 1, Fields: map[string]any{"feeder": "f2", "state": "open"}})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		Serve(conn.CloseRead(r.Context()), conn, "grey", media.NewStream(), ch, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	_, b, err := conn.Read(ctx)
+	if err != nil || !strings.Contains(string(b), `"state":"open"`) || !strings.Contains(string(b), `"feeder":"f1"`) {
+		t.Fatalf("first message %q, %v", b, err)
 	}
 }

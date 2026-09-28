@@ -34,7 +34,7 @@ test('range lookup', () => {
   assert.equal(nextRangeStart(rs, 45), null);
 });
 
-import { LabelStore, topCat, parseSidecar } from './labels.js';
+import { LabelStore, DecisionStore, topCat, parseSidecar, describeDecision } from './labels.js';
 
 test('label store lookup', () => {
   const s = new LabelStore();
@@ -53,7 +53,20 @@ test('topCat', () => {
   assert.equal(topCat({}), 'cat');
 });
 
-test('parseSidecar skips other types and partial lines', () => {
-  const r = parseSidecar('{"t":"cv","pts":1,"dets":[]}\n{"t":"decision"}\n{"t":"cv","pt');
-  assert.deepEqual(r, [{ t: 'cv', pts: 1, dets: [] }]);
+test('parseSidecar splits results and decisions, skips partial lines', () => {
+  const r = parseSidecar('{"t":"cv","pts":1,"dets":[]}\n{"t":"decision","pts":2}\n{"t":"other"}\n{"t":"cv","pt');
+  assert.deepEqual(r.results, [{ t: 'cv', pts: 1, dets: [] }]);
+  assert.deepEqual(r.decisions, [{ t: 'decision', pts: 2 }]);
+});
+
+test('decision store and description', () => {
+  const s = new DecisionStore();
+  s.add({ feeder: 'f2', pts: 90 * 100, state: 'closed', action: 'close', reason: 'no_cat' });
+  s.add({ feeder: 'f1', pts: 90 * 200, state: 'open', action: 'open', reason: 'chuzh', identity: 'chuzh', conf: 0.97 });
+  assert.deepEqual(s.at(150).map(d => d.feeder), ['f2']);
+  const now = s.at(300);
+  assert.equal(now.length, 2);
+  assert.equal(describeDecision(now[0]), 'f1: open · chuzh 97%');
+  assert.equal(describeDecision({ feeder: 'f3', state: 'closed', action: 'close', reason: 'not_allowed:alisa', identity: 'alisa', conf: 0.9, display: 'CA9N' }),
+    'f3: closed · alisa 90% · not_allowed:alisa · [CA9N]');
 });

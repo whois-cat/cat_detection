@@ -80,7 +80,7 @@ func run(configPath string, log *slog.Logger) error {
 	if err := summary.Sync(); err != nil {
 		return err
 	}
-	bus := labels.NewBus()
+	ch := labels.NewChannels()
 	sidecars := sidecar.NewWriter(root, summary, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -117,8 +117,9 @@ func run(configPath string, log *slog.Logger) error {
 	rescan := time.Duration(cfg.Streamhub.Recordings.Rescan)
 	wg.Go(func() { idx.RescanEvery(ctx, rescan) })
 	wg.Go(func() { summary.SyncEvery(ctx, rescan) })
-	results := bus.Subscribe(1024)
-	wg.Go(func() { sidecars.Run(ctx, results) })
+	results := ch.Results.Subscribe(1024)
+	decisions := ch.Decisions.Subscribe(1024)
+	wg.Go(func() { sidecars.Run(ctx, results, decisions) })
 
 	cvConfig := map[string]map[string]any{}
 	for _, cam := range cfg.Cameras {
@@ -128,7 +129,7 @@ func run(configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	hubSrv := &hub.Server{Streams: streams, Config: cvConfig, Bus: bus, Log: log}
+	hubSrv := &hub.Server{Streams: streams, Config: cvConfig, Ch: ch, Log: log}
 	wg.Go(func() {
 		if err := hubSrv.Serve(ctx, hubLn); err != nil {
 			fatal <- fmt.Errorf("hub: %w", err)
@@ -139,7 +140,7 @@ func run(configPath string, log *slog.Logger) error {
 	srv := &http.Server{
 		Addr: cfg.Streamhub.Listen,
 		Handler: (&api.Server{
-			Cameras: cfg.Cameras, Sources: sources, Streams: streams, Bus: bus, Summary: summary, Index: idx, Root: root,
+			Cameras: cfg.Cameras, Sources: sources, Streams: streams, Ch: ch, Summary: summary, Index: idx, Root: root,
 			WebUIDir: cfg.Streamhub.WebUIDir, Log: log,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,

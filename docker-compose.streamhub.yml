@@ -56,3 +56,22 @@ services:
     volumes:
       - ./config.yaml:/config.yaml:ro
       - ./data/streamhub:/data
+
+  # Feeding decisions: drives the feeders (config.yaml: decider).
+  decider:
+    build:
+      context: .
+      dockerfile: decider/Dockerfile
+    restart: unless-stopped
+    depends_on: [streamhub]
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      STREAMHUB_HUB: streamhub:9000
+      # Scheduled feeding times are local to feed.tz; logs use this.
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - ./data/streamhub:/data
+    env_file:
+      - path: ./secrets/streamhub.env
+        required: false

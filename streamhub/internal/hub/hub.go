@@ -1,16 +1,26 @@
-// Package hub serves the internal protocol for non-browser clients (CV
-// workers now, the decider later).
+// Package hub serves the internal protocol for non-browser clients: CV
+// workers and the decider.
 //
 // Transport: TCP; each message is a 4-byte big-endian length followed by a
 // msgpack map with a "type" key. Clients connect and send "hello" first:
 //
-//	C→H hello   {role: "cv", id, cameras: ["*"] | [ids], model: {name, version}}
-//	H→C stream  {camera, sps, pps, width, height, config} — before the first
-//	            frame of a camera and whenever its parameter sets change
-//	H→C frame   {camera, pts, key, data} — every frame (Annex-B), starting at
-//	            a keyframe; after dropped frames it resumes at the next keyframe
-//	C→H result  {camera, pts, infer_ms, dets: [{box, score, cats, emb?}]}
-//	both ping   {} — liveness, every pingEvery
+//	C→H hello    {role: "cv" | "decider", id, cameras: ["*"] | [ids],
+//	             model: {name, version} (cv only)}
+//	both ping    {} — liveness, every pingEvery
+//
+// role "cv":
+//
+//	H→C stream   {camera, sps, pps, width, height, config} — before the first
+//	             frame of a camera and whenever its parameter sets change
+//	H→C frame    {camera, pts, key, data} — every frame (Annex-B), starting at
+//	             a keyframe; after dropped frames it resumes at the next keyframe
+//	C→H result   {camera, pts, infer_ms, dets: [{box, score, cats, emb?}]}
+//
+// role "decider":
+//
+//	H→C result   {camera, pts, model, worker, infer_ms, dets} — CV results of
+//	             its cameras as they arrive
+//	C→H decision {camera, pts, …} — stored next to the video and shown live
 package hub
 
 import (
@@ -50,7 +60,7 @@ type Server struct {
 	Streams map[string]*media.Stream
 	// Config is passed to CV workers per camera (rotation, detection area, …).
 	Config map[string]map[string]any
-	Bus    *labels.Bus
+	Ch     *labels.Channels
 	Log    *slog.Logger
 }
 
@@ -76,6 +86,16 @@ type streamMsg struct {
 	Width  int            `msgpack:"width"`
 	Height int            `msgpack:"height"`
 	Config map[string]any `msgpack:"config"`
+}
+
+type resultMsg struct {
+	Type    string       `msgpack:"type"`
+	Camera  string       `msgpack:"camera"`
+	PTS     int64        `msgpack:"pts"`
+	Model   string       `msgpack:"model"`
+	Worker  string       `msgpack:"worker"`
+	InferMs float64      `msgpack:"infer_ms"`
+	Dets    []labels.Det `msgpack:"dets"`
 }
 
 type frameMsg struct {
@@ -124,7 +144,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	if err == nil {
 		err = msgpack.Unmarshal(body, &hello)
 	}
-	if err == nil && hello.Role != "cv" {
+	if err == nil && hello.Role != "cv" && hello.Role != "decider" {
 		err = fmt.Errorf("unsupported role %q", hello.Role)
 	}
 	cameras, cerr := s.resolveCameras(hello.Cameras)
@@ -136,16 +156,23 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	if hello.Model.Version != "" {
 		model += "@" + hello.Model.Version
 	}
-	c.log = c.log.With("id", hello.ID, "model", model)
-	c.log.Info("cv worker connected", "cameras", cameras)
-	defer c.log.Info("cv worker disconnected")
+	c.log = c.log.With("role", hello.Role, "id", hello.ID)
+	if hello.Role == "cv" {
+		c.log = c.log.With("model", model)
+	}
+	c.log.Info("hub client connected", "cameras", cameras)
+	defer c.log.Info("hub client disconnected")
 
 	go c.writeLoop(ctx, cancel)
 	go c.pingLoop(ctx)
-	for _, cam := range cameras {
-		detach := s.Bus.Attach(cam)
-		defer detach()
-		go s.forward(ctx, c, cam)
+	if hello.Role == "cv" {
+		for _, cam := range cameras {
+			detach := s.Ch.CV.Attach(cam)
+			defer detach()
+			go s.forward(ctx, c, cam)
+		}
+	} else {
+		go s.forwardResults(ctx, c, cameras)
 	}
 
 	for {
@@ -157,8 +184,8 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
-		switch typ {
-		case "result":
+		switch {
+		case typ == "result" && hello.Role == "cv":
 			var r labels.Result
 			if err := msgpack.Unmarshal(body, &r); err != nil {
 				c.log.Warn("bad result", "err", err)
@@ -169,12 +196,81 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 				continue
 			}
 			r.Model, r.Worker = model, hello.ID
-			s.Bus.Publish(r)
-		case "ping":
+			s.Ch.Results.Publish(r)
+		case typ == "decision" && hello.Role == "decider":
+			d, err := decodeDecision(body)
+			if err != nil {
+				c.log.Warn("bad decision", "err", err)
+				continue
+			}
+			if !slices.Contains(cameras, d.Camera) {
+				c.log.Warn("decision for a camera this decider doesn't serve", "camera", d.Camera)
+				continue
+			}
+			d.Fields["decider"] = hello.ID
+			s.Ch.PublishDecision(d)
+		case typ == "ping":
 		default:
 			c.log.Debug("ignoring message", "type", typ)
 		}
 	}
+}
+
+// forwardResults sends the CV results of cameras to a decider.
+func (s *Server) forwardResults(ctx context.Context, c *client, cameras []string) {
+	results := s.Ch.Results.Subscribe(1024)
+	defer s.Ch.Results.Unsubscribe(results)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case r := <-results:
+			if !slices.Contains(cameras, r.Camera) {
+				continue
+			}
+			if !c.send(ctx, resultMsg{Type: "result", Camera: r.Camera, PTS: r.PTS, Model: r.Model,
+				Worker: r.Worker, InferMs: r.InferMs, Dets: r.Dets}) {
+				return
+			}
+		}
+	}
+}
+
+func decodeDecision(body []byte) (labels.Decision, error) {
+	var m map[string]any
+	if err := msgpack.Unmarshal(body, &m); err != nil {
+		return labels.Decision{}, err
+	}
+	camera, _ := m["camera"].(string)
+	pts, ok := toInt64(m["pts"])
+	if camera == "" || !ok {
+		return labels.Decision{}, errors.New("decision needs camera and pts")
+	}
+	delete(m, "type")
+	m["pts"] = pts
+	return labels.Decision{Camera: camera, PTS: pts, Fields: m}, nil
+}
+
+func toInt64(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int8:
+		return int64(x), true
+	case int16:
+		return int64(x), true
+	case int32:
+		return int64(x), true
+	case int64:
+		return x, true
+	case uint8:
+		return int64(x), true
+	case uint16:
+		return int64(x), true
+	case uint32:
+		return int64(x), true
+	case uint64:
+		return int64(x), true
+	}
+	return 0, false
 }
 
 func (s *Server) resolveCameras(req []string) ([]string, error) {
