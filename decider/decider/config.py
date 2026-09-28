@@ -52,6 +52,10 @@ class FeederConfig:
     # Box centres must be inside (camera-frame fractions) to count.
     action_polygon: list[list[float]] = field(default_factory=lambda: [p[:] for p in FULL_FRAME])
     dangerous_confusions: list[dict[str, str]] = field(default_factory=list)
+    # Open when any allowed identity got votes in the presence window, even if
+    # another cat won the vote; all allowed identities then count as one (so
+    # alternating between them neither delays opening nor closes the door).
+    open_if_any_allowed: bool = False
     # Show a short live status ("<cat letter> <C/O>") on the feeder display
     # instead of only the cat name on open (see display.py).
     status_display: bool = False

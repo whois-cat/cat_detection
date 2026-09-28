@@ -241,3 +241,29 @@ def test_confident_other_cat_does_not_open_unknown_feeder(tmp_path):
     feed_frames(f, clock, 6, [{"box": [0.4, 0.4, 0.2, 0.2], "score": 0.9,
                                "cats": {"felisis": 0.5, "alisa": 0.3, "chuzh": 0.1, "ellie": 0.1}}])
     assert doors(client) == [("open", "unknown")]
+
+
+def test_open_if_any_allowed(tmp_path):
+    """feeder3 crutch: felisis/unknown seen at all opens, even when alisa wins
+    the vote, and alternating identities neither delay opening nor close it."""
+    clock = Clock()
+    cfg = FeederConfig(id="feeder3", camera="grey", api_base_url="http://x", serial_number="S",
+                       allowed_cats=["felisis", "unknown"], unknown_conf=0.8, open_if_any_allowed=True)
+    client, decisions = FakeClient(), []
+    f = Feeder(cfg, client, FeedJournal(tmp_path / "j.db"), decisions.append, monotonic=clock, wall=clock)
+    f.start()
+    unsure = {"box": [0.4, 0.4, 0.2, 0.2], "score": 0.9,
+              "cats": {"felisis": 0.5, "alisa": 0.3, "chuzh": 0.1, "ellie": 0.1}}
+    # Mostly a confident alisa, sometimes felisis, sometimes unsure.
+    for i in range(30):
+        feed_frames(f, clock, 0.2, [[cat("alisa", 0.95), cat("felisis", 0.95), unsure][i % 3]])
+    assert doors(client) == [("open", "felisis|unknown")]
+    for i in range(60):
+        feed_frames(f, clock, 0.2, [[cat("alisa", 0.95), cat("felisis", 0.95), unsure][i % 3]])
+    assert doors(client) == [("open", "felisis|unknown")]  # never closed in between
+    # Only alisa: stays closed once her visit starts fresh (after the 30 s close timeout).
+    feed_frames(f, clock, 35, [])
+    assert doors(client)[-1] == ("close", "no_cat")
+    feed_frames(f, clock, 6, [cat("alisa", 0.95)])
+    assert doors(client)[-1] == ("close", "no_cat")
+    assert decisions[-1]["reason"] == "not_allowed:alisa"

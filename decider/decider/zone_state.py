@@ -16,7 +16,7 @@ Usage:
 from __future__ import annotations
 
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 UNKNOWN = "unknown"
 
@@ -37,6 +37,10 @@ class ZoneSummary:
     # TODO: when the detector emits top-k per box, populate this so decide()'s
     # min_margin gate activates — do NOT synthesise it from window votes.
     margin: float | None = None
+    # All identities voted for in the window: weighted vote and mean score
+    # (None when scoreless). identity is the winner among them.
+    votes: dict[str, float] = field(default_factory=dict)
+    vote_scores: dict[str, float | None] = field(default_factory=dict)
 
 
 class ZoneState:
@@ -168,4 +172,6 @@ class ZoneState:
             meal_sec=meal_sec,
             identity_score=identity_score,
             margin=None,   # top-2 not available in the event stream (see ZoneSummary)
+            votes=votes,
+            vote_scores={c: (score_sum[c] / score_cnt[c] if score_cnt.get(c) else None) for c in votes},
         )

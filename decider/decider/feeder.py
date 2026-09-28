@@ -13,6 +13,7 @@ web UI) whenever the decision state changes or the door is commanded.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import logging
@@ -53,6 +54,21 @@ def point_in_polygon(x: float, y: float, poly: list[list[float]]) -> bool:
             inside = not inside
         j = i
     return inside
+
+
+def prefer_allowed(snap: ZoneSummary, allowed: list[str]) -> ZoneSummary:
+    """If any allowed identity got votes, report the allowed group as the
+    identity (see FeederConfig.open_if_any_allowed); else leave snap as is."""
+    voted = [c for c in allowed if snap.votes.get(c)]
+    if not voted:
+        return snap
+    scores = [s for c in voted if (s := snap.vote_scores.get(c)) is not None]
+    return dataclasses.replace(snap, identity=allowed_group(allowed),
+                               identity_score=max(scores) if scores else None)
+
+
+def allowed_group(allowed: list[str]) -> str:
+    return "|".join(allowed)
 
 
 def observations(result: dict[str, Any], unknown_conf: float, polygon: list[list[float]]) -> list[Observation]:
@@ -107,6 +123,8 @@ class Feeder:
             unknown_votes=UNKNOWN in cfg.allowed_cats,
             allowed=cfg.allowed_cats,
         )
+        # With open_if_any_allowed the allowed identities act as one group.
+        self.allowed = cfg.allowed_cats + ([allowed_group(cfg.allowed_cats)] if cfg.open_if_any_allowed else [])
         self.fsm = DoorFSM(open_debounce_sec=cfg.open_debounce_sec, multi_debounce_sec=cfg.multi_debounce_sec)
         # Show the open-cat name ONCE on open with a long interval covering the
         # meal (per-event re-pushing flooded the display bridge).
@@ -180,8 +198,10 @@ class Feeder:
 
     def _step(self, wall_t: float, pts: int) -> None:
         snap = self.zone.snapshot(wall_t)
+        if self.cfg.open_if_any_allowed:
+            snap = prefer_allowed(snap, self.cfg.allowed_cats)
         action, reason = decide(
-            snap, self.cfg.allowed_cats, self.dangerous,
+            snap, self.allowed, self.dangerous,
             min_confidence=self.cfg.open_min_confidence, min_margin=self.cfg.open_min_margin,
         )
         ctx = self._context(snap, action, reason)
