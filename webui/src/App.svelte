@@ -45,7 +45,7 @@
           fetch(`/api/detections/${id}?${q}&bucket=${bucket}`).then(r => r.json()),
         ]);
         cams.ranges[c.id] = ranges;
-        cams.events[c.id] = dets.map(([wall_ms, cat, n]) => ({ wall_ms, cat, n }));
+        cams.events[c.id] = dets.map(([wall_ms, cat, n]) => ({ wall_ms, cat, n, dur: bucket }));
       } catch { /* keep last known */ }
     }));
   }

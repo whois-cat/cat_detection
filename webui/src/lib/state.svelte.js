@@ -5,7 +5,7 @@ export const cams = $state({
   list: [],      // [{id, label}]
   status: {},    // id -> ingest status from /api/status
   ranges: {},    // id -> [[startMs, endMs], ...] recorded spans
-  events: {},    // id -> [{wall_ms, cat, n}] detection counts
+  events: {},    // id -> [{wall_ms, cat, n, dur}] detection counts per dur-ms bucket
 });
 
 export const view = $state({

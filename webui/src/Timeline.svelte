@@ -5,7 +5,8 @@
   // Props:
   //   label:  camera name shown at the left
   //   ranges: [[startMs, endMs], ...] recorded spans
-  //   events: [{wall_ms, cat, n}] detection counts (density bars, per-cat colours)
+  //   events: [{wall_ms, cat, n, dur}] detection counts over [wall_ms, wall_ms + dur)
+  //           (density bars, per-cat colours)
   import { onMount, onDestroy } from 'svelte';
   import { view, play, clock, seek, cancelAnimation, writeHash, ZOOM_MIN_MS, ZOOM_MAX_MS } from './lib/state.svelte.js';
   import { DAY_MS, fmtDate, fmtTimeOfDay, fmtDateTime, fmtDuration, isLocalMidnight } from './lib/time.js';
@@ -128,7 +129,11 @@
       const startIdx = lowerBound(eventsSorted, view.from);
       const endIdx = lowerBound(eventsSorted, view.to);
       const msPerPx = (view.to - view.from) / width;
-      const bucketMs = Math.max(1, Math.round(msPerPx));
+      // One bar per pixel, but never narrower than the counts' own buckets
+      // (else a steady presence would draw as a comb of thin bars).
+      let evDur = 1;
+      for (let i = startIdx; i < endIdx; i++) evDur = Math.max(evDur, eventsSorted[i].dur ?? 1);
+      const bucketMs = Math.max(evDur, Math.round(msPerPx));
       const alignedFloor = Math.floor(view.from / bucketMs) * bucketMs;
       const numBuckets = Math.ceil((view.to - alignedFloor) / bucketMs) + 1;
       const present = new Set();
