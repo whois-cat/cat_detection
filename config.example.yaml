@@ -53,10 +53,12 @@ decider:
   # While the old feeder services still drive the feeders, keep this on: the
   # decider then decides and journals but never calls the feeder API.
   dry_run: true
-  # Default: <data_dir>/feed_journal/journal.db. When taking over from the old
-  # feeder services, point this at their journal (data/feed_journal/journal.db
-  # of the old checkout): scheduled feeding checks it for slots already fed
-  # today — with an empty journal it would feed the latest missed slots again.
+  # Default: <data_dir>/feed_journal/journal.db (journal.dry-run.db while
+  # dry_run, so pretend feeds never reach the real journal). When taking over
+  # from the old feeder services, stop them and copy their journal
+  # (data/feed_journal/journal.db + -wal) to data/streamhub/feed_journal/:
+  # scheduled feeding checks it for slots already fed today — with an empty
+  # journal it would feed the latest missed slots again.
   # journal_db: /data/feed_journal/journal.db
   feeders:
     - id: feeder1

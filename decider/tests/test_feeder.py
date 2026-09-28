@@ -181,7 +181,8 @@ def test_config(monkeypatch):
     monkeypatch.setenv("SERIAL", "AF0")
     c = parse(CONFIG)
     assert not c.dry_run
-    assert parse(CONFIG.replace("decider:\n", "decider:\n  dry_run: true\n")).dry_run
+    dry = parse(CONFIG.replace("decider:\n", "decider:\n  dry_run: true\n"))
+    assert dry.dry_run and dry.journal_db == "/data/feed_journal/journal.dry-run.db"
     f = c.feeders[0]
     assert (c.hub, c.journal_db) == ("127.0.0.1:9001", "/data/feed_journal/journal.db")
     assert f.serial_number == "AF0" and f.unknown_conf == 0.8 and f.door_close_timeout_sec == 30

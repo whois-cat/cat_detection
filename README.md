@@ -69,9 +69,16 @@ Everything below is outside git; copy it from the old checkout.
 | `cameras.yaml` | → `config.yaml` + `secrets/streamhub.env` | camera URLs/credentials, feeder ids and serials (already transcribed in `config.example.yaml`) |
 | `models/classifier/` (incl. symlinks) | same path | the deployed classifier |
 | `models/trained/` | same path | trained checkpoints (re-exportable, needed for promote) |
-| `data/feed_journal/journal.db` (+ `-wal`, `-shm`) | `data/streamhub/feed_journal/` | **required before `dry_run: false`**: scheduled feeding checks it for slots already fed today — with an empty journal it would feed the latest missed slots again. Copy with the old feeders stopped. |
+| `data/feed_journal/journal.db` (+ `-wal`) | `data/streamhub/feed_journal/` | **at switchover, right before `dry_run: false`**, with the old feeders stopped: scheduled feeding checks it for slots already fed today — with an empty journal it would feed the latest missed slots again. (A dry run uses `journal.dry-run.db`.) Containers run as UID 1000: `chown` it. |
 | `data/review/`, `reviews.db` (repo root) | same paths | human labels; the root `reviews.db` holds more reviews than `data/review/reviews.db` |
 | `data/events/`, `data/recordings/`, `data/replay/`, `data/mlflow/` | same paths | training data and history, if you still train on them |
 
-Not needed: `.env` (old pruner knobs), `secrets/cameras.env`,
-`docker-compose.cameras*.yml`, `mediamtx/`, `data/cooldowns/`.
+Not needed: `.env` (old pruner knobs; start from `.env.example`),
+`secrets/cameras.env`, `cameras.yaml` (once `config.yaml` exists),
+`docker-compose.cameras*.yml`, `mediamtx/`, `data/cooldowns/`, any `.venv/`,
+`webui/node_modules/`, `webui/dist/`.
+
+Running next to the old stack: give it its own compose project (a different
+directory name, or `COMPOSE_PROJECT_NAME` in `.env`) — the old stack also has
+`pruner` and `mlflow` services — and a free `MLFLOW_PORT`. Each camera allows
+two RTSP sessions, one per stack.
