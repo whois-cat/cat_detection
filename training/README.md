@@ -16,12 +16,12 @@ detection) or a classifier (per-cat identity).
 
 ## What "internal public API" means here
 
-The live2 system has two surfaces:
+The system has two surfaces:
 
 | Consumer | Video | Labels |
 |---|---|---|
-| **Browser / UI** (live, interactive) | mediamtx WebRTC + playback HTTP (chunked fMP4) | detector `GET /events` |
-| **Training / batch extraction** (this package) | recording files on disk | SQLite directly |
+| **Browser / UI** (live, interactive) | streamhub WebSocket (live fMP4) + segment files | live WebSocket messages / `.labels.jsonl` sidecars |
+| **Training / batch extraction** (this package) | recording files on disk | SQLite directly (the previous stack's `events.db`, for now) |
 
 The browser surfaces are streaming-shaped and not suitable for batch
 random access. The training surfaces are the **on-disk files and the
