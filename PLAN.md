@@ -10,6 +10,17 @@ is dropped (needed the old detector's bowl monitor); per-feeder
 Start fresh — no backward compatibility with existing recordings, `events.db`,
 or services (training still reads them until it is adapted).
 
+## Temporary workarounds (felisis after the haircut)
+
+Remove once the identity classifier is retrained (and YOLO checked):
+
+| Where | What | Why |
+|---|---|---|
+| config.yaml feeder3 | `allowed_cats: [felisis, unknown]` | classifier doesn't recognise felisis |
+| config.yaml feeder3 | `open_if_any_allowed: true` | felisis also shows up as alisa |
+| config.yaml feeder3 | `door_close_timeout_sec: 60` | YOLO often misses felisis |
+| config.yaml camera black | `cv.yolo_conf: 0.05` | diagnosis: does YOLO see felisis at low scores? Set to just below her scores, or back to default |
+
 ## 1. Components
 
 ```mermaid
