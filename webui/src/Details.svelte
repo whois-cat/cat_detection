@@ -62,9 +62,9 @@
         <div><b>{d.feeder}</b> · {d.state} · door {d.door}{#if d.display} · display <b>{d.display}</b>{/if}</div>
         <div class="dim">
           {d.present ? 'cat present' : 'no cat'}{#if d.n_cats > 1} · {d.n_cats} cats{/if}
-          {#if d.identity} · {d.identity}{#if d.conf != null} {pct(d.conf)}{/if}{/if}
+          {#if d.identity} · {d.identity}{#if d.conf != null}{' '}{pct(d.conf)}{/if}{/if}
         </div>
-        <div class="dim">{d.action === 'open' ? 'wants open' : `stays closed: ${d.reason}`}{#if d.event} · {d.event}{/if}</div>
+        <div class="dim">{d.action === 'open' ? 'wants open' : `stays closed: ${d.reason}`}{#if d.event}{` · ${d.event}`}{/if}</div>
       </div>
     {/each}
   </section>
