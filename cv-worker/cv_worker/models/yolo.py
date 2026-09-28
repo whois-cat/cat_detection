@@ -37,10 +37,12 @@ class YoloModel:
             self._classifier = CatClassifier(classifier_dir)
             self.name, self.version = f"{stem}+cat", self._classifier.version
 
-    def infer(self, img_bgr: np.ndarray) -> list[Det]:
+    def infer(self, img_bgr: np.ndarray, config: dict | None = None) -> list[Det]:
         h, w = img_bgr.shape[:2]
+        # Per-camera detection threshold (cv.yolo_conf), else the worker's.
+        conf = float((config or {}).get("yolo_conf", self.conf))
         boxes = []
-        for r in self._yolo(img_bgr, classes=[COCO_CAT], conf=self.conf, verbose=False):
+        for r in self._yolo(img_bgr, classes=[COCO_CAT], conf=conf, verbose=False):
             for b in r.boxes:
                 x1, y1, x2, y2 = (int(v) for v in b.xyxy[0].cpu().numpy())
                 x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)

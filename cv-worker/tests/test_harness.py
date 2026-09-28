@@ -30,9 +30,11 @@ class SlowModel:
 
     def __init__(self):
         self.shapes = []
+        self.configs = []
 
-    def infer(self, img):
+    def infer(self, img, config):
         self.shapes.append(img.shape)
+        self.configs.append(config)
         time.sleep(0.05)  # slower than frames arrive
         return [Det(box=(0, 0, 16, 32), score=0.9, cats={"a": 0.7, "b": 0.3})]
 
@@ -85,7 +87,7 @@ def run_session(model, frames_per_camera, cameras=("grey",), frame_gap=0.01, **h
 class FastModel:
     name, version = "stub", "1"
 
-    def infer(self, img):
+    def infer(self, img, config):
         return []
 
 
@@ -144,6 +146,7 @@ def test_session_drops_stale_frames_and_maps_boxes():
     assert len(pts) < 45 / 2, "stale frames were not dropped"
     assert pts[-1] == 1044, "newest frame was not inferred"
     assert model.shapes[0] == (64, 64, 3)
+    assert model.configs[0] == {"rotate_deg": 90}  # the camera's cv config reaches the model
     # Rotating clockwise moves the camera's bottom-left corner to the input's
     # top-left, so a 16x32 box there is x 0..0.5, y 0.75..1 of the camera frame.
     assert results[0]["dets"] == [{"box": [0.0, 0.75, 0.5, 0.25], "score": 0.9, "cats": {"a": 0.7, "b": 0.3}}]

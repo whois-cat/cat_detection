@@ -15,6 +15,7 @@ Usage:
 """
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 
 UNKNOWN = "unknown"
@@ -52,12 +53,19 @@ class ZoneState:
         door_close_timeout_sec: float,
         classifier_min_conf: float,
         unknown_votes: bool = False,
+        allowed: "Collection[str] | None" = None,
     ) -> None:
         self._win = window_sec
         # When True (a feeder lists "unknown" in allowed_cats), unconfident
         # frames — detector "unknown" or below classifier_min_conf — vote as
         # UNKNOWN instead of being dropped, so an unrecognised cat can win.
         self._unknown_votes = unknown_votes
+        # With unknown votes on, a frame below classifier_min_conf whose
+        # identity is still a named cat NOT in `allowed` (i.e. it was confident
+        # enough not to be labelled "unknown" upstream) votes for that cat
+        # instead: evidence of another cat must block an "unknown" admission,
+        # not feed it. None keeps the plain behaviour.
+        self._allowed = None if allowed is None else frozenset(allowed)
         self._timeout = door_close_timeout_sec
         self._min_conf = classifier_min_conf
         # wall_t → list of (cat, cat_score) for in_action detections at that frame
@@ -124,7 +132,8 @@ class ZoneState:
                 if cat == UNKNOWN or (score is not None and score < self._min_conf):
                     if not self._unknown_votes:
                         continue
-                    cat = UNKNOWN
+                    if cat == UNKNOWN or self._allowed is None or cat in self._allowed:
+                        cat = UNKNOWN
                 votes[cat] = votes.get(cat, 0.0) + (score if score is not None else 1.0)
                 if score is not None:
                     score_sum[cat] = score_sum.get(cat, 0.0) + score

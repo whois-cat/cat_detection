@@ -105,6 +105,7 @@ class Feeder:
             door_close_timeout_sec=cfg.door_close_timeout_sec,
             classifier_min_conf=cfg.classifier_min_conf,
             unknown_votes=UNKNOWN in cfg.allowed_cats,
+            allowed=cfg.allowed_cats,
         )
         self.fsm = DoorFSM(open_debounce_sec=cfg.open_debounce_sec, multi_debounce_sec=cfg.multi_debounce_sec)
         # Show the open-cat name ONCE on open with a long interval covering the

@@ -217,3 +217,22 @@ def test_example_config_is_valid(monkeypatch):
     c = parse((Path(__file__).parents[2] / "config.example.yaml").read_text())
     assert c.dry_run and [f.id for f in c.feeders] == ["feeder1", "feeder2", "feeder3"]
     assert c.feeders[2].allowed_cats == ["felisis", "unknown"] and c.feeders[1].feed.mode == "scheduled"
+
+
+def test_confident_other_cat_does_not_open_unknown_feeder(tmp_path):
+    """feeder3-like: allowed felisis + unknown. alisa at 87% (above unknown_conf
+    0.8, below classifier_min_conf 0.9) must keep the door shut."""
+    clock = Clock()
+    cfg = FeederConfig(id="feeder3", camera="grey", api_base_url="http://x", serial_number="S",
+                       allowed_cats=["felisis", "unknown"], unknown_conf=0.8)
+    client, decisions = FakeClient(), []
+    f = Feeder(cfg, client, FeedJournal(tmp_path / "j.db"), decisions.append, monotonic=clock, wall=clock)
+    f.start()
+    feed_frames(f, clock, 6, [cat("alisa", 0.87)])
+    assert doors(client) == []
+    assert decisions[-1]["reason"] == "not_allowed:alisa"
+    # A genuinely unsure cat is still admitted as unknown.
+    feed_frames(f, clock, 40, [])
+    feed_frames(f, clock, 6, [{"box": [0.4, 0.4, 0.2, 0.2], "score": 0.9,
+                               "cats": {"felisis": 0.5, "alisa": 0.3, "chuzh": 0.1, "ellie": 0.1}}])
+    assert doors(client) == [("open", "unknown")]

@@ -87,3 +87,22 @@ def test_confident_cat_beats_unknown_votes():
     z.update(0.0, "unknown", 0.4, True)
     z.update(1.0, "alisa", 0.9, True)
     assert z.snapshot(1.0).identity == "alisa"
+
+
+def test_other_cat_blocks_unknown_admission():
+    """A feeder allowing "unknown": a named, not-allowed cat below
+    classifier_min_conf (but not relabelled "unknown" upstream) votes for
+    itself, so it can't sneak in as "unknown"; unsure frames still vote unknown."""
+    def zone():
+        return ZoneState(window_sec=5, door_close_timeout_sec=30, classifier_min_conf=0.9,
+                         unknown_votes=True, allowed=["felisis", "unknown"])
+    z = zone()
+    for t in range(4):
+        z.update(float(t), "alisa", 0.87, True)
+    assert z.snapshot(3.0).identity == "alisa"
+
+    z = zone()
+    for t in range(4):
+        z.update(float(t), "unknown", 0.5, True)   # genuinely unsure
+    z.update(4.0, "felisis", 0.8, True)             # allowed cat below min_conf
+    assert z.snapshot(4.0).identity == "unknown"

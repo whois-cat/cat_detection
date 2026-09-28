@@ -16,7 +16,7 @@ class BlobModel:
         self.min_area = min_area
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    def infer(self, img_bgr: np.ndarray) -> list[Det]:
+    def infer(self, img_bgr: np.ndarray, config: dict | None = None) -> list[Det]:
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         _, mask = cv2.threshold(gray, self.threshold, 255, cv2.THRESH_BINARY)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)

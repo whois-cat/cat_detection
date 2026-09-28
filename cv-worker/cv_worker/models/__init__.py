@@ -20,7 +20,9 @@ class Model(Protocol):
     name: str
     version: str
 
-    def infer(self, img_bgr: np.ndarray) -> list[Det]: ...
+    # config: the camera's cv settings from config.yaml (model-specific keys,
+    # e.g. yolo_conf; geometry keys are already applied by the harness).
+    def infer(self, img_bgr: np.ndarray, config: dict) -> list[Det]: ...
 
 
 def build(kind: str) -> Model:

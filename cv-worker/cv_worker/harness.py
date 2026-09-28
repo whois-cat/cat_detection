@@ -132,7 +132,7 @@ class Harness:
         """Run the model on a camera frame; boxes as fractions of the frame."""
         inp, to_camera = prepare(img_bgr, config)
         out = []
-        for d in self.model.infer(np.ascontiguousarray(inp)):
+        for d in self.model.infer(np.ascontiguousarray(inp), config):
             det: dict[str, Any] = {"box": [round(v, 5) for v in to_camera(d.box)], "score": round(d.score, 4)}
             if d.cats:
                 det["cats"] = {k: round(v, 5) for k, v in d.cats.items()}

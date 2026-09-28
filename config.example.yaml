@@ -22,7 +22,9 @@ cameras:
     cv: {rotate_deg: 90}
   - id: black
     rtsp: "rtsp://camera:${CAM_BLACK_PASSWORD}@192.168.0.215:554/stream1"
-    cv: {rotate_deg: 90}
+    # TEMP yolo_conf 0.05 (worker default 0.25): diagnosing whether YOLO sees
+    # felisis after her haircut at low scores; raise again once known.
+    cv: {rotate_deg: 90, yolo_conf: 0.05}
 
 streamhub:
   listen: ":8090"
@@ -102,7 +104,8 @@ decider:
       api_base_url: https://feeder.khvoinitsky.org
       serial_number: AF060103031EA0DA037F
       allowed_cats: [felisis, unknown]  # TEMP: felisis unrecognisable after haircut; remove once retrained
-      door_close_timeout_sec: 10
+      # Long: YOLO often misses felisis since her haircut; don't close mid-meal.
+      door_close_timeout_sec: 60
       min_meal_sec: 15
       unknown_conf: 0.8
       feed:
