@@ -111,8 +111,11 @@ class Feeder:
         # Show the open-cat name ONCE on open with a long interval covering the
         # meal (per-event re-pushing flooded the display bridge).
         self.display_open_interval = max(cfg.display_text_interval, int(cfg.door_close_timeout_sec))
+        # The status stays on the display until the next (refresh) update, so
+        # hold each text longer than the refresh period.
+        status_hold = max(self.display_open_interval, int(cfg.display_refresh_min_sec) * 2)
         self.status = DisplayThrottle(
-            lambda text: client.set_display_text(text, self.display_open_interval),
+            lambda text: client.set_display_text(text, status_hold),
             refresh_sec=cfg.display_refresh_min_sec,
         ) if cfg.status_display else None
 
@@ -225,7 +228,7 @@ class Feeder:
 
         text = None
         if self.status is not None:
-            text = status_text(self.fsm.state, snap, action, reason)
+            text = status_text(self.fsm.state, self.fsm.door_cat, snap)
             self.status.set(text)
             if cmd.kind is None:
                 self.status.flush(self._monotonic())

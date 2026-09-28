@@ -78,6 +78,7 @@ export function goLive() {
   const span = view.to - view.from;
   const to = clock.now + span * 0.05;
   animateView(to - span, to);
+  writeHash();
 }
 
 export function seek(ms) {
@@ -88,12 +89,14 @@ export function seek(ms) {
   view.follow = false;
 }
 
-// ---- URL hash: #cam=…&from=…&to=…&t=… ----
+// ---- URL hash ----
+// #cam=…&span=… while following live (reload: live, same zoom);
+// #cam=…&from=…&to=…[&t=…] otherwise (t: history playhead).
 
 export function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
   const num = k => { const v = parseInt(p.get(k), 10); return Number.isNaN(v) ? null : v; };
-  return { cam: p.get('cam'), from: num('from'), to: num('to'), t: num('t') };
+  return { cam: p.get('cam'), from: num('from'), to: num('to'), span: num('span'), t: num('t') };
 }
 
 let hashTimer = 0;
@@ -102,8 +105,12 @@ export function writeHash() {
   hashTimer = setTimeout(() => {
     const p = new URLSearchParams();
     p.set('cam', encodeSelection(view.selected));
-    p.set('from', Math.round(view.from).toString());
-    p.set('to', Math.round(view.to).toString());
+    if (view.follow) {
+      p.set('span', Math.round(view.to - view.from).toString());
+    } else {
+      p.set('from', Math.round(view.from).toString());
+      p.set('to', Math.round(view.to).toString());
+    }
     if (!play.live) p.set('t', Math.round(play.playheadMs).toString());
     const next = '#' + p.toString();
     if (location.hash !== next) history.replaceState(null, '', next);

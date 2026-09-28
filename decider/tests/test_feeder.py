@@ -127,19 +127,24 @@ def test_status_display(tmp_path):
     f, client, clock, decisions = make(tmp_path, status_display=True)
     feed_frames(f, clock, 5, [cat("chuzh", 0.93)])
     texts = [c[1] for c in client.calls if c[0] == "display"]
-    assert texts[0].startswith("AC9") or texts[0].startswith("C")
-    assert texts[-1] == "OC9"
+    assert texts[0] in ("- C", "C C")   # idle, then chuzh recognised while arming
+    assert texts[-1] == "C O"           # door open for chuzh
     assert "chuzh" not in texts  # the status replaces the plain name
     assert len(texts) <= 6  # at most ~1/s over 5 s
-    assert decisions[-1]["display"] == "OC9"
+    assert decisions[-1]["display"] == "C O"
+    # Held longer than the 25 s refresh, so it never blanks in between.
+    assert all(c[2] >= 50 for c in client.calls if c[0] == "display")
 
 
 def test_status_text():
     s = ZoneSummary(n_cats=1, identity="alisa", present=True, meal_sec=0, identity_score=0.84)
-    assert status_text("closed", s, "close", "not_allowed:alisa") == "CA8N"
-    assert status_text("open", s, "open", "alisa") == "OA8"
-    assert status_text("closed", ZoneSummary(0, None, False, 0), "close", "no_cat") == "C-"
-    assert status_text("closed", ZoneSummary(2, "alisa", True, 0, 0.9), "close", "multi_cat") == "C29M"
+    assert status_text("closed", None, s) == "A C"
+    assert status_text("arming", None, s) == "A C"
+    assert status_text("open", "felisis", s) == "F O"       # the cat the door is open for
+    assert status_text("closing", "felisis", s) == "F O"    # still physically open
+    assert status_text("closed", None, ZoneSummary(0, None, False, 0)) == "- C"
+    assert status_text("closed", None, ZoneSummary(2, "alisa", True, 0, 0.9)) == "2 C"
+    assert status_text("closed", None, ZoneSummary(1, "unknown", True, 0, 0.5)) == "? C"
 
 
 def test_display_throttle():

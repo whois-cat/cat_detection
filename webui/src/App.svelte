@@ -17,6 +17,7 @@
   const STATUS_EVERY_MS = 2000;
   const RANGES_EVERY_MS = 10_000;
   const RATES = [0.5, 1, 2, 4, 8, 16];
+  const DEFAULT_SPAN_MS = 60 * 60_000;
 
   const shown = $derived(cams.list.filter(c => !view.selected || view.selected.includes(c.id)));
   const single = $derived(shown.length === 1);
@@ -140,8 +141,10 @@
       view.to = h.to;
       view.follow = false;
     } else {
-      view.to = now + 3 * 60_000;
-      view.from = view.to - 60 * 60_000;
+      // Follow live, at the linked zoom level if any.
+      const span = h.span > 0 ? h.span : DEFAULT_SPAN_MS;
+      view.to = now + span * 0.05;
+      view.from = view.to - span;
     }
     if (h.t !== null) seek(h.t); else play.playheadMs = now;
     loadStatus();
