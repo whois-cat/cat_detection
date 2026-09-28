@@ -29,9 +29,11 @@ default:
 # ───────────────────────────── stack ─────────────────────────────
 # streamhub, cv-worker, decider, pruner (docker-compose.yml, config.yaml).
 
-# Build and start the stack.
+# Build and start the stack. Data dirs are created first so they belong to
+# you, not root (containers run as UID/GID, default 1000).
 [group('stack')]
 up:
+    mkdir -p data/streamhub data/decider
     {{COMPOSE}} up -d --build
 
 # Stop the stack.
