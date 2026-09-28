@@ -1,3 +1,5 @@
+import { encode as encodeSelection } from './selection.js';
+
 // Shared UI state. All timelines and players read the same view and
 // playback, so they stay in sync (pan/zoom, hover, playhead).
 
@@ -22,7 +24,7 @@ export const view = $state({
   hoverMs: null,  // hovered time, shown on every timeline
   follow: true,   // viewport's right edge tracks now
   dragging: false, // a timeline is being panned/pinched
-  selected: 'all', // 'all' (grid) or a camera id
+  selected: null, // shown camera ids, or null for all (see lib/selection.js)
   details: pref('details', false), // per-camera CV/decider details panel
 });
 
@@ -42,7 +44,7 @@ export const ZOOM_MIN_MS = 30_000;
 export const ZOOM_MAX_MS = 30 * 86_400_000;
 
 export function visibleCameras() {
-  return view.selected === 'all' ? cams.list.map(c => c.id) : [view.selected];
+  return view.selected ?? cams.list.map(c => c.id);
 }
 
 // ---- viewport animation (one at a time, shared by all timelines) ----
@@ -99,7 +101,7 @@ export function writeHash() {
   clearTimeout(hashTimer);
   hashTimer = setTimeout(() => {
     const p = new URLSearchParams();
-    p.set('cam', view.selected);
+    p.set('cam', encodeSelection(view.selected));
     p.set('from', Math.round(view.from).toString());
     p.set('to', Math.round(view.to).toString());
     if (!play.live) p.set('t', Math.round(play.playheadMs).toString());

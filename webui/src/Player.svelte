@@ -135,7 +135,7 @@
   <!-- svelte-ignore a11y_media_has_caption -->
   <video bind:this={video} muted playsinline></video>
   <canvas class="overlay" bind:this={canvas}></canvas>
-  <button class="label" onclick={onselect} title="Show only this camera">{camera}</button>
+  <button class="label" onclick={onselect} title="Show only this camera; ctrl+click: show/hide it">{camera}</button>
   {#if shownMs}<div class="time">{fmtDateTime(shownMs)}</div>{/if}
   {#if decisions.length && !view.details}
     <div class="decisions">

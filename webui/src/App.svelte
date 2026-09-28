@@ -6,6 +6,7 @@
     cams, view, play, clock, visibleCameras, goLive, seek, animating, readHash, writeHash, savePref,
   } from './lib/state.svelte.js';
   import { fmtDateTime, fmtGap, rangeIndexAt, nextRangeStart } from './lib/time.js';
+  import { select as selectCamera, decode as decodeSelection } from './lib/selection.js';
 
   // A gap in recordings shorter than this plays out in real time ("no
   // recording"); longer ones show their length for GAP_NOTICE_MS, then jump.
@@ -17,7 +18,8 @@
   const RANGES_EVERY_MS = 10_000;
   const RATES = [0.5, 1, 2, 4, 8, 16];
 
-  const shown = $derived(cams.list.filter(c => view.selected === 'all' || c.id === view.selected));
+  const shown = $derived(cams.list.filter(c => !view.selected || view.selected.includes(c.id)));
+  const single = $derived(shown.length === 1);
 
   let raf, statusTimer, rangesTimer, rangesDebounce;
   let lastFrame = performance.now();
@@ -95,8 +97,9 @@
 
   // ---- controls ----
 
-  function select(id) {
-    view.selected = view.selected === id ? 'all' : id;
+  // Click: only this camera (again: all). Ctrl/Cmd+click: toggle it.
+  function select(id, e) {
+    view.selected = selectCamera(view.selected, cams.list.map(c => c.id), id, e?.ctrlKey || e?.metaKey);
     writeHash();
   }
 
@@ -131,7 +134,7 @@
     const h = readHash();
     const now = Date.now();
     clock.now = now;
-    view.selected = h.cam && (h.cam === 'all' || cams.list.some(c => c.id === h.cam)) ? h.cam : 'all';
+    view.selected = decodeSelection(h.cam, cams.list.map(c => c.id));
     if (h.from !== null && h.to !== null && h.to > h.from) {
       view.from = h.from;
       view.to = h.to;
@@ -167,9 +170,10 @@
 
 <header>
   <nav>
-    <button class:active={view.selected === 'all'} onclick={() => { view.selected = 'all'; writeHash(); }}>All</button>
+    <button class:active={!view.selected} onclick={() => { view.selected = null; writeHash(); }}>All</button>
     {#each cams.list as c (c.id)}
-      <button class:active={view.selected === c.id} onclick={() => select(c.id)}>
+      <button class:active={!!view.selected?.includes(c.id)} onclick={e => select(c.id, e)}
+              title="Show only this camera; ctrl+click: show/hide it">
         <span class="dot" class:ok={cams.status[c.id]?.connected}></span>{c.id}
       </button>
     {/each}
@@ -188,9 +192,9 @@
   </div>
 </header>
 
-<main class:grid={view.selected === 'all'} class:details={view.details}>
+<main class:grid={!single} class:details={view.details}>
   {#each shown as c (c.id)}
-    <Player camera={c.id} onselect={() => select(c.id)} side={view.selected !== 'all'} />
+    <Player camera={c.id} onselect={e => select(c.id, e)} side={single} />
   {/each}
   {#if play.gap}
     <div class="gap">&gt;&gt; {fmtGap(play.gap.lengthMs)}</div>

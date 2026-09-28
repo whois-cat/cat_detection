@@ -70,3 +70,18 @@ test('decision store and description', () => {
   assert.equal(describeDecision({ feeder: 'f3', state: 'closed', action: 'close', reason: 'not_allowed:alisa', identity: 'alisa', conf: 0.9, display: 'CA9N' }),
     'f3: closed · alisa 90% · not_allowed:alisa · [CA9N]');
 });
+
+import { select, encode, decode } from './selection.js';
+
+test('camera selection', () => {
+  const all = ['grey', 'beige', 'black'];
+  assert.deepEqual(select(null, all, 'beige', false), ['beige']);
+  assert.equal(select(['beige'], all, 'beige', false), null);          // click the only one: back to all
+  assert.deepEqual(select(null, all, 'beige', true), ['grey', 'black']); // ctrl: hide one
+  assert.deepEqual(select(['black'], all, 'grey', true), ['grey', 'black']); // ctrl: add, config order
+  assert.equal(select(['grey', 'black'], all, 'beige', true), null);   // all again
+  assert.deepEqual(select(['grey'], all, 'grey', true), ['grey']);     // never empty
+  assert.equal(encode(null), 'all');
+  assert.deepEqual(decode(encode(['grey', 'black']), all), ['grey', 'black']);
+  assert.equal(decode('pink', all), null);
+});
