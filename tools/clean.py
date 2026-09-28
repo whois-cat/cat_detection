@@ -1,6 +1,6 @@
 """Remove local files git ignores, without touching config and state.
 
-    python tools/clean.py junk     [--yes]   # build artifacts, caches, venvs, old-stack leftovers
+    python tools/clean.py junk     [--yes]   # build artifacts, caches, venvs, old-stack leftovers (OBSOLETE)
     python tools/clean.py history  [--yes]   # junk + the new stack's recordings and dry-run journal
 
 Without --yes it only lists what it would remove. Everything under KEEP (and
@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Config and state: never removed.
 KEEP = ("config.yaml", ".env", "secrets", "data", "models", "reviews.db")
+# Previous-stack leftovers inside KEEP dirs (removed by `junk` too): mediamtx's
+# generated camera URLs with credentials, and an older feeder's state.
+OBSOLETE = ("secrets/cameras.env", "data/cooldowns")
 # Recorded history of the new stack (removed by `history`).
 HISTORY = ("data/streamhub/recordings", "data/decider/feed_journal/journal.dry-run.db",
            "data/decider/feed_journal/journal.dry-run.db-wal", "data/decider/feed_journal/journal.dry-run.db-shm")
@@ -54,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--yes", action="store_true", help="actually remove (default: only list)")
     args = ap.parse_args(argv)
 
-    targets = junk(ignored_paths())
+    targets = junk(ignored_paths()) + [o for o in OBSOLETE if (ROOT / o).exists()]
     if args.what == "history":
         targets += [h for h in HISTORY if (ROOT / h).exists()]
     if not targets:
