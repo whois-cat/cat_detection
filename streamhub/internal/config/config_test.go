@@ -12,7 +12,6 @@ func TestParse(t *testing.T) {
 data_dir: /data
 cameras:
   - id: grey
-    label: Regular feed
     rtsp: rtsp://camera:${CAM_PASS}@192.168.0.213:554/stream1
 streamhub:
   recordings:

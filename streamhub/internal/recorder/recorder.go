@@ -20,12 +20,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
-	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4/seekablebuffer"
-	"github.com/bluenviron/mediacommon/v2/pkg/formats/mp4/codecs"
 
 	"github.com/whois-cat/cat_detection/streamhub/internal/media"
+	"github.com/whois-cat/cat_detection/streamhub/internal/mux"
 	"github.com/whois-cat/cat_detection/streamhub/internal/segment"
 	"github.com/whois-cat/cat_detection/streamhub/internal/timeline"
 )
@@ -174,17 +172,12 @@ func openSegment(root, camera string, f *media.Frame) (*segWriter, error) {
 		root: root, camera: camera, partPath: rel, file: file,
 		sps: f.SPS, pps: f.PPS, startPTS: f.PTS, endPTS: f.PTS,
 	}
-	init := fmp4.Init{Tracks: []*fmp4.InitTrack{{
-		ID:        1,
-		TimeScale: timeline.ClockRate,
-		Codec:     &codecs.H264{SPS: f.SPS, PPS: f.PPS},
-	}}}
-	var buf seekablebuffer.Buffer
-	if err := init.Marshal(&buf); err != nil {
+	init, err := mux.Init(f.SPS, f.PPS)
+	if err != nil {
 		file.Close()
 		return nil, err
 	}
-	if _, err := file.Write(buf.Bytes()); err != nil {
+	if _, err := file.Write(init); err != nil {
 		file.Close()
 		return nil, err
 	}
@@ -204,15 +197,11 @@ func (w *segWriter) add(f *media.Frame, dur int64) error {
 	if len(w.frag) == 0 {
 		w.fragBase = f.PTS
 	}
-	payload, err := h264.AVCC(f.AU).Marshal()
+	sample, err := mux.Sample(f.AU, f.IDR, dur)
 	if err != nil {
 		return err
 	}
-	w.frag = append(w.frag, &fmp4.Sample{
-		Duration:        uint32(dur),
-		IsNonSyncSample: !f.IDR,
-		Payload:         payload,
-	})
+	w.frag = append(w.frag, sample)
 	w.endPTS = f.PTS + dur
 	return nil
 }
@@ -221,16 +210,13 @@ func (w *segWriter) flushFragment() error {
 	if len(w.frag) == 0 {
 		return nil
 	}
-	part := fmp4.Part{SequenceNumber: w.seq, Tracks: []*fmp4.PartTrack{{
-		ID: 1, BaseTime: uint64(w.fragBase), Samples: w.frag,
-	}}}
-	w.seq++
-	w.frag = nil
-	var buf seekablebuffer.Buffer
-	if err := part.Marshal(&buf); err != nil {
+	frag, err := mux.Fragment(w.seq, w.fragBase, w.frag)
+	if err != nil {
 		return err
 	}
-	_, err := w.file.Write(buf.Bytes())
+	w.seq++
+	w.frag = nil
+	_, err = w.file.Write(frag)
 	return err
 }
 

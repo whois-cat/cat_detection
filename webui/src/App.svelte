@@ -1,1210 +1,268 @@
 <script>
-  // Combined live + history view (Svelte 5, runes).
-  //
-  // Two <video> elements share the same overlay <canvas>:
-  //   - liveVideo (WebRTC, always playing)
-  //   - historyVideo (native fMP4 from mediamtx /recordings/get)
-  // The visible one is determined by `mode`, which is derived from the
-  // playhead's distance from nowMs. `follow=true` keeps the playhead pinned
-  // to now and shifts the timeline viewport along with it.
-  //
-  // Sync between video and overlay:
-  //   - live: WS pushes events; the latest non-empty event drives the overlay
-  //   - history: the wall-clock of the displayed frame is
-  //     playbackWindowStartMs + historyVideo.currentTime (corrected on
-  //     loadedmetadata where possible); we look up the closest event in
-  //     `allEvents` and draw it.
-  //
-  // Retention ranges shown in the timeline come from the detector's
-  // SQLite-backed /recordings/ranges endpoint, which is rebuilt from MediaMTX
-  // recording files and avoids blocking on MediaMTX /list during UI work.
-  import { onMount, onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
+  import Player from './Player.svelte';
   import Timeline from './Timeline.svelte';
-  import { planSeek, sameWindowLoaded } from './seek.js';
-  import { appendBoundedEvent, mergeBoundedEvents } from './eventBuffer.js';
   import {
-    createJsonRequestCache,
-    normalizeAvailabilityRanges,
-    normalizeEpochMs,
-    rangeCacheKey,
-  } from './requestCache.js';
+    cams, view, play, clock, visibleCameras, goLive, seek, animating, readHash, writeHash,
+  } from './lib/state.svelte.js';
+  import { fmtDateTime, fmtGap, rangeIndexAt, nextRangeStart } from './lib/time.js';
 
-  // ---- DOM refs (plain let) ----
-  let liveVideo, historyVideo, canvas, wrap, appRoot;
+  // A gap in recordings shorter than this plays out in real time ("no
+  // recording"); longer ones show their length for GAP_NOTICE_MS, then jump.
+  const SMALL_GAP_MS = 2000;
+  const GAP_NOTICE_MS = 2000;
+  // History playback that catches up with now switches to live.
+  const CATCH_UP_MS = 3000;
+  const STATUS_EVERY_MS = 2000;
+  const RANGES_EVERY_MS = 10_000;
+  const RATES = [0.5, 1, 2, 4, 8, 16];
 
-  // ---- Canvas / RAF lifecycle (non-reactive) ----
-  // Cap device pixel ratio: overlay strokes don't need >1.5x, and high-DPR
-  // canvases quadruple per-frame fill cost on retina displays.
-  const MAX_DPR = 1.5;
-  let ctx2d = null;            // cached 2D context (getContext is not free)
-  let cssW = 0, cssH = 0;     // CSS px size, updated by ResizeObserver (not per-frame)
-  let canvasResized = true;   // set when ResizeObserver fires; drives a one-off resize
-  let rafId = 0;              // current requestAnimationFrame / rVFC handle
-  let rafIsVFC = false;       // whether rafId came from requestVideoFrameCallback
-  let rafVideo = null;        // the <video> a rVFC handle is registered on (to cancel it)
-  let resizeObserver = null;
-  let drawLoopRunning = false;
+  const shown = $derived(cams.list.filter(c => view.selected === 'all' || c.id === view.selected));
 
-  // ---- Non-reactive (imperative state used only in handlers / draw) ----
-  let pc, ws;
-  let recentLive = [];
-  let seekTimer = 0;
-  let wsReconnectTimer = 0;
-  let connectionSeq = 0;
-  let nowTimer = 0;
-  let _prevMode = 'live';
-  // Wall-clock at t=0 of the loaded fMP4 stream. mediamtx /get?start=T
-  // returns video starting from the most recent segment boundary BEFORE T
-  // (up to ~SEGMENT_DURATION earlier), not exactly at T. We correct this
-  // via video.getStartDate() once loadedmetadata fires; until then we use
-  // our requested T as a best guess.
-  let playbackWindowStartMs = 0;
-  let playbackWindowEndMs = 0;
-  // Where the user actually clicked. We re-seek to this once we know the
-  // true segment start (currentTime = playbackTargetMs - playbackWindowStartMs).
-  let playbackTargetMs = 0;
-  // History playback window. Kept SHORT by default (~3 min) so each seek fetches
-  // a small clip — mediamtx /get can't Range-serve a single fMP4, so the whole
-  // window downloads on every committed seek; 15 min was tens of MB per scrub.
-  // Override with #pw=<seconds> in the URL hash (clamped 30s–3600s).
-  const DEFAULT_PLAYBACK_WINDOW_SEC = 180;
-  function readPlaybackWindowSec() {
+  let raf, statusTimer, rangesTimer, rangesDebounce;
+  let lastFrame = performance.now();
+
+  // ---- data ----
+
+  async function loadStatus() {
     try {
-      const v = parseInt(new URLSearchParams(location.hash.slice(1)).get('pw'), 10);
-      if (!isNaN(v) && v >= 30 && v <= 3600) return v;
-    } catch {}
-    return DEFAULT_PLAYBACK_WINDOW_SEC;
-  }
-  let playbackWindowSec = readPlaybackWindowSec();
-  const MAX_EVENTS = 2000;
-  const HISTORY_EVENTS_WINDOW_MS = 6 * 3600_000;
-  const RECORDING_RANGES_WINDOW_MS = 24 * 3600_000;
-  const RANGE_FETCH_TTL_MS = 15_000;
-  const MODEL_FETCH_TTL_MS = 30_000;
-  const REQUEST_TIMEOUT_MS = 1500;
-
-  const rangesRequests = createJsonRequestCache({
-    ttlMs: RANGE_FETCH_TTL_MS,
-    timeoutMs: 2000,
-    onTiming: ({ url, source, elapsedMs }) => {
-      console.log(`[recordings/ranges] ${source} ${Math.round(elapsedMs)}ms ${url}`);
-    },
-  });
-  const modelRequests = createJsonRequestCache({
-    ttlMs: MODEL_FETCH_TTL_MS,
-    timeoutMs: REQUEST_TIMEOUT_MS,
-    onTiming: ({ url, source, elapsedMs }) => {
-      console.log(`[models] ${source} ${Math.round(elapsedMs)}ms ${url}`);
-    },
-  });
-  const historyRequests = createJsonRequestCache({
-    ttlMs: 1000,
-    timeoutMs: 2500,
-    onTiming: ({ url, source, elapsedMs }) => {
-      console.log(`[events] ${source} ${Math.round(elapsedMs)}ms ${url}`);
-    },
-  });
-
-  // ---- Reactive state ----
-  let nowMs        = $state(Date.now());
-  let playheadMs   = $state(Date.now());
-  let allEvents    = $state([]);
-  let hlsRanges    = $state([]);
-  let hlsErrorText = $state('');
-  let rangeWarningText = $state('');
-  let modelWarningText = $state('');
-  // historyPaused reflects the actual <video>.paused flag for the UI.
-  // userWantsPlaying is what the user intends — set by the play/pause button
-  // and used to decide whether to resume after a src reload (every seek).
-  let historyPaused    = $state(true);
-  let userWantsPlaying = $state(true);
-  let follow           = $state(true);
-  // Overlay zones (ignore/food/decision regions + detection boxes) are hidden
-  // by default so the video opens clean; toggled by the in-player "зоны"
-  // checkbox in both normal and fullscreen modes.
-  let showZones        = $state(false);
-  // Latest stats frame from the detector ({fps_in, fps_processed, active_tracks, model, camera_id})
-  let stats            = $state(null);
-  // detectRoi: axis-aligned rect [x0,y0,x1,y1] in [0..1], CAMERA coords.
-  // actionPolygon: array of [x,y] vertices in [0..1] (closed polygon), CAMERA coords.
-  // foodRegion: bowl texture monitor polygon; it never filters detections.
-  // ignoreRegions: [{name, points:[[x,y], ...]}], CAMERA coords.
-  // Null until first stats frame arrives. Detector may internally rotate frames
-  // for the model (FRAME_ROTATE_DEG), but everything outside that — including
-  // these overlays and the displayed video — stays in camera orientation.
-  let detectRoi        = $state(null);
-  let actionPolygon    = $state(null);
-  let foodRegion       = $state(null);
-  let foodRegionName   = $state('bowl');
-  let ignoreRegions    = $state([]);
-  // Multi-camera: cameras are fetched from /cameras.json (generated by
-  // tools/configure.py) at startup. `cameraId` is the selected camera; all
-  // backend URLs derive from it (/detector/<id>/, /whep/<id>/whep,
-  // /recordings/get?path=<id>). Choice is persisted in the URL hash
-  // as #camera=<id>.
-  let availableCameras = $state([]);            // [{id, label}]
-  let cameraId         = $state(null);
-  // Model picker: empty string means "all models". availableModels is populated
-  // from /detector/<cameraId>/models on mount and after a camera switch.
-  let availableModels  = $state([]);
-  let selectedModel    = $state('');
-
-  // ---- Derived ----
-  const LIVE_THRESHOLD_MS = 5_000;
-  let mode = $derived(playheadMs >= nowMs - LIVE_THRESHOLD_MS ? 'live' : 'history');
-  let ranges = $derived(
-    hlsRanges.length
-      ? hlsRanges
-      : [{ from_ms: nowMs - 24 * 3600_000, to_ms: nowMs }]
-  );
-
-  // Filtered view of events for whichever model the user picked.
-  let visibleEvents = $derived(
-    selectedModel
-      ? allEvents.filter(e => e.model === selectedModel)
-      : allEvents
-  );
-
-  // History playhead falls outside any actual recording range (pruned by
-  // the detection-based cleanup, or before recording started).
-  // Only true once we have real ranges from /recordings/ranges — before that we
-  // optimistically assume "everything's there".
-  let inGap = $derived(
-    mode === 'history'
-    && hlsRanges.length > 0
-    && !hlsRanges.some(r => playheadMs >= r.from_ms && playheadMs < r.to_ms)
-  );
-  let nextRangeStartMs = $derived.by(() => {
-    let best = null;
-    for (const r of hlsRanges) {
-      if (r.from_ms > playheadMs && (best === null || r.from_ms < best)) {
-        best = r.from_ms;
-      }
-    }
-    return best;
-  });
-
-
-  // ---- Overlay constants ----
-  const OVERLAY_MAX_AGE_MS = 1500;
-  const BOX_RGB = [0, 255, 136];
-  const BOX_STROKE = `rgb(${BOX_RGB.join(',')})`;
-  const IGNORE_STROKE = '#ff6b6b';
-  const IGNORE_FILL = 'rgba(255,107,107,0.14)';
-  const IGNORE_TEXT = '#ff8f8f';
-  const FOOD_STROKE = '#c084fc';
-  const FOOD_FILL = 'rgba(192,132,252,0.13)';
-  const FOOD_TEXT = '#ddd6fe';
-  const DECISION_STROKE = '#ffd454';
-  const BOX_SHADOW = (() => {
-    const [r, g, b] = BOX_RGB;
-    const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-    return lum > 0.5 ? 'rgba(0,0,0,0.85)' : 'rgba(255,255,255,0.85)';
-  })();
-
-  function ensureCtx() {
-    if (!ctx2d && canvas) ctx2d = canvas.getContext('2d');
-    return ctx2d;
+      cams.status = (await (await fetch('/api/status')).json()).cameras;
+    } catch { /* keep last known */ }
   }
 
-  function syncCanvasSize() {
-    const ctx = ensureCtx();
-    // Use the ResizeObserver-cached CSS size; reading clientWidth/Height every
-    // frame forces a synchronous layout. Only touch canvas.width/height (which
-    // also clears it) when the element actually resized.
-    const width = cssW || canvas.clientWidth || canvas.width || 1;
-    const height = cssH || canvas.clientHeight || canvas.height || 1;
-    const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
-    if (canvasResized) {
-      const pxW = Math.max(1, Math.round(width * dpr));
-      const pxH = Math.max(1, Math.round(height * dpr));
-      if (canvas.width !== pxW || canvas.height !== pxH) {
-        canvas.width = pxW;
-        canvas.height = pxH;
-      }
-      canvasResized = false;
-    }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, width, height);
-    return { ctx, width, height };
-  }
-
-  function videoContentRect(video, width, height) {
-    const vw = video?.videoWidth || 0;
-    const vh = video?.videoHeight || 0;
-    if (!vw || !vh) return { x: 0, y: 0, w: width, h: height };
-    const scale = Math.min(width / vw, height / vh);
-    const w = vw * scale;
-    const h = vh * scale;
-    return {
-      x: (width - w) / 2,
-      y: (height - h) / 2,
-      w,
-      h,
-    };
-  }
-
-  function isSoftFoodRegionName(name) {
-    const tokens = String(name || '').toLowerCase().replaceAll('-', '_').replaceAll(' ', '_').split('_');
-    return tokens.includes('bowl') || tokens.includes('food');
-  }
-
-  function regionPoints(region) {
-    const pts = Array.isArray(region?.points) ? region.points : region;
-    return Array.isArray(pts) && pts.length >= 3 ? pts : null;
-  }
-
-  function applyOverlayRegions(source) {
-    const hard = [];
-    let soft = null;
-    let softName = 'bowl';
-    for (const region of source?.ignore_regions || []) {
-      const name = region?.name || '';
-      if (isSoftFoodRegionName(name)) {
-        if (!soft) {
-          soft = regionPoints(region);
-          softName = name || 'bowl';
-        }
-      } else {
-        hard.push(region);
-      }
-    }
-    const explicitFood = regionPoints(source?.food_region);
-    ignoreRegions = hard;
-    foodRegion = explicitFood || soft;
-    foodRegionName = source?.food_region?.name || softName || 'bowl';
-  }
-
-  // ---- Overlay drawing ----
-  function findHistoryEventAt(referenceMs) {
-    let best = null, bestDist = OVERLAY_MAX_AGE_MS;
-    for (let i = allEvents.length - 1; i >= 0; i--) {
-      const e = allEvents[i];
-      if (!e.boxes || !e.boxes.length) continue;
-      const d = Math.abs(referenceMs - e.wall_ms);
-      if (d < bestDist) { bestDist = d; best = e; }
-      if (e.wall_ms < referenceMs - OVERLAY_MAX_AGE_MS - 60_000) break;
-    }
-    return best;
-  }
-
-  function clearCanvas() {
-    const ctx = ensureCtx();
-    if (!ctx || !canvas) return;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  }
-
-  function drawOverlay() {
-    if (!canvas) return;
-    // Zones hidden: wipe once and draw nothing (the loop is also stopped).
-    if (!showZones) {
-      clearCanvas();
-      return;
-    }
-    const v = mode === 'live' ? liveVideo : historyVideo;
-    if (!v) return;
-    const { ctx, width, height } = syncCanvasSize();
-    const frameRect = videoContentRect(v, width, height);
-
-    // ROI overlays (drawn first so detection boxes sit on top). Only render
-    // when the region is a sub-region of the frame; full-frame ROIs would just
-    // be a border. The feeder decision zone may be an arbitrary polygon.
-    const FULL_POLY = (p) => p && p.length === 4
-      && p[0][0] === 0 && p[0][1] === 0 && p[1][0] === 1 && p[1][1] === 0
-      && p[2][0] === 1 && p[2][1] === 1 && p[3][0] === 0 && p[3][1] === 1;
-
-    const drawPolygonRegion = (region, label = 'IGNORE', stroke = IGNORE_STROKE, fill = IGNORE_FILL, text = IGNORE_TEXT) => {
-      const pts = Array.isArray(region?.points) ? region.points : region;
-      if (!Array.isArray(pts) || pts.length < 3) return;
-      let minX = Infinity, minY = Infinity;
-      ctx.save();
-      ctx.lineWidth = 2;
-      ctx.setLineDash([6, 5]);
-      ctx.strokeStyle = stroke;
-      ctx.fillStyle = fill;
-      ctx.beginPath();
-      pts.forEach(([x, y], i) => {
-        const px = frameRect.x + x * frameRect.w;
-        const py = frameRect.y + y * frameRect.h;
-        if (px < minX) minX = px;
-        if (py < minY) minY = py;
-        if (i === 0) ctx.moveTo(px, py);
-        else         ctx.lineTo(px, py);
-      });
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.font = '600 14px system-ui';
-      ctx.fillStyle = text;
-      ctx.fillText(region?.name ? `${label} ${region.name}` : label, minX + 4, minY + 16);
-      ctx.restore();
-    };
-
-    const drawPath = (stroke, label, makePath, labelXY) => {
-      ctx.save();
-      ctx.lineWidth = 2;
-      ctx.setLineDash([8, 6]);
-      ctx.strokeStyle = stroke;
-      ctx.beginPath();
-      makePath();
-      ctx.closePath();
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.font = '600 14px system-ui';
-      ctx.fillStyle = stroke;
-      ctx.fillText(label, labelXY[0] + 4, labelXY[1] + 16);
-      ctx.restore();
-    };
-    for (const region of ignoreRegions || []) drawPolygonRegion(region);
-    if (foodRegion && !FULL_POLY(foodRegion)) {
-      drawPolygonRegion(
-        { name: foodRegionName, points: foodRegion },
-        'FOOD',
-        FOOD_STROKE,
-        FOOD_FILL,
-        FOOD_TEXT,
-      );
-    }
-    if (actionPolygon && !FULL_POLY(actionPolygon)) {
-      let minX = Infinity, minY = Infinity;
-      drawPath(DECISION_STROKE, 'DECISION', () => {
-        actionPolygon.forEach(([x, y], i) => {
-          const px = frameRect.x + x * frameRect.w;
-          const py = frameRect.y + y * frameRect.h;
-          if (px < minX) minX = px;
-          if (py < minY) minY = py;
-          if (i === 0) ctx.moveTo(px, py);
-          else         ctx.lineTo(px, py);
-        });
-      }, [minX, minY]);
-    }
-
-    let referenceMs, ev;
-    if (mode === 'live') {
-      referenceMs = Date.now();
-      while (recentLive.length && recentLive[0].wall_ms < referenceMs - OVERLAY_MAX_AGE_MS) {
-        recentLive.shift();
-      }
-      if (!recentLive.length) return;
-      ev = recentLive[recentLive.length - 1];
-    } else {
-      // Reference = wall-clock of the currently-displayed historyVideo frame.
-      referenceMs = playbackWindowStartMs
-                  ? playbackWindowStartMs + historyVideo.currentTime * 1000
-                  : playheadMs;
-      ev = findHistoryEventAt(referenceMs);
-      if (!ev) return;
-    }
-
-    const ageMs = Math.max(0, referenceMs - ev.wall_ms);
-    if (ageMs > OVERLAY_MAX_AGE_MS) return;
-    const sx = frameRect.w / ev.w;
-    const sy = frameRect.h / ev.h;
-    const dashFactor = 1 - ageMs / OVERLAY_MAX_AGE_MS;
-    const segLen = 14;
-    ctx.setLineDash(segLen * (1 - dashFactor) > 0.5 ? [segLen * dashFactor, segLen - segLen * dashFactor] : []);
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = BOX_STROKE;
-    ctx.fillStyle = `rgba(${BOX_RGB.join(',')},0.15)`;
-    ctx.font = '600 16px system-ui';
-    ctx.shadowColor = BOX_SHADOW;
-    ctx.shadowBlur = 6;
-    for (const b of ev.boxes) {
-      ctx.fillRect(frameRect.x + b.x * sx, frameRect.y + b.y * sy, b.w * sx, b.h * sy);
-      ctx.strokeRect(frameRect.x + b.x * sx, frameRect.y + b.y * sy, b.w * sx, b.h * sy);
-    }
-    ctx.setLineDash([]);
-    ctx.fillStyle = BOX_STROKE;
-    for (const b of ev.boxes) {
-      ctx.fillText(`${ev.cat || 'blob'}  age ${ageMs.toFixed(0)}ms`,
-                   frameRect.x + b.x * sx + 4, frameRect.y + b.y * sy - 6);
-    }
-    ctx.shadowColor = 'transparent';
-    ctx.shadowBlur = 0;
-  }
-
-  // ---- Draw loop lifecycle ----
-  // The loop only runs while zones are shown (nothing to draw otherwise), and a
-  // single guarded handle prevents two loops after a remount. Prefers
-  // requestVideoFrameCallback for BOTH live and history video so we redraw per
-  // decoded frame (not per display refresh); falls back to RAF when unsupported.
-  // The cancel always targets the exact <video> the handle was registered on.
-  function cancelDrawFrame() {
-    if (!rafId) return;
-    if (rafIsVFC && rafVideo && typeof rafVideo.cancelVideoFrameCallback === 'function') {
-      rafVideo.cancelVideoFrameCallback(rafId);
-    } else {
-      cancelAnimationFrame(rafId);
-    }
-    rafId = 0;
-    rafVideo = null;
-  }
-
-  function scheduleNextFrame() {
-    if (!drawLoopRunning) return;
-    const v = mode === 'live' ? liveVideo : historyVideo;
-    if (v && typeof v.requestVideoFrameCallback === 'function') {
-      rafIsVFC = true;
-      rafVideo = v;
-      rafId = v.requestVideoFrameCallback(drawFrame);
-    } else {
-      rafIsVFC = false;
-      rafVideo = null;
-      rafId = requestAnimationFrame(drawFrame);
-    }
-  }
-
-  function drawFrame() {
-    drawOverlay();
-    scheduleNextFrame();
-  }
-
-  function startDrawLoop() {
-    if (drawLoopRunning) return;
-    drawLoopRunning = true;
-    scheduleNextFrame();
-  }
-
-  function stopDrawLoop() {
-    drawLoopRunning = false;
-    cancelDrawFrame();
-  }
-
-  // ---- WebRTC (WHEP) ----
-  // mediamtx exposes WHEP at /<path>/whep — standard SDP offer/answer over HTTP.
-  async function startWebRTC(seq = connectionSeq) {
-    const id = cameraId;
-    if (!id) return;
-    const nextPc = new RTCPeerConnection({ iceServers: [] });
-    pc = nextPc;
-    nextPc.addTransceiver('video', { direction: 'recvonly' });
-    nextPc.ontrack = (e) => {
-      if (seq !== connectionSeq || nextPc !== pc) return;
-      if (e.track.kind !== 'video') return;
-      if (!liveVideo.srcObject) liveVideo.srcObject = new MediaStream();
-      liveVideo.srcObject.addTrack(e.track);
-      liveVideo.play().catch(() => {});
-    };
-    try {
-      const offer = await nextPc.createOffer();
-      if (seq !== connectionSeq || nextPc !== pc) return nextPc.close();
-      await nextPc.setLocalDescription(offer);
-      const resp = await fetch(`/whep/${id}/whep`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/sdp' },
-        body: offer.sdp,
-      });
-      if (seq !== connectionSeq || nextPc !== pc) return nextPc.close();
-      if (!resp.ok) {
-        console.error('[webrtc] WHEP signalling failed', resp.status, await resp.text());
-        return;
-      }
-      const answerSdp = await resp.text();
-      if (seq !== connectionSeq || nextPc !== pc) return nextPc.close();
-      await nextPc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
-    } catch (e) {
-      if (seq === connectionSeq && nextPc === pc) {
-        console.warn('[webrtc] start failed', e);
-      }
-      try { nextPc.close(); } catch {}
-    }
-  }
-
-  // ---- History playback (via mediamtx /recordings/get) ----
-  //
-  // mediamtx's /get returns a fragmented MP4 stream (NOT an HLS playlist),
-  // which browsers can play natively via <video src>. We load one bounded
-  // window starting at the committed seek target and track its start wall-clock
-  // so we can map between target wall-time and historyVideo.currentTime.
-
-  async function refreshRecordingsList() {
-    try {
-      if (!cameraId) return;
-      const seq = ++rangesFetchSeq;
-      const to = normalizeEpochMs(Math.ceil(Date.now() / 60_000) * 60_000);
-      const from = normalizeEpochMs(to - RECORDING_RANGES_WINDOW_MS);
-      const cacheKey = `ranges:${rangeCacheKey(cameraId, from, to)}`;
-      if (activeRangesKey && activeRangesKey !== cacheKey) {
-        rangesRequests.abort(`ranges:${cameraId}:`);
-      }
-      activeRangesKey = cacheKey;
-      const url = `/detector/${cameraId}/recordings/ranges?from=${from}&to=${to}`;
-      const data = await rangesRequests.get(
-        cacheKey,
-        url,
-      );
-      if (seq !== rangesFetchSeq || activeRangesKey !== cacheKey) return;
-      hlsRanges = normalizeAvailabilityRanges(data.ranges);
-      rangeWarningText = '';
-    } catch (e) {
-      if (e?.name === 'AbortError') return;
-      console.warn('[recordings/ranges] failed', e);
-      rangeWarningText = 'recording ranges unavailable';
-    }
-  }
-
-  // Load a fresh playback window starting *at* `startMs` (wall-clock ms).
-  // currentTime=0 == startMs. mediamtx /get is chunked without Range support,
-  // so we can only play forward from whatever first bytes the server sends.
-  function loadPlaybackWindowAt(startMs) {
-    if (!historyVideo) return;
-    startMs = normalizeEpochMs(startMs);
-    // Don't refetch a range we already have loaded.
-    if (sameWindowLoaded(startMs, playbackWindowStartMs, !!historyVideo.src)) {
-      playbackTargetMs = startMs;
-      return;
-    }
-    playbackTargetMs       = startMs;             // where the user clicked
-    playbackWindowStartMs  = startMs;             // pre-load guess (corrected on loadedmetadata)
-    playbackWindowEndMs    = startMs + playbackWindowSec * 1000;
-    const startIso = new Date(startMs).toISOString();
-    const url = `/recordings/get?path=${encodeURIComponent(cameraId)}&start=${encodeURIComponent(startIso)}`
-              + `&duration=${playbackWindowSec}s&format=fmp4`;
-    historyVideo.src = url;
-    hlsErrorText = '';
-    historyVideo.onerror = () => {
-      const err = historyVideo.error;
-      hlsErrorText = err ? `playback err code=${err.code} ${err.message || ''}` : 'playback failed';
-    };
-    // Correct the wall-clock anchor once we have stream metadata. mediamtx
-    // returns video starting at the most recent segment boundary <= start,
-    // not exactly at start. video.getStartDate() reads the actual t=0 from
-    // the fMP4's creation_time when available.
-    const onMeta = () => {
-      historyVideo.removeEventListener('loadedmetadata', onMeta);
-      let actualStart = null;
+  async function loadRanges() {
+    const span = view.to - view.from;
+    const from = Math.round(view.from - span), to = Math.round(view.to + span);
+    await Promise.all(cams.list.map(async c => {
       try {
-        const sd = historyVideo.getStartDate?.();
-        if (sd && !isNaN(sd.getTime())) actualStart = sd.getTime();
-      } catch {}
-      if (actualStart !== null) {
-        const diff = playbackTargetMs - actualStart;       // how much lead-in mediamtx gave us
-        if (diff >= 0 && diff < 5 * 60_000) {
-          playbackWindowStartMs = actualStart;
-          playbackWindowEndMs   = actualStart + playbackWindowSec * 1000;
-          // Skip the lead-in: seek to the user's actual target moment.
-          if (diff > 250) historyVideo.currentTime = diff / 1000;
-          console.log('[playback] anchor corrected: target', new Date(playbackTargetMs).toISOString(),
-                      '→ actual start', new Date(actualStart).toISOString(),
-                      '(lead-in', diff, 'ms)');
-        }
-      } else {
-        // TODO: getStartDate() returns null for mediamtx fMP4 streams. To fix the
-        // ~2s overlay offset (mediamtx /get aligns to the previous 30s segment
-        // boundary), parse mvhd.creation_time from the fMP4 bytes via mp4box.js,
-        // or query mediamtx for the actual segment boundary and use that as anchor.
-        console.log('[playback] video.getStartDate() unavailable; using requested start as anchor');
+        const r = await fetch(`/api/ranges/${encodeURIComponent(c.id)}?from=${from}&to=${to}`);
+        cams.ranges[c.id] = await r.json();
+      } catch { /* keep last known */ }
+    }));
+  }
+
+  // ---- playback clock ----
+
+  function frame(now) {
+    const dt = now - lastFrame;
+    lastFrame = now;
+    clock.now = Date.now();
+
+    if (play.live) {
+      play.playheadMs = clock.now;
+    } else if (play.playing && !play.gap) {
+      const ids = visibleCameras();
+      if (!ids.some(id => play.waiting[id])) play.playheadMs += dt * play.rate;
+      skipGaps(ids);
+      if (play.playheadMs >= clock.now - CATCH_UP_MS) goLive();
+    }
+
+    if (!animating() && !view.dragging) {
+      const span = view.to - view.from;
+      if (view.follow) {
+        view.to = clock.now + span * 0.05;
+        view.from = view.to - span;
+      } else if (play.playheadMs > view.to - span * 0.05 || play.playheadMs < view.from) {
+        // Keep the history playhead in view.
+        view.from = play.playheadMs - span * 0.2;
+        view.to = view.from + span;
       }
-    };
-    historyVideo.addEventListener('loadedmetadata', onMeta);
-    if (userWantsPlaying) {
-      const onReady = () => {
-        historyVideo.removeEventListener('canplay', onReady);
-        historyVideo.play().catch(() => {});
-      };
-      historyVideo.addEventListener('canplay', onReady);
     }
+    raf = requestAnimationFrame(frame);
   }
 
-  // Every seek triggers a fresh fetch starting exactly at the target.
-  // mediamtx can't Range-serve a single fMP4, so this is the only way to get
-  // snappy scrubs — we accept the per-seek HTTP request cost.
-  function seekHistory(targetMs) {
-    if (!historyVideo) return;
-    targetMs = normalizeEpochMs(targetMs);
-    // In-window seek: move currentTime only, never touch video.src (no fetch).
-    const plan = planSeek({
-      targetMs,
-      windowStartMs: playbackWindowStartMs || null,
-      windowEndMs: playbackWindowEndMs || null,
-      hasWindow: !!playbackWindowStartMs && !!historyVideo.src,
-    });
-    if (plan.mode === 'currentTime') {
-      playbackTargetMs = targetMs;
-      historyVideo.currentTime = plan.currentTime;
-      return;
-    }
-    loadPlaybackWindowAt(targetMs);
+  function skipGaps(ids) {
+    const t = play.playheadMs;
+    if (ids.some(id => rangeIndexAt(cams.ranges[id] || [], t) >= 0)) return;
+    const next = Math.min(...ids.map(id => nextRangeStart(cams.ranges[id] || [], t) ?? Infinity));
+    if (!Number.isFinite(next) || next - t <= SMALL_GAP_MS) return;
+    play.gap = { lengthMs: next - t, target: next };
+    setTimeout(() => {
+      if (play.gap?.target !== next) return;
+      play.playheadMs = next;
+      play.gap = null;
+    }, GAP_NOTICE_MS);
   }
 
-  function scheduleHistorySeek(target) {
-    clearTimeout(seekTimer);
-    // Longer debounce than before — each fire is a full media reload now,
-    // so we want the user to settle before we fetch.
-    const targetMs = normalizeEpochMs(target);
-    seekTimer = setTimeout(() => seekHistory(targetMs), 200);
+  // ---- controls ----
+
+  function select(id) {
+    view.selected = view.selected === id ? 'all' : id;
+    writeHash();
   }
 
-  function onHistoryTime() {
-    if (mode !== 'history' || !historyVideo || !playbackWindowStartMs) return;
-    const t = normalizeEpochMs(playbackWindowStartMs + historyVideo.currentTime * 1000);
-    if (Math.abs(t - playheadMs) > 100) playheadMs = t;
-  }
-
-  function toggleHistoryPlay() {
-    if (!historyVideo) return;
-    if (historyVideo.paused) {
-      userWantsPlaying = true;
-      historyVideo.play().catch(() => {});
+  function togglePlay() {
+    if (play.live) {
+      // Pausing live freezes the current moment as history.
+      seek(clock.now - 1);
+      play.playing = false;
     } else {
-      userWantsPlaying = false;
-      historyVideo.pause();
+      play.playing = !play.playing;
     }
+    writeHash();
   }
 
-  // ---- WS live event stream ----
-  function startWS(seq = connectionSeq) {
-    const id = cameraId;
-    if (!id) return;
-    clearTimeout(wsReconnectTimer);
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const nextWs = new WebSocket(`${proto}//${location.host}/detector/${id}/ws`);
-    ws = nextWs;
-    nextWs.onmessage = (m) => {
-      if (seq !== connectionSeq || nextWs !== ws) return;
-      const ev = JSON.parse(m.data);
-      if (ev.kind === 'stats') {
-        stats = ev;
-        if (Array.isArray(ev.detect_roi) && ev.detect_roi.length === 4) detectRoi = ev.detect_roi;
-        const decision = ev.decision_polygon || ev.action_polygon;
-        if (Array.isArray(decision) && decision.length >= 3) actionPolygon = decision;
-        applyOverlayRegions(ev);
-        return;
-      }
-      appendBoundedEvent(allEvents, ev, MAX_EVENTS);
-      recentLive.push(ev);
-      if (recentLive.length > 40) recentLive.shift();
-    };
-    nextWs.onclose = () => {
-      if (seq !== connectionSeq || nextWs !== ws) return;
-      wsReconnectTimer = setTimeout(() => startWS(seq), 1000);
-    };
+  function jump(deltaMs) {
+    seek((play.live ? clock.now : play.playheadMs) + deltaMs);
+    writeHash();
   }
 
-  async function loadModels() {
-    const url = `/detector/${cameraId}/models`;
-    try {
-      if (!cameraId) return;
-      const j = await modelRequests.get(`models:${cameraId}`, url, {
-        timeoutMs: REQUEST_TIMEOUT_MS,
-      });
-      availableModels = Array.isArray(j.models) ? j.models : [];
-      modelWarningText = '';
-    } catch (e) {
-      console.warn('[models] fetch failed', e);
-      availableModels = [];
-      modelWarningText = 'models unavailable';
-    }
+  function onKey(e) {
+    if (e.target.closest('input, select, textarea')) return;
+    if (e.key === ' ') { e.preventDefault(); togglePlay(); }
+    else if (e.key === 'ArrowLeft') jump(e.shiftKey ? -60_000 : -10_000);
+    else if (e.key === 'ArrowRight') jump(e.shiftKey ? 60_000 : 10_000);
+    else if (e.key === 'l') goLive();
   }
 
-  function applyCameraZones(id) {
-    const cam = availableCameras.find(c => c.id === id);
-    detectRoi = Array.isArray(cam?.detect_roi) && cam.detect_roi.length === 4
-      ? cam.detect_roi
-      : null;
-    const decision = cam?.decision_polygon || cam?.action_polygon;
-    actionPolygon = Array.isArray(decision) && decision.length >= 3
-      ? decision
-      : null;
-    applyOverlayRegions(cam);
-  }
-
-  // ---- Initial history fetch ----
-  async function loadHistory() {
-    if (!cameraId) return;
-    const seq = ++historyFetchSeq;
-    const now = normalizeEpochMs(Date.now());
-    const center = normalizeEpochMs(follow ? now : playheadMs);
-    const to = normalizeEpochMs(Math.min(now, center + 15 * 60_000));
-    const from = normalizeEpochMs(Math.max(0, center - HISTORY_EVENTS_WINDOW_MS));
-    const modelKey = selectedModel || '';
-    const cacheKey = `events:${cameraId}:${modelKey}:${from}:${to}`;
-    if (activeHistoryKey && activeHistoryKey !== cacheKey) {
-      historyRequests.abort(`events:${cameraId}:`);
-    }
-    activeHistoryKey = cacheKey;
-    let url = `/detector/${cameraId}/events?from=${from}&to=${to}`;
-    if (selectedModel) url += `&model=${encodeURIComponent(selectedModel)}`;
-    try {
-      const arr = await historyRequests.get(cacheKey, url, { timeoutMs: 2500 });
-      if (seq !== historyFetchSeq || activeHistoryKey !== cacheKey) return;
-      allEvents = mergeBoundedEvents(allEvents, arr, MAX_EVENTS);
-    } catch (e) {
-      if (e?.name === 'AbortError') return;
-      console.warn('[history] fetch failed', e);
-    }
-  }
-
-  function onModelChange() {
-    // Drop stale events and refetch for the newly-selected model. Live WS
-    // events with the right model will flow in automatically.
-    historyRequests.clear(`events:${cameraId}:`);
-    activeHistoryKey = '';
-    historyFetchSeq++;
-    allEvents = [];
-    recentLive = [];
-    loadHistory();
-  }
-
-  function tickNow() {
-    nowMs = Date.now();
-    if (follow) playheadMs = nowMs;
-  }
-
-  // ---- Timeline callback props ----
-  function onSeek(t) {
-    follow = false;
-    playheadMs = normalizeEpochMs(t);
-    loadHistory();
-    scheduleHistorySeek(playheadMs);          // explicitly user-initiated reload
-  }
-  function onEnterLive()     { follow = true;  playheadMs = Date.now(); nowMs = playheadMs; }
-  function onBreakFollow()   { follow = false; }
-
-  // ---- Fullscreen ----
-  function toggleFullscreen(target) {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else target.requestFullscreen();
-  }
-  function toggleVideoFullscreen() { toggleFullscreen(wrap); }
-  function toggleAppFullscreen()   { toggleFullscreen(appRoot); }
-
-  function fmtAbs(ms) { return new Date(ms).toLocaleString(); }
-  function fmtRelative(targetMs) {
-    const delta = targetMs - playheadMs;
-    const abs = Math.abs(delta);
-    const sign = delta >= 0 ? 'in' : 'ago';
-    let s;
-    if (abs < 60_000) s = `${Math.round(abs/1000)}s`;
-    else if (abs < 3600_000) s = `${Math.round(abs/60_000)}min`;
-    else if (abs < 86_400_000) s = `${(abs/3600_000).toFixed(1)}h`;
-    else s = `${(abs/86_400_000).toFixed(1)}d`;
-    return sign === 'in' ? `in ${s}` : `${s} ago`;
-  }
-
-  let rangesTimer = 0;
-  let modelsTimer = 0;
-  let activeRangesKey = '';
-  let activeHistoryKey = '';
-  let rangesFetchSeq = 0;
-  let historyFetchSeq = 0;
-  async function loadCameras() {
-    try {
-      const r = await fetch('/cameras.json');
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j = await r.json();
-      availableCameras = j.cameras || [];
-    } catch (e) {
-      console.error('[cameras] failed to fetch /cameras.json', e);
-      availableCameras = [];
-    }
-    // Pick from URL hash if present, else first camera.
-    const params = new URLSearchParams(location.hash.slice(1));
-    const fromHash = params.get('camera');
-    if (fromHash && availableCameras.some(c => c.id === fromHash)) {
-      cameraId = fromHash;
-    } else if (availableCameras.length) {
-      cameraId = availableCameras[0].id;
-    }
-    if (cameraId) applyCameraZones(cameraId);
-  }
-
-  // Switch to a different camera at runtime. Tears down per-camera state
-  // (WS, WebRTC, history events, ranges) and re-bootstraps for the new id.
-  function switchCamera(newId) {
-    if (newId === cameraId) return;
-    const seq = ++connectionSeq;
-    cameraId = newId;
-    clearTimeout(wsReconnectTimer);
-    try { ws && ws.close(); } catch {}
-    ws = null;
-    try { pc && pc.close(); } catch {}
-    pc = null;
-    if (liveVideo?.srcObject) {
-      for (const track of liveVideo.srcObject.getTracks()) track.stop();
-      liveVideo.srcObject = null;
-    }
-    allEvents = [];
-    recentLive = [];
-    hlsRanges = [];
-    rangeWarningText = '';
-    modelWarningText = '';
-    rangesRequests.clear('ranges:');
-    historyRequests.clear('events:');
-    modelRequests.clear('models:');
-    activeRangesKey = '';
-    activeHistoryKey = '';
-    rangesFetchSeq++;
-    historyFetchSeq++;
-    stats = null;
-    applyCameraZones(newId);
-    availableModels = [];
-    selectedModel = '';
-    // Reset playback so a stale historyVideo.src can't fight us.
-    if (historyVideo) {
-      historyVideo.pause();
-      historyVideo.removeAttribute('src');
-      historyVideo.load();
-    }
-    playbackWindowStartMs = 0;
-    playbackWindowEndMs   = 0;
-    // Persist in URL hash without disturbing other keys.
-    const params = new URLSearchParams(location.hash.slice(1));
-    params.set('camera', newId);
-    history.replaceState(null, '', '#' + params.toString());
-    startWS(seq);
-    loadModels();
-    loadHistory();
-    refreshRecordingsList();
-    startWebRTC(seq);
-  }
+  // ---- lifecycle ----
 
   onMount(async () => {
-    // Camera list must load before WS / WHEP / recording URLs are constructed.
-    await loadCameras();
-    startWS();
-    loadModels();
-    loadHistory();
-    refreshRecordingsList();
-    // Don't pre-load playback — wait until the user actually enters
-    // history mode. Saves a 15-min fetch on every page load.
-    startWebRTC(connectionSeq);
-    nowTimer = setInterval(tickNow, 1000);
-    rangesTimer = setInterval(refreshRecordingsList, 30_000);
-    modelsTimer = setInterval(loadModels, 60_000);
-    // Track CSS size via ResizeObserver instead of reading layout each frame.
-    if (canvas) {
-      cssW = canvas.clientWidth;
-      cssH = canvas.clientHeight;
-      ensureCtx();
-      resizeObserver = new ResizeObserver((entries) => {
-        for (const e of entries) {
-          cssW = e.contentRect.width;
-          cssH = e.contentRect.height;
-        }
-        canvasResized = true;
-      });
-      resizeObserver.observe(canvas);
+    cams.list = await (await fetch('/api/cameras')).json();
+    const h = readHash();
+    const now = Date.now();
+    clock.now = now;
+    view.selected = h.cam && (h.cam === 'all' || cams.list.some(c => c.id === h.cam)) ? h.cam : 'all';
+    if (h.from !== null && h.to !== null && h.to > h.from) {
+      view.from = h.from;
+      view.to = h.to;
+      view.follow = false;
+    } else {
+      view.to = now + 3 * 60_000;
+      view.from = view.to - 60 * 60_000;
     }
-    // The draw loop is started/stopped by the showZones effect below; nothing
-    // to draw until zones are shown.
+    if (h.t !== null) seek(h.t); else play.playheadMs = now;
+    loadStatus();
+    loadRanges();
+    statusTimer = setInterval(loadStatus, STATUS_EVERY_MS);
+    rangesTimer = setInterval(loadRanges, RANGES_EVERY_MS);
+    raf = requestAnimationFrame(frame);
   });
+
   onDestroy(() => {
-    clearInterval(nowTimer);
+    cancelAnimationFrame(raf);
+    clearInterval(statusTimer);
     clearInterval(rangesTimer);
-    clearInterval(modelsTimer);
-    clearTimeout(wsReconnectTimer);
-    stopDrawLoop();
-    try { resizeObserver && resizeObserver.disconnect(); } catch {}
-    try { ws && ws.close(); } catch {}
-    try { pc && pc.close(); } catch {}
   });
 
-  // ---- Effect: run the overlay draw loop only while zones are visible ----
+  // Reload ranges when the viewport settles somewhere new.
   $effect(() => {
-    const show = showZones;
-    untrack(() => {
-      if (show) startDrawLoop();
-      else { stopDrawLoop(); clearCanvas(); }
-    });
-  });
-
-  // ---- Effect: mode transitions only ----
-  // We deliberately don't reseek on every playheadMs change here — the
-  // timeupdate event during playback advances playheadMs ~5x/sec, which
-  // would otherwise reload the src every tick (50 MB fetch each time).
-  // User-initiated seeks come through onSeek; playback-extension comes
-  // through onHistoryTime when nearing window end.
-  $effect(() => {
-    const m = mode;
-    untrack(() => {
-      if (m === 'history' && _prevMode === 'live') {
-        userWantsPlaying = true;
-        scheduleHistorySeek(playheadMs);     // initial load on entering history
-      }
-      if (m === 'live' && historyVideo && !historyVideo.paused) {
-        historyVideo.pause();
-      }
-      // The active video element changed; if the overlay loop is running, cancel
-      // the frame callback on the OLD video and re-register on the new one so we
-      // never leave a stray rVFC callback firing on a hidden element.
-      if (_prevMode !== m && drawLoopRunning) {
-        cancelDrawFrame();
-        scheduleNextFrame();
-      }
-      _prevMode = m;
-    });
+    void view.from; void view.to;
+    if (view.follow) return; // the periodic refresh covers following live
+    clearTimeout(rangesDebounce);
+    rangesDebounce = setTimeout(loadRanges, 300);
   });
 </script>
 
-<div class="app" bind:this={appRoot}>
-  <header>
-    <h1>cat-live2</h1>
-    <span class="mode-pill mode-{mode}">{mode}</span>
-    <span class="now">{fmtAbs(playheadMs)}</span>
+<svelte:window onkeydown={onKey} />
 
-    {#if availableCameras.length > 1}
-      <label class="camera-picker">
-        camera:
-        <select value={cameraId} onchange={(e) => switchCamera(e.currentTarget.value)}>
-          {#each availableCameras as c (c.id)}
-            <option value={c.id}>{c.label}</option>
-          {/each}
-        </select>
-      </label>
-    {:else if availableCameras.length === 1}
-      <span class="camera-label">{availableCameras[0].label}</span>
-    {/if}
+<header>
+  <nav>
+    <button class:active={view.selected === 'all'} onclick={() => { view.selected = 'all'; writeHash(); }}>All</button>
+    {#each cams.list as c (c.id)}
+      <button class:active={view.selected === c.id} onclick={() => select(c.id)}>
+        <span class="dot" class:ok={cams.status[c.id]?.connected}></span>{c.id}
+      </button>
+    {/each}
+  </nav>
+  <div class="transport">
+    <button onclick={() => jump(-10_000)} title="Back 10 s (←, shift: 1 min)">⏪</button>
+    <button onclick={togglePlay} title="Play/pause (space)">{play.live || play.playing ? '⏸' : '▶'}</button>
+    <button onclick={() => jump(10_000)} title="Forward 10 s (→, shift: 1 min)" disabled={play.live}>⏩</button>
+    <select bind:value={play.rate} title="Playback speed" disabled={play.live}>
+      {#each RATES as r (r)}<option value={r}>{r}×</option>{/each}
+    </select>
+    <span class="clock">{fmtDateTime(play.playheadMs)}</span>
+    <button class="live" class:on={play.live} onclick={goLive} title="Go live (l)">LIVE</button>
+  </div>
+</header>
 
-    <label class="model-picker">
-      model:
-      <select bind:value={selectedModel} onchange={onModelChange}>
-        <option value="">all</option>
-        {#each availableModels as m (m)}
-          <option value={m}>{m}</option>
-        {/each}
-      </select>
-    </label>
+<main class:grid={view.selected === 'all'}>
+  {#each shown as c (c.id)}
+    <Player camera={c.id} onselect={() => select(c.id)} />
+  {/each}
+  {#if play.gap}
+    <div class="gap">&gt;&gt; {fmtGap(play.gap.lengthMs)}</div>
+  {/if}
+</main>
 
-    {#if stats && mode === 'live'}
-      <span class="stats">
-        {stats.fps_in.toFixed(1)} fps in · {stats.fps_processed.toFixed(1)} proc · {stats.active_tracks} tracks
-      </span>
-    {/if}
-
-    <label class="zones-toggle" title="Show overlay zones">
-      <input type="checkbox" bind:checked={showZones} />
-      zones
-    </label>
-
-    {#if modelWarningText || rangeWarningText}
-      <span class="warn">{[modelWarningText, rangeWarningText].filter(Boolean).join(' · ')}</span>
-    {/if}
-
-    <span class="spacer"></span>
-    <button class="fs-app" onclick={toggleAppFullscreen} title="Fullscreen the whole app">⛶ app</button>
-  </header>
-
-  <main>
-    <div class="player">
-      <div class="wrap" bind:this={wrap}>
-        <video bind:this={liveVideo}
-               autoplay playsinline muted
-               ondblclick={toggleVideoFullscreen}
-               hidden={mode !== 'live'}></video>
-        <video bind:this={historyVideo}
-               playsinline muted
-               ondblclick={toggleVideoFullscreen}
-               ontimeupdate={onHistoryTime}
-               onplay={() => historyPaused = false}
-               onpause={() => historyPaused = true}
-               hidden={mode !== 'history'}></video>
-        <canvas bind:this={canvas} ondblclick={toggleVideoFullscreen}></canvas>
-        {#if showZones}
-          <div class="overlay-legend" aria-label="Overlay legend">
-            <div class="legend-row"><span class="legend-swatch cat"></span><span>cat</span></div>
-            <div class="legend-row"><span class="legend-swatch decision"></span><span>decision</span></div>
-            <div class="legend-row"><span class="legend-swatch food"></span><span>food</span></div>
-            <div class="legend-row"><span class="legend-swatch ignore"></span><span>ignore</span></div>
-          </div>
-        {/if}
-        {#if mode === 'history' && inGap}
-          <div class="history-overlay">
-            <div>no recording at this time</div>
-            <div class="dim">
-              {nextRangeStartMs === null
-                ? 'no recordings after this point'
-                : `next recording: ${fmtRelative(nextRangeStartMs)} (${fmtAbs(nextRangeStartMs)})`}
-            </div>
-          </div>
-        {:else if mode === 'history' && hlsErrorText}
-          <div class="history-overlay">
-            <div>HLS error</div>
-            <div class="dim">{hlsErrorText}</div>
-          </div>
-        {/if}
-        {#if mode === 'history' && !inGap}
-          <button class="play-pause" onclick={toggleHistoryPlay}
-                  title={historyPaused ? 'Play' : 'Pause'}>
-            {historyPaused ? '▶' : '⏸'}
-          </button>
-        {/if}
-        <button class="fs" onclick={toggleVideoFullscreen} title="Fullscreen video only (or double-click video)">⛶</button>
-      </div>
-    </div>
-
-    <Timeline
-      {ranges}
-      events={visibleEvents}
-      {nowMs}
-      {playheadMs}
-      {follow}
-      onseek={onSeek}
-      onenterLive={onEnterLive}
-      onbreakFollow={onBreakFollow}
-    />
-  </main>
-</div>
+<section class="timelines">
+  {#each shown as c (c.id)}
+    <Timeline label={c.id} ranges={cams.ranges[c.id] || []} />
+  {/each}
+</section>
 
 <style>
-  :global(body) { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
-  header { display: flex; align-items: center; gap: 1rem; padding: 0.5rem 1rem; background: #222; border-bottom: 1px solid #333; }
-  header h1 { margin: 0; font-size: 1rem; font-weight: 600; }
-  header .spacer { flex: 1; }
-  .mode-pill { padding: 0.1rem 0.5rem; border-radius: 3px; font-size: 0.75rem; letter-spacing: 1px; text-transform: uppercase; font-weight: 700; }
-  .mode-live    { background: #c0392b; color: white; }
-  .mode-history { background: #555; color: #ddd; }
-  header .now { color: #888; font-family: ui-monospace, monospace; font-size: 0.8rem; }
-  header .fs-app {
-    background: #333; color: #ddd; border: 1px solid #555;
-    padding: 0.2rem 0.6rem; border-radius: 3px; cursor: pointer; font-size: 0.85rem;
-  }
-  header .fs-app:hover { background: #444; }
-  .model-picker, .camera-picker {
-    color: #aaa; font-size: 0.85rem; display: flex; align-items: center; gap: 0.3rem;
-  }
-  .model-picker select, .camera-picker select {
-    background: #2a2a2a; color: #ddd; border: 1px solid #555;
-    padding: 0.15rem 0.3rem; border-radius: 3px;
-    font: inherit;
-  }
-  .camera-label { color: #ccc; font-size: 0.9rem; font-weight: 600; }
-  header .stats {
-    color: #9c9; font-family: ui-monospace, monospace; font-size: 0.8rem;
-  }
-  header .warn {
-    color: #f4c76b; font-family: ui-monospace, monospace; font-size: 0.78rem;
-    white-space: nowrap;
-  }
-  main { padding: 1rem; }
-
-  .player { margin-bottom: 0.6rem; }
-  .wrap {
-    position: relative;
-    width: 100%;
-    max-width: 1280px;
-    aspect-ratio: 16 / 9;
-    background: #000;
-  }
-  video {
-    position: absolute; inset: 0;
-    width: 100%; height: 100%;
-    display: block;
-    object-fit: contain;
-    background: #000;
-  }
-  video[hidden] { display: none; }
-  canvas {
-    position: absolute; inset: 0;
-    width: 100%; height: 100%;
-    pointer-events: none;
-    background: transparent;
-  }
-  .overlay-legend {
-    display: grid;
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    z-index: 5;
-    gap: 0.3rem;
-    padding: 0.35rem 0.45rem;
-    border: 1px solid rgba(255,255,255,0.18);
-    border-radius: 4px;
-    background: rgba(12,14,18,0.72);
-    color: #e5e7eb;
-    font: 600 0.62rem/1.1 system-ui, sans-serif;
-    text-transform: uppercase;
-    letter-spacing: 0.02em;
-    pointer-events: none;
-    backdrop-filter: blur(6px);
-  }
-  .legend-row {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    white-space: nowrap;
-  }
-  .legend-swatch {
-    width: 0.7rem;
-    height: 0.7rem;
-    border: 2px solid currentColor;
-    background: rgba(255,255,255,0.08);
-    flex: 0 0 auto;
-  }
-  .legend-swatch.cat { color: rgb(0,255,136); }
-  .legend-swatch.decision { color: #ffd454; border-style: dashed; }
-  .legend-swatch.food { color: #c084fc; border-style: dashed; background: rgba(192,132,252,0.13); }
-  .legend-swatch.ignore { color: #ff6b6b; border-style: dashed; background: rgba(255,107,107,0.14); }
-  .history-overlay {
-    position: absolute; inset: 0;
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    background: rgba(0,0,0,0.55); color: #ddd; text-align: center;
-    font-family: ui-monospace, monospace; gap: 0.5rem;
-  }
-  .history-overlay .dim { color: #888; font-size: 0.85rem; }
-  .fs {
-    position: absolute; right: 8px; bottom: 8px;
-    background: rgba(0,0,0,0.55); color: #fff; border: 1px solid #555;
-    font-size: 1.1rem; padding: 0.1rem 0.5rem; border-radius: 3px; cursor: pointer;
-  }
-  .fs:hover { background: rgba(0,0,0,0.8); }
-  .play-pause {
-    position: absolute; left: 8px; bottom: 8px;
-    background: rgba(0,0,0,0.55); color: #fff; border: 1px solid #555;
-    font-size: 1.1rem; padding: 0.1rem 0.6rem; border-radius: 3px; cursor: pointer;
-    line-height: 1;
-  }
-  .play-pause:hover { background: rgba(0,0,0,0.8); }
-  .zones-toggle {
-    display: flex; align-items: center; gap: 0.3rem;
-    color: #aaa; font-size: 0.85rem; cursor: pointer; user-select: none;
-  }
-  .zones-toggle input { cursor: pointer; }
-  .wrap:fullscreen { width: 100vw; height: 100vh; background: #000; display: flex; align-items: center; justify-content: center; }
-  .wrap:fullscreen video,
-  .wrap:fullscreen canvas { width: 100%; height: 100%; max-width: none; object-fit: contain; }
-  .wrap:fullscreen canvas { position: absolute; inset: 0; }
-
-  .app:fullscreen {
-    height: 100vh;
-    width: 100vw;
-    display: flex;
-    flex-direction: column;
+  :global(body) {
+    margin: 0;
     background: #111;
-    overflow: hidden;
+    color: #ddd;
+    font-family: system-ui, sans-serif;
   }
-  .app:fullscreen main {
-    flex: 1;
-    min-height: 0;
+  :global(#app) {
     display: flex;
     flex-direction: column;
-    padding: 0.5rem 1rem;
-    gap: 0.5rem;
+    gap: 8px;
+    padding: 8px;
+    min-height: 100vh;
+    box-sizing: border-box;
   }
-  .app:fullscreen .player {
-    flex: 1;
-    min-height: 0;
-    margin-bottom: 0;
+  header {
     display: flex;
-    align-items: center;
-    justify-content: center;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px;
   }
-  .app:fullscreen .wrap {
-    width: 100%;
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #000;
+  nav, .transport { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  button, select {
+    background: #222;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font: inherit;
+    cursor: pointer;
   }
-  .app:fullscreen .wrap video,
-  .app:fullscreen .wrap canvas {
+  button:disabled, select:disabled { opacity: 0.4; cursor: default; }
+  button.active { background: #2f4f6f; border-color: #4f7faf; }
+  .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #a33;
+    margin-right: 6px;
+  }
+  .dot.ok { background: #3a3; }
+  .clock { font-family: ui-monospace, monospace; padding: 0 6px; }
+  .live { font-weight: 700; letter-spacing: 1px; }
+  .live.on { background: #c0392b; border-color: #e04535; color: #fff; }
+  main {
+    position: relative;
+    display: grid;
+    gap: 8px;
+    /* Single camera: as large as fits above the timeline. */
+    max-height: calc(100vh - 200px);
+    aspect-ratio: 16 / 9;
+    margin: 0 auto;
     width: 100%;
-    height: 100%;
+    max-width: calc((100vh - 200px) * 16 / 9);
+  }
+  main.grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+    aspect-ratio: auto;
+    max-height: none;
     max-width: none;
-    object-fit: contain;
   }
-  .app:fullscreen .wrap canvas { position: absolute; inset: 0; }
+  .gap {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    font: 700 4rem ui-monospace, monospace;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+  }
+  .timelines { display: flex; flex-direction: column; gap: 4px; }
 </style>

@@ -27,17 +27,18 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
-// Camera is one camera.
+// Camera is one camera. Its id is also its name everywhere (UI, paths).
 type Camera struct {
-	ID    string `yaml:"id"`
-	Label string `yaml:"label"`
-	RTSP  string `yaml:"rtsp"`
+	ID   string `yaml:"id"`
+	RTSP string `yaml:"rtsp"`
 }
 
 // Streamhub holds streamhub's settings.
 type Streamhub struct {
 	Listen     string     `yaml:"listen"`
 	Recordings Recordings `yaml:"recordings"`
+	// WebUIDir is the built webui to serve; empty disables it.
+	WebUIDir string `yaml:"webui_dir"`
 }
 
 // Recordings holds recording settings.

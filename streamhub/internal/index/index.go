@@ -146,6 +146,25 @@ func (x *Index) Query(camera string, from, to time.Time) []Entry {
 	return out
 }
 
+// Range is a span of continuous recording.
+type Range struct {
+	Start, End time.Time
+}
+
+// Ranges returns the camera's recorded spans overlapping [from, to), merging
+// segments separated by at most maxGap.
+func (x *Index) Ranges(camera string, from, to time.Time, maxGap time.Duration) []Range {
+	var out []Range
+	for _, e := range x.Query(camera, from, to) {
+		if n := len(out); n > 0 && e.Start.Sub(out[n-1].End) <= maxGap {
+			out[n-1].End = e.End()
+			continue
+		}
+		out = append(out, Range{Start: e.Start, End: e.End()})
+	}
+	return out
+}
+
 // RescanEvery rescans the tree periodically until ctx is cancelled.
 func (x *Index) RescanEvery(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)

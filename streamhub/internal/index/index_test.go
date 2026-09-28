@@ -62,6 +62,14 @@ func TestScanQueryRemove(t *testing.T) {
 		t.Fatalf("after delete: got %d", len(got))
 	}
 
+	// Contiguous segments merge into one range; the gap before a far one doesn't.
+	x.Add(segment.Info{Camera: "grey", Start: t0.Add(time.Hour), Duration: time.Second, Path: "far"}, 1)
+	rs := x.Ranges("grey", t0, t0.Add(2*time.Hour), time.Second)
+	if len(rs) != 2 || !rs[0].Start.Equal(t0.Add(10*time.Second)) || !rs[0].End.Equal(t0.Add(30*time.Second)) {
+		t.Fatalf("ranges: %+v", rs)
+	}
+	x.Remove("far")
+
 	x.Remove(filepath.ToSlash(paths[1]))
 	x.Add(segment.Info{Camera: "grey", Start: t0.Add(-time.Minute), Duration: 10 * time.Second, Path: "p"}, 1)
 	got = x.Query("grey", t0.Add(-time.Hour), t0.Add(time.Hour))

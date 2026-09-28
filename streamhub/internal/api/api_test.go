@@ -31,7 +31,7 @@ func TestRecordingsAndFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{
-		Cameras: []config.Camera{{ID: "grey", Label: "Grey"}},
+		Cameras: []config.Camera{{ID: "grey"}},
 		Sources: map[string]*ingest.Source{"grey": ingest.NewSource("grey", "rtsp://x", media.NewStream(), log)},
 		Index:   idx,
 		Root:    root,

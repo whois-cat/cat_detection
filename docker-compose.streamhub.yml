@@ -7,7 +7,9 @@
 
 services:
   streamhub:
-    build: ./streamhub
+    build:
+      context: .
+      dockerfile: streamhub/Dockerfile
     restart: unless-stopped
     # Recordings are owned by the invoking user, not root.
     user: "${UID:-1000}:${GID:-1000}"

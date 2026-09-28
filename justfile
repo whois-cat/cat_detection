@@ -82,10 +82,16 @@ sh-logs:
 sh-status PORT=env_var_or_default("STREAMHUB_PORT", "8096"):
     curl -s http://127.0.0.1:{{PORT}}/api/status | python3 -m json.tool
 
-# Run streamhub's tests.
+# Run streamhub's and the webui's tests.
 [group('streamhub')]
 sh-test:
     cd streamhub && go vet ./... && go test ./...
+    cd webui && npm test
+
+# Webui dev server (hot reload) against a running streamhub.
+[group('streamhub')]
+webui-dev STREAMHUB=("http://127.0.0.1:" + env_var_or_default("STREAMHUB_PORT", "8096")):
+    cd webui && npm install --no-audit --no-fund && STREAMHUB={{STREAMHUB}} npm run dev
 
 # ───────────────────────────── setup ─────────────────────────────
 

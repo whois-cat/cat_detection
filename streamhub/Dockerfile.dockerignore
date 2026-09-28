@@ -1,0 +1,9 @@
+# Context is the repo root; only these are needed.
+*
+!streamhub/go.mod
+!streamhub/go.sum
+!streamhub/cmd
+!streamhub/internal
+!webui
+webui/node_modules
+webui/dist

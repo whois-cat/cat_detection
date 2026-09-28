@@ -11,6 +11,7 @@ require (
 
 require (
 	github.com/abema/go-mp4 v1.7.3 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/pion/logging v0.2.4 // indirect

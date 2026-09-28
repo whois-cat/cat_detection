@@ -80,11 +80,13 @@ func run(configPath string, log *slog.Logger) error {
 	// fatal receives the first error that must bring the service down.
 	fatal := make(chan error, len(cfg.Cameras)+1)
 	sources := map[string]*ingest.Source{}
+	streams := map[string]*media.Stream{}
 	target := time.Duration(cfg.Streamhub.Recordings.SegmentTarget)
 	for _, cam := range cfg.Cameras {
 		stream := media.NewStream()
 		src := ingest.NewSource(cam.ID, cam.RTSP, stream, log)
 		sources[cam.ID] = src
+		streams[cam.ID] = stream
 		rec := recorder.New(cam.ID, root, target, func(info segment.Info, size int64) {
 			idx.Add(info, size)
 			log.Debug("segment finished", "path", info.Path, "duration", info.Duration, "size", size)
@@ -104,7 +106,8 @@ func run(configPath string, log *slog.Logger) error {
 	srv := &http.Server{
 		Addr: cfg.Streamhub.Listen,
 		Handler: (&api.Server{
-			Cameras: cfg.Cameras, Sources: sources, Index: idx, Root: root, Log: log,
+			Cameras: cfg.Cameras, Sources: sources, Streams: streams, Index: idx, Root: root,
+			WebUIDir: cfg.Streamhub.WebUIDir, Log: log,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
