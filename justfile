@@ -57,6 +57,36 @@ ps:
 logs SERVICE="":
     {{COMPOSE}} logs -f --tail=200 {{SERVICE}}
 
+# ─────────────────────────── new stack ───────────────────────────
+# Runs alongside the old stack during the migration (see PLAN.md).
+
+SH_COMPOSE := "docker compose -f docker-compose.streamhub.yml"
+
+# Build and start streamhub.
+[group('streamhub')]
+sh-up:
+    {{SH_COMPOSE}} up -d --build
+
+# Stop streamhub.
+[group('streamhub')]
+sh-down:
+    {{SH_COMPOSE}} down
+
+# Tail streamhub logs.
+[group('streamhub')]
+sh-logs:
+    {{SH_COMPOSE}} logs -f --tail=200 streamhub
+
+# Per-camera ingest status (connection, fps, clock correction).
+[group('streamhub')]
+sh-status PORT=env_var_or_default("STREAMHUB_PORT", "8096"):
+    curl -s http://127.0.0.1:{{PORT}}/api/status | python3 -m json.tool
+
+# Run streamhub's tests.
+[group('streamhub')]
+sh-test:
+    cd streamhub && go vet ./... && go test ./...
+
 # ───────────────────────────── setup ─────────────────────────────
 
 # One-time dependency check/warmup. TARGET: label | train | all (default).

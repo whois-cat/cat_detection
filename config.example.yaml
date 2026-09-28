@@ -1,0 +1,31 @@
+# Shared config for the new stack (see PLAN.md §8). Copy to config.yaml
+# (gitignored) and adjust. Each component reads only its own keys; camera `id`
+# is what ties sections together.
+#
+# `${VAR}` is replaced from the environment (for docker compose: from
+# secrets/streamhub.env); an unset variable is an error. Quote values that may
+# contain YAML-special characters once expanded.
+
+# Runtime state. Inside the container this is the mounted ./data/streamhub.
+data_dir: /data
+
+cameras:
+  - id: grey
+    label: Regular feed
+    rtsp: "rtsp://camera:${CAM_GREY_PASSWORD}@192.168.0.213:554/stream1"
+  - id: beige
+    label: Medical feed
+    rtsp: "rtsp://camera:${CAM_BEIGE_PASSWORD}@192.168.0.214:554/stream1"
+  - id: black
+    label: Felisis feed
+    rtsp: "rtsp://camera:${CAM_BLACK_PASSWORD}@192.168.0.215:554/stream1"
+
+streamhub:
+  listen: ":8090"
+  recordings:
+    # Segments end at the first keyframe after this length.
+    segment_target: 10s
+    # Put CACHEDIR.TAG into the recordings dir so backup tools skip it.
+    cachedir_tag: true
+    # How often to rescan the recordings dir for files deleted by others.
+    rescan: 1m

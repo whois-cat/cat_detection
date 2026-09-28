@@ -1,0 +1,22 @@
+# New stack (see PLAN.md). Runs alongside the old one during the migration:
+# it uses each camera's second RTSP session slot and its own data dir and port.
+#
+#   docker compose -f docker-compose.streamhub.yml up -d --build
+#
+# `just sh-up` / `just sh-logs` wrap this.
+
+services:
+  streamhub:
+    build: ./streamhub
+    restart: unless-stopped
+    # Recordings are owned by the invoking user, not root.
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "${STREAMHUB_PORT:-8096}:8090"
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - ./data/streamhub:/data
+    # Values for ${VAR} references in config.yaml (e.g. RTSP credentials).
+    env_file:
+      - path: ./secrets/streamhub.env
+        required: false
