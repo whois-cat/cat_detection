@@ -8,6 +8,14 @@ export const cams = $state({
   events: {},    // id -> [{wall_ms, cat, n, dur}] detection counts per dur-ms bucket
 });
 
+// Per-browser preferences (localStorage may be unavailable: private mode, etc.).
+function pref(key, fallback) {
+  try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; }
+}
+export function savePref(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* not persisted */ }
+}
+
 export const view = $state({
   from: 0,        // timeline viewport, wall-clock ms
   to: 0,
@@ -15,6 +23,7 @@ export const view = $state({
   follow: true,   // viewport's right edge tracks now
   dragging: false, // a timeline is being panned/pinched
   selected: 'all', // 'all' (grid) or a camera id
+  details: pref('details', false), // per-camera CV/decider details panel
 });
 
 export const play = $state({

@@ -3,7 +3,7 @@
   import Player from './Player.svelte';
   import Timeline from './Timeline.svelte';
   import {
-    cams, view, play, clock, visibleCameras, goLive, seek, animating, readHash, writeHash,
+    cams, view, play, clock, visibleCameras, goLive, seek, animating, readHash, writeHash, savePref,
   } from './lib/state.svelte.js';
   import { fmtDateTime, fmtGap, rangeIndexAt, nextRangeStart } from './lib/time.js';
 
@@ -182,12 +182,15 @@
       {#each RATES as r (r)}<option value={r}>{r}×</option>{/each}
     </select>
     <span class="clock">{fmtDateTime(play.playheadMs)}</span>
+    <label class="toggle" title="Per-camera CV results and decider state for the shown frame">
+      <input type="checkbox" bind:checked={view.details} onchange={() => savePref('details', view.details)} /> details
+    </label>
   </div>
 </header>
 
-<main class:grid={view.selected === 'all'}>
+<main class:grid={view.selected === 'all'} class:details={view.details}>
   {#each shown as c (c.id)}
-    <Player camera={c.id} onselect={() => select(c.id)} />
+    <Player camera={c.id} onselect={() => select(c.id)} side={view.selected !== 'all'} />
   {/each}
   {#if play.gap}
     <div class="gap">&gt;&gt; {fmtGap(play.gap.lengthMs)}</div>
@@ -260,6 +263,12 @@
     width: 100%;
     max-width: calc((100vh - 200px) * 16 / 9);
   }
+  /* Single camera with details: the panel sits beside the video. */
+  main.details:not(.grid) {
+    aspect-ratio: auto;
+    max-width: calc((100vh - 200px) * 16 / 9 + 23rem);
+  }
+  .toggle { display: flex; align-items: center; gap: 4px; padding: 0 6px; cursor: pointer; }
   main.grid {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
     aspect-ratio: auto;

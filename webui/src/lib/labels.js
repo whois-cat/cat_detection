@@ -12,7 +12,10 @@ export class LabelStore {
 
   // add accepts a hub/sidecar result (pts in 90 kHz ticks).
   add(r) {
-    const item = { ms: r.pts / (CLOCK_RATE / 1000), dets: r.dets || [], model: r.model, infer_ms: r.infer_ms, decision: r.decision };
+    const item = {
+      ms: r.pts / (CLOCK_RATE / 1000), dets: r.dets || [], model: r.model, worker: r.worker,
+      infer_ms: r.infer_ms, decision: r.decision,
+    };
     const a = this.items;
     if (!a.length || a[a.length - 1].ms < item.ms) { a.push(item); return; }
     const i = this.index(item.ms);

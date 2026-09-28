@@ -33,6 +33,8 @@ services:
     depends_on: [streamhub]
     environment:
       STREAMHUB_HUB: streamhub:9000
+      # Shown in the web UI and logs (default would be the container id).
+      CV_WORKER_ID: local
       CV_MODEL: yolo_cat
       # Inferences per second per camera at most; caps CPU use (0 = unlimited).
       CV_MAX_FPS: "2"
@@ -73,6 +75,7 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       STREAMHUB_HUB: streamhub:9000
+      DECIDER_ID: decider
       # 1 forces a dry run (never calls the feeder API), whatever config.yaml says.
       DECIDER_DRY_RUN: ${DECIDER_DRY_RUN:-}
       # Scheduled feeding times are local to feed.tz; logs use this.

@@ -3,12 +3,14 @@
   // the shared playback state.
   import { onMount, onDestroy, untrack } from 'svelte';
   import { LiveSource, HistorySource } from './lib/sources.js';
-  import { play, cams } from './lib/state.svelte.js';
+  import { play, cams, view } from './lib/state.svelte.js';
+  import Details from './Details.svelte';
   import { fmtDateTime } from './lib/time.js';
   import { LabelStore, DecisionStore, topCat, describeDecision } from './lib/labels.js';
   import { catColor } from './lib/colors.js';
 
-  let { camera, onselect } = $props();
+  // side: details panel beside the video (single camera) rather than below.
+  let { camera, onselect, side = false } = $props();
 
   // History players re-sync to the playhead this often.
   const UPDATE_MS = 200;
@@ -22,6 +24,10 @@
   const decisionStore = new DecisionStore();
   let decisions = $state([]); // latest per feeder at the shown frame
   let frameHandle;
+  // Result used for the frame on screen (updated per frame, not reactive) and
+  // its reactive copy for the details panel (refreshed every UPDATE_MS).
+  let frameResult = null, frameMs = null;
+  let panel = $state({ result: null, age: 0 });
   let source = null;
   let mode = null;
   let hasData = $state(true);
@@ -61,6 +67,10 @@
     if (JSON.stringify(next) !== JSON.stringify(decisions)) decisions = next;
     // Also redraw here: labels can arrive after a paused frame was shown.
     drawOverlay(video.currentTime);
+    if (view.details) {
+      const age = frameResult && frameMs != null ? frameMs - frameResult.ms : 0;
+      if (panel.result !== frameResult || Math.abs(panel.age - age) > 50) panel = { result: frameResult, age };
+    }
   }
 
   // drawOverlay draws the boxes of the newest result at or before the frame
@@ -76,8 +86,9 @@
     const ctx = canvas.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, ew, eh);
-    const frameMs = source?.sink.frameWallMs(mediaTime);
-    const r = frameMs != null && labels.at(frameMs);
+    frameMs = source?.sink.frameWallMs(mediaTime) ?? null;
+    const r = frameMs != null ? labels.at(frameMs) : null;
+    frameResult = r;
     if (!r || !r.dets.length || !video.videoWidth) return;
     const scale = Math.min(ew / video.videoWidth, eh / video.videoHeight);
     const dw = video.videoWidth * scale, dh = video.videoHeight * scale;
@@ -85,13 +96,13 @@
     ctx.setLineDash(frameMs - r.ms > STALE_MS ? [6, 4] : []);
     ctx.lineWidth = 2;
     ctx.font = '12px ui-monospace, monospace';
-    for (const d of r.dets) {
+    r.dets.forEach((d, i) => {
       const [bx, by, bw, bh] = d.box;
       const x = ox + bx * dw, y = oy + by * dh;
       const cat = topCat(d);
       const p = d.cats?.[cat];
-      // identity probability · detector's confidence that this is a cat at all
-      const text = `${cat}${p != null ? ` ${Math.round(p * 100)}%` : ''} · det ${d.score.toFixed(2)}`;
+      // #n (as in the details panel), identity probability, YOLO's cat score
+      const text = `#${i + 1} ${cat}${p != null ? ` ${Math.round(p * 100)}%` : ''} · yolo ${d.score.toFixed(2)}`;
       ctx.strokeStyle = ctx.fillStyle = catColor(cat);
       ctx.strokeRect(x, y, bw * dw, bh * dh);
       const tw = ctx.measureText(text).width + 6;
@@ -99,7 +110,7 @@
       ctx.fillRect(x - 1, ty, tw, 16);
       ctx.fillStyle = '#000';
       ctx.fillText(text, x + 2, ty + 12);
-    }
+    });
   }
 
   function onVideoFrame(_now, meta) {
@@ -119,13 +130,14 @@
   });
 </script>
 
+<div class="cam" class:side={side && view.details}>
 <div class="player">
   <!-- svelte-ignore a11y_media_has_caption -->
   <video bind:this={video} muted playsinline></video>
   <canvas class="overlay" bind:this={canvas}></canvas>
   <button class="label" onclick={onselect} title="Show only this camera">{camera}</button>
   {#if shownMs}<div class="time">{fmtDateTime(shownMs)}</div>{/if}
-  {#if decisions.length}
+  {#if decisions.length && !view.details}
     <div class="decisions">
       {#each decisions as d (d.feeder)}<div class:open={d.state === 'open'}>{describeDecision(d)}</div>{/each}
     </div>
@@ -138,8 +150,17 @@
     <div class="notice dim">loading…</div>
   {/if}
 </div>
+{#if view.details}
+  <Details result={panel.result} age={panel.age} {decisions} />
+{/if}
+</div>
 
 <style>
+  .cam { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .cam.side { flex-direction: row; height: 100%; }
+  .cam :global(.details) { max-height: 14rem; }
+  .cam.side :global(.details) { width: 22rem; flex: none; max-height: none; }
+  .cam.side .player { flex: 1; align-self: flex-start; }
   .player {
     position: relative;
     aspect-ratio: 16 / 9;
