@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from detectors import identity_crop_box
+from cv_worker.models.yolo import identity_crop_box
 from training.db import Box
 from training.sources import _local_box, _pad_crop
 

@@ -12,7 +12,7 @@ Requires torch + torchvision + openvino (build-time only).
 Parity gate
 -----------
 Exporting to OpenVINO is a classic drift point: the runtime path
-(detector/classifier.py::_preprocess + OpenVINO inference) must produce the
+(cv_worker/models/classifier.py::preprocess + OpenVINO inference) must produce the
 same logits the trained torch model would, or identity decisions silently
 diverge from training. After export this script PROVES that and FAILS the build
 on any mismatch. Two independent gates:
@@ -40,7 +40,7 @@ Correctness-by-construction notes (each kills a known cause of false/real drift)
   - FP32 inference is forced via INFERENCE_PRECISION_HINT=f32 on the CPU plugin.
     This is THE one that mattered: the plugin runs FP32 IRs in bf16 by default on
     AVX512_BF16/AMX CPUs, whose ~8-bit mantissa shifts logits by up to ~1e1
-    (argmax usually survives, magnitudes don't). classifier.py sets the same hint
+    (argmax usually survives, magnitudes don't). cv_worker's classifier sets the same hint
     at runtime, so the gate matches production.
   - The IR is saved with compress_to_fp16=False (the on-disk weights stay FP32).
   - The torch model is in eval() under torch.inference_mode() for the reference
@@ -56,6 +56,9 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+
+# cv_worker (the runtime classifier) lives next to this tools/ directory.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # The gate compares softmax PROBABILITIES (== the runtime cat_score), not raw
 # logits: classifier.py returns softmax(logits).max(), the feeder votes by that
@@ -106,7 +109,7 @@ def _model_parity_inputs(crops_dir: Path | None) -> list:
     import numpy as np
 
     crops = _load_real_crops(crops_dir) if crops_dir is not None else _synthetic_uint8_crops()
-    from classifier import _preprocess
+    from cv_worker.models.classifier import preprocess as _preprocess
 
     inputs = [np.ascontiguousarray(_preprocess(c), dtype=np.float32) for c in crops]
     kind = "real" if crops_dir is not None else "synthetic"
@@ -122,7 +125,7 @@ def _check_preprocess_parity(crops_dir: Path | None) -> None:
     import numpy as np
     from torchvision import transforms
 
-    from classifier import _preprocess  # the runtime preprocessing under test
+    from cv_worker.models.classifier import preprocess as _preprocess  # the runtime preprocessing under test
 
     crops = _load_real_crops(crops_dir) if crops_dir is not None else _synthetic_uint8_crops()
 
@@ -145,7 +148,7 @@ def _check_preprocess_parity(crops_dir: Path | None) -> None:
         sys.exit(
             f"[parity] FAIL: runtime _preprocess drifted from the training "
             f"transform (max|Δ|={worst:.3e} >= {PARITY_TOL:.0e}). "
-            "Reconcile detector/classifier.py::_preprocess with the torchvision "
+            "Reconcile cv_worker/models/classifier.py::preprocess with the torchvision "
             "Resize(256)+CenterCrop(224)+Normalize pipeline before shipping."
         )
 

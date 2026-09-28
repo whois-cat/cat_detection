@@ -129,7 +129,7 @@ def test_bounded_cache_single_oversized_item_not_retained():
 def test_iter_crop_refs_enumerates_without_decoding(tmp_path):
     """CropSource.iter_crop_refs yields lightweight (stub, CropRef) pairs from
     the DB alone — no recordings touched, no pixels decoded."""
-    from storage import init_db, insert_event  # detector storage (on sys.path)
+    from training.events_store import init_db, insert_event
 
     from training.sources import CropSource
 

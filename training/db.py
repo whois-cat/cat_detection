@@ -4,7 +4,7 @@ The detector writes one row per detected box; multiple boxes in one frame
 share `wall_ms` (and `pts`). For training we usually want them re-grouped
 back into per-frame records.
 
-Schema reference: live2/detector/storage.py
+Schema reference: training/events_store.py
 """
 from __future__ import annotations
 

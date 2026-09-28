@@ -168,13 +168,3 @@ def test_rollback_refuses_unknown_version(tmp_path):
 
 
 # ---- restart service discovery ----------------------------------------------
-
-def test_select_detector_services_excludes_infra():
-    names = ["mediamtx", "pruner", "indexer", "webui", "mlflow",
-             "detector-grey", "detector-beige", "feeder-feeder1"]
-    assert P.select_detector_services(names) == ["detector-grey", "detector-beige"]
-
-
-def test_select_detector_services_handles_generated_names():
-    names = ["detector-cam_a", "detector-cam_b", "detector-kitchen_2"]
-    assert P.select_detector_services(names) == names

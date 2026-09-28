@@ -7,8 +7,8 @@ Runtime model delivery is volume-mounted, not baked into the image:
       current  -> versions/<active_version>     (symlink)
       previous -> versions/<previous_version>   (symlink)
 
-Detector containers mount ``./models/classifier:/opt/models/classifier:ro`` and
-read ``CLASSIFIER_WEIGHTS=/opt/models/classifier/current``. Promotion exports a
+The cv-worker container mounts ``./models/classifier:/opt/models/classifier:ro``
+and reads ``CLASSIFIER_DIR=/opt/models/classifier/current``. Promotion exports a
 trained checkpoint to the OpenVINO runtime format into a NEW version dir and
 atomically switches the ``current`` symlink. Containers pick it up only after an
 explicit restart (``just classifier-restart``) — no image rebuild, no hot reload.
@@ -17,7 +17,6 @@ Training never touches this tree; promotion is explicit and validated.
 
     python tools/promote_classifier.py promote  [--src PATH]      # default: latest trained
     python tools/promote_classifier.py rollback [--version ID]    # default: -> previous
-    python tools/promote_classifier.py services                   # stdin svc names -> detector ones
 """
 from __future__ import annotations
 
@@ -36,7 +35,7 @@ TRAINED_ROOT = ROOT / "models" / "trained"
 CLASSIFIER_ROOT = ROOT / "models" / "classifier"
 
 REQUIRED_RUNTIME_FILES = ("cat_classifier.xml", "cat_classifier.bin", "classes.json")
-RESTART_HINT = "Next: restart the detector containers to load it:\n    just classifier-restart"
+RESTART_HINT = "Next: restart cv-worker to load it:\n    just classifier-restart"
 
 
 # ---- discovery / validation -------------------------------------------------
@@ -78,7 +77,7 @@ def validate_checkpoint(path: Path) -> dict:
 def validate_runtime_artifact(version_dir: Path) -> list[str]:
     """Confirm an exported version dir has the runtime files and a non-empty,
     valid classes.json. Returns the class list; raises ValueError otherwise.
-    (Output-dim/IR check needs OpenVINO; the export parity gate + the detector
+    (Output-dim/IR check needs OpenVINO; the export parity gate + cv-worker's
     runtime guard cover that — this stays dependency-free.)"""
     version_dir = Path(version_dir)
     for name in REQUIRED_RUNTIME_FILES:
@@ -97,16 +96,16 @@ def validate_runtime_artifact(version_dir: Path) -> list[str]:
 
 def default_export(src_pt: Path, out_dir: Path) -> None:
     """Export a torch checkpoint to OpenVINO IR + classes.json by reusing the
-    existing detector/export_classifier.py (which includes the parity gate).
-    Runs in-process via subprocess; requires torch + openvino (present in the
-    detector image, which is where `just classifier-promote` runs)."""
-    script = ROOT / "detector" / "export_classifier.py"
+    cv-worker/tools/export_classifier.py (which includes the parity gate).
+    Runs via subprocess; requires torch + openvino (present in the cv-worker
+    image, which is where `just classifier-promote` runs)."""
+    script = ROOT / "cv-worker" / "tools" / "export_classifier.py"
     cmd = [sys.executable, str(script), "--pt", str(src_pt), "--out", str(out_dir)]
     proc = subprocess.run(cmd)
     if proc.returncode != 0:
         raise RuntimeError(
             f"export failed (exit {proc.returncode}): {' '.join(cmd)}. "
-            "Run this inside the detector image (torch + openvino), e.g. via "
+            "Run this inside the cv-worker image (torch + openvino), e.g. via "
             "`just classifier-promote`."
         )
 
@@ -223,12 +222,6 @@ def rollback(version: str | None, *, classifier_root: Path = CLASSIFIER_ROOT) ->
     return {"version_id": target, "previous_version": rolling_from, "current": current}
 
 
-def select_detector_services(names) -> list[str]:
-    """Detector services use the classifier volume; restart only those. Names
-    are generated per-camera (detector-<id>); never db/webui/mediamtx/etc."""
-    return [n for n in names if n.startswith("detector")]
-
-
 # ---- CLI ---------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -239,7 +232,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--src", default="", help="checkpoint path; empty = latest trained")
     r = sub.add_parser("rollback")
     r.add_argument("--version", default="", help="version id; empty = previous")
-    sub.add_parser("services", help="filter detector services from stdin (one name per line)")
     args = ap.parse_args(argv)
 
     if args.cmd == "promote":
@@ -256,11 +248,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[rollback] active version : {res['version_id']}")
         print(f"[rollback] previous       : {res['previous_version'] or '(none)'}")
         print(RESTART_HINT)
-        return 0
-    if args.cmd == "services":
-        names = [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
-        for s in select_detector_services(names):
-            print(s)
         return 0
     raise AssertionError(args.cmd)
 

@@ -2,7 +2,7 @@
 so they are durable/visible without an explicit flush step."""
 import sqlite3
 
-from storage import init_db, insert_event, query_events
+from training.events_store import init_db, insert_event, query_events
 
 
 def _insert(conn, wall_ms):

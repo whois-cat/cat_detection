@@ -9,7 +9,7 @@ Pipeline (all reused from this package):
   - training.db.iter_frames        — collect reviewed crop refs/metadata
   - training.reviews.load_reviews  — human corrections {rowid: label}
   - training.sources.decode_crop_batch — decode only the current batch in RAM
-  - detector/classifier.py::_preprocess — the EXACT runtime eval transform
+  - cv_worker/models/classifier.py::preprocess — the EXACT runtime eval transform
 
 Label policy (flags; safe defaults):
   - cold start: ONLY human labels are trusted.
@@ -926,11 +926,8 @@ def main() -> None:
     if args.torch_threads > 0:
         torch.set_num_threads(args.torch_threads)
 
-    try:
-        from classifier import _preprocess  # exact runtime eval preprocessing
-    except ImportError:
-        sys.path.insert(0, str(ROOT / "detector"))
-        from classifier import _preprocess
+    sys.path.insert(0, str(ROOT / "cv-worker"))
+    from cv_worker.models.classifier import preprocess as _preprocess  # exact runtime eval preprocessing
     from training import load_reviews
     from training.reviews import load_review_rows
     from training.ram import log_rss
@@ -1545,9 +1542,9 @@ def main() -> None:
             "resize_short_side": args.resize_short, "center_crop": args.image_size,
             "mean": IMAGENET_MEAN, "std": IMAGENET_STD,
             "interpolation": "bilinear",
-            "note": ("byte-identical to detector/classifier.py::_preprocess"
+            "note": ("byte-identical to cv_worker/models/classifier.py::preprocess"
                      if args.image_size == INPUT_SIZE else
-                     "WARNING: image_size != runtime default; detector/classifier.py "
+                     "WARNING: image_size != runtime default; cv_worker/models/classifier.py "
                      "still preprocesses to 256->224 — align serve-time preprocessing "
                      "before promoting"),
         },

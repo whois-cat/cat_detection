@@ -336,7 +336,7 @@ class CropSource(SampleSource):
 def rotate_crop(crop: np.ndarray, rotate_deg: int | None) -> np.ndarray:
     """Rotate a camera-orientation crop into the detector's INFERENCE orientation.
 
-    SINGLE shared helper — same convention as detector/main.py's `_ROT90_K`: the
+    SINGLE shared helper — same convention as cv-worker's geometry.prepare(): the
     camera is mounted rotated and we rotate the inference input CW by rotate_deg;
     np.rot90 turns CCW, so the matching factor is k = (-rotate_deg // 90) % 4.
     rotate_deg is per-event (0/90/180/270); 0/None is a no-op so users with no

@@ -7,71 +7,43 @@ server pulls, and future Codex sessions.
 ## What This System Does
 
 `cat_detection` is a local, multi-camera cat detection and feeder-control stack.
-The system records camera video, detects cats, serves a live/history web UI,
-stores detection events, supports human review, trains an identity classifier,
-and uses the classifier to open a feeder only for allowed cats.
+It records camera video without re-encoding, detects and identifies cats per
+frame, serves a live/history web UI with frame-exact detections, stores every
+CV result and feeder decision next to the video, and opens each feeder only for
+its allowed cats. Human review and classifier training run on top.
 
-The current branch is focused on a safer cold-start labeling pipeline:
-
-- do not trust the old identity classifier as truth;
-- filter crops by detector confidence first;
-- cluster visually similar crops;
-- let a human bulk-label clusters;
-- train from human labels with leakage-safe train/validation/test splits;
-- keep a compact replay set so weekly fine-tuning does not forget older cats.
+Architecture and decisions: `PLAN.md`. How to run: `README.md`.
 
 ## Architecture
 
-High-level flow:
-
 ```text
 camera RTSP
-  -> mediamtx
-      -> browser WebRTC live view
-      -> detector RTSP input
-      -> local MP4 recordings
-      -> playback API for timeline/history
-
-detector
-  -> YOLO boxes
-  -> optional identity classifier
-  -> data/events/events.db
-  -> websocket events for webui/feeder
-
-review/training tools
-  -> read events.db + recordings directly
-  -> decode crops in memory
-  -> write review labels and model artifacts
-
-feeder
-  -> consumes detector websocket
-  -> opens only when an allowed cat is present with enough classifier confidence
-
-pruner
-  -> deletes old boring recording segments
-  -> keeps recent video and video around detections
+  -> streamhub (Go)             ingest, wall-clock PTS, fMP4 segments, API, webui
+      -> cv-worker (Python)     every frame over the hub port; YOLO + classifier
+      <- results                boxes + per-cat probabilities, every processed frame
+      -> decider (Python)       results; door FSM, scheduled feeding, journal
+      <- decisions              state/reason/identity, stored and shown
+      -> data/streamhub/recordings/<camera>/<date>/<hour>/*.mp4 + .labels.jsonl
+      -> browser                live (WebSocket fMP4 + labels), history (segments)
+pruner                          sparsifies old recordings, enforces the size cap
+training/review                 previous stack's events.db + recordings (for now)
 ```
 
 ## Important Invariants
 
-- Do not casually change the WebRTC/mediamtx live-video path. The live stream
-  base is from `live2`: mediamtx owns ingest/recording/WebRTC, and detector
-  services should not add slow extra video hops.
-- Training/review tools read `data/events/events.db` and `data/recordings`
-  directly. They should not depend on the web UI APIs.
-- `wall_ms` is the authoritative join key between detections and recordings.
-  Avoid using raw video PTS as a cross-system identifier.
-- Recording filename timezone matters. mediamtx segment names are parsed using
-  `RECORDING_TZ` or `TZ`, defaulting to `UTC`.
-- The main review/training path does not store crop JPGs. Crops are decoded
-  from recordings in memory. The replay set is the intentional exception: it
-  stores compressed `.npz` crop arrays for long-term training memory.
-- Detector confidence and identity confidence are different things:
-  `events.score` means "detector thinks this box is a cat"; `cat_score` means
-  "identity classifier thinks this is a specific cat".
-- Static false positives such as a feeder or bowl should be configured as
-  `ignore_regions` in `cameras.yaml`. Detections whose box center lands inside
-  these camera-normalized regions are dropped before events/review/training.
+- Frame identity is `(camera, pts)`; pts is 90 kHz ticks since the Unix epoch,
+  strictly increasing per camera. Camera RTP timing is kept (no CFR rewrite);
+  RTCP is ignored (the cameras' sender reports are wrong).
+- Files are the source of truth: segment names carry start and duration,
+  sidecars (`<start>.labels.jsonl`) carry CV results and decisions. Indexes are
+  rebuilt from them, so anyone may delete files.
+- Detections leave cv-worker in camera-frame fractions (camera orientation);
+  `rotate_deg`/`detect_roi` only affect the model input.
+- Detector score (`score`: is it a cat) and identity probabilities (`cats`) are
+  different things; decider thresholds apply to identity.
+- Classifier runtime preprocessing (`cv-worker/cv_worker/models/classifier.py`)
+  must stay bit-identical to training; training imports it from there.
+- `classifier_pad_frac` (cv-worker `CLASSIFIER_PAD_FRAC`) must match training.
 
 ## Data Layout
 
@@ -79,49 +51,41 @@ Local runtime data is intentionally outside git:
 
 ```text
 data/
-  events/events.db                 SQLite detection event store
-  recordings/<camera>/*.mp4        mediamtx recording segments
-  review/clusters.json             cold-start cluster manifest
-  review/reviews.db                human labels and split decisions
-  replay/manifest.jsonl            compact replay memory index
-  replay/crops/<label>/*.npz       compressed crop arrays
-
+  streamhub/recordings/<camera>/<date>/<hour>/<start>_<dur>ms.mp4   segments
+  streamhub/recordings/<camera>/<date>/<hour>/<start>.labels.jsonl  CV results + decisions
+  streamhub/feed_journal/journal.db  decider journal (door sessions, scheduled feeds)
+  streamhub/pins.json                ranges the pruner keeps
+  events/events.db                   previous stack's detections (training)
+  recordings/<camera>/*.mp4          previous stack's recordings (training)
+  review/clusters.json, reviews.db   cold-start clusters and human labels
+  replay/                            compact replay memory
+  mlflow/                            experiment tracking
 models/
   trained/<timestamp>/cat_classifier.pt
+  classifier/versions/<id>/, current, previous   runtime classifier (OpenVINO)
 ```
-
-Common untracked local files such as `configs/`, `reports/`, `secrets/`,
-`data/`, model weights, and generated artifacts should stay out of normal
-source commits unless there is a specific reason to version them.
 
 ## Core Services
 
-- `mediamtx`: camera ingest, WebRTC live view, playback, recording.
-- `detector-<camera_id>`: one detector process per configured camera.
-- `webui`: Svelte/nginx UI for live/history.
-- `pruner`: detection-aware recording cleanup.
-- `feeder`: feeder door control, if feeder config is present.
+- `streamhub`: camera ingest, recording, hub port (:9000), API + webui.
+- `cv-worker`: CV for all cameras (`CV_MAX_FPS` per camera, default 2).
+- `decider`: all feeders; `dry_run` decides without calling the feeder API.
+- `pruner`: detection-aware cleanup + size cap.
+- `mlflow`: experiment-tracking UI.
 
-Generated camera-specific compose/config files come from `tools/configure.py`
-and `cameras.yaml`.
+All configured in `config.yaml` (template `config.example.yaml`); compose in
+`docker-compose.yml`.
 
 ## Operator Commands
 
 Run from the repo root.
 
 ```bash
-just configure
-just dev
-just up
-just down
-just ps
-just logs detector-grey
-just check
+just up          # build + start
+just status      # per-camera ingest status
+just logs cv-worker
+just check       # all tests
 ```
-
-`just up` starts the production-shaped local stack. `just dev` starts the dev
-stack with frontend/backend watch behavior where configured. `just check`
-compiles Python packages and runs tests.
 
 ## Cold-Start Labeling Workflow
 
@@ -134,7 +98,7 @@ Example:
 export REVIEW_LABELS=alisa,chuzh,ellie,felisis
 export RECORDING_TZ=America/New_York
 
-just label-build detector-grey --default-rotate-deg 90 --min-score 0.7 --clusters 80
+just label-build --default-rotate-deg 90 --min-score 0.7 --clusters 80
 just setup label
 just label-review 8095
 ```
@@ -282,7 +246,7 @@ Compare models on the same reviewed data before promoting a candidate:
 
 ```bash
 just train-compare \
-  --candidate current=/opt/models/cat_classifier_openvino \
+  --candidate current=models/classifier/current \
   --candidate new=models/trained/<stamp>/cat_classifier.pt \
   --baseline current \
   --thresholds 0.7,0.8,0.9 \
@@ -321,48 +285,25 @@ identity fallback uses `DETECTOR_UNKNOWN_CONF` (legacy alias:
 
 ## Pruner Behavior
 
-The pruner scans recording segments periodically and deletes old segments that
-do not contain detections or nearby context.
-
-Current defaults:
-
-- segment duration: `30s`;
-- keep pre-roll around detections: `30s`;
-- keep post-roll around detections: `30s`;
-- always keep the newest `24h`;
-- prune interval: `3600s` / one hour;
-- dry-run can be enabled with `PRUNER_DRY_RUN=1`.
-
-mediamtx also has its own hard recording retention cap:
-`recordDeleteAfter: 720h`, i.e. 30 days. Replay memory is still useful because
-approved examples can outlive both pruner cleanup and the 30-day hard cap.
+Every `pruner.interval` (10 min): recordings newer than `keep_recent` (3 h) are
+kept; older segments are deleted unless a detection is within `event_margin`
+(30 s) or a pin covers them; segments CV never processed are deleted
+(`delete_unprocessed`); then the oldest unpinned go until the total is under
+`max_size` (50 GB). Sidecars go with their segments.
 
 ## Important Files
 
-- `docker-compose.yml`: base services: mediamtx, pruner, webui.
-- `docker-compose.cameras.yml`: generated camera detector services.
-- `mediamtx/mediamtx.yml`: generated mediamtx camera/path config.
-- `tools/configure.py`: reads camera config and generates service/config files.
-- `justfile`: main operator command surface.
-- `detector/main.py`: detector service runtime and websocket events.
-- `detector/detectors.py`: YOLO/OpenVINO detector wrappers.
-- `detector/classifier.py`: runtime identity classifier.
-- `detector/export_classifier.py`: export trained classifier for deployment.
-- `detector/storage.py`: SQLite event writes.
-- `training/build_cluster_manifest.py`: cold-start clustering manifest.
-- `review/cluster_app.py`: cluster review API.
-- `review/static/cluster.html`: browser UI for bulk cluster labeling.
-- `training/reviews.py`: review DB helpers.
-- `training/train_classifier.py`: identity classifier training.
-- `training/build_replay_set.py`: compact replay memory builder.
-- `training/replay.py`: replay-set loader.
-- `training/compare_classifiers.py`: candidate model evaluation/comparison.
-- `training/segments.py`: recording segment lookup and timezone parsing.
-- `training/extract_classifier.py`: optional ImageFolder/JPG export.
-- `pruner/pruner.py`: detection-aware video cleanup.
-- `feeder/main.py`: feeder runtime and classifier confidence gate.
-- `feeder/zone_state.py`: temporal smoothing for identities/presence.
-- `feeder/door_fsm.py`: debounced feeder door state machine.
+- `PLAN.md`: architecture and decisions of the current stack.
+- `config.example.yaml`: all settings, commented.
+- `streamhub/internal/…`: `timeline` (RTP → wall-clock), `recorder`, `hub`
+  (protocol), `live`, `sidecar`, `prune`, `api`.
+- `cv-worker/cv_worker/`: `harness.py` (decode/infer loop), `geometry.py`,
+  `models/` (yolo, classifier, blob); `cv-worker/tools/export_classifier.py`.
+- `decider/decider/`: `feeder.py` (per-feeder loop), `zone_state.py`,
+  `decision.py`, `door_fsm.py`, `journal.py`, `schedule_feed.py`, `display.py`.
+- `webui/src/`: `App.svelte`, `Player.svelte`, `Timeline.svelte`, `lib/`.
+- `training/…`, `review/…`: labeling and training (unchanged).
+- `tools/promote_classifier.py`, `tools/feed_log.py`.
 
 ## Gotchas
 
@@ -382,8 +323,7 @@ approved examples can outlive both pruner cleanup and the 30-day hard cap.
 
 ## Current Code-State Notes
 
-- Branch: `feat/cat-classifier-and-feeder`.
-- Last source-code commit before this document: `1a75b2c Add cold-start cluster labeling and replay training`.
-- Last full check after the implementation: `just check` passed with 17 tests.
-- Known local untracked runtime/development artifacts at the time of writing:
-  `configs/`, `reports/`, and `yolov8n.pt`.
+- Branch `redesign` replaces mediamtx/detector/feeder/indexer with the stack
+  above (see `PLAN.md`, `README.md` for migration).
+- Training/review still read the previous stack's `data/events` and
+  `data/recordings`; adapting them to segments + sidecars is pending.

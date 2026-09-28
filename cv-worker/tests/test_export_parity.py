@@ -9,7 +9,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import export_classifier as ec  # detector/ is on sys.path via conftest
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import export_classifier as ec  # noqa: E402
 
 
 def _inputs(n):

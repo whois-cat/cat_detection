@@ -69,6 +69,12 @@ class CatClassifier:
         if out_dim is not None and out_dim != len(names):
             raise ValueError(f"classifier outputs {out_dim} classes but classes.json lists {len(names)} ({model_dir})")
 
+    def classify(self, crop_rgb: np.ndarray) -> tuple[str, float]:
+        """Most likely class and its probability for one crop."""
+        p = self.probs([crop_rgb])[0]
+        name = max(p, key=p.__getitem__)
+        return name, p[name]
+
     def probs(self, crops_rgb: list[np.ndarray]) -> list[dict[str, float]]:
         """Probability per class for each crop, in one inference call."""
         if not crops_rgb:

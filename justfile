@@ -1,15 +1,16 @@
-# live2 operator commands. Run from the repo root.
+# Operator commands. Run from the repo root. See README.md / PLAN.md.
 
 set dotenv-load := true
 
-COMPOSE := "docker compose -f docker-compose.yml -f docker-compose.cameras.yml"
-DEV_COMPOSE := COMPOSE + " -f docker-compose.dev.yml -f docker-compose.cameras.dev.yml"
-CLUSTER_SERVICE := env_var_or_default("CLUSTER_SERVICE", "detector-grey")
+COMPOSE := "docker compose"
+# Container used as the Python runtime for labeling/training helpers that need
+# torch + openvino + av (the cv-worker image has them).
+CLUSTER_SERVICE := env_var_or_default("CLUSTER_SERVICE", "cv-worker")
 TRAINING_RUN := "uv run --project training"
 CLASSIFIER_RUN := TRAINING_RUN + " --extra classifier"
 
-# Shared path/label defaults (override via the matching env var). These were
-# duplicated inline across recipes; centralized here and substituted as {{...}}.
+# Shared path/label defaults (override via the matching env var).
+# events_db/recordings are the previous stack's data, still used for training.
 events_db   := env_var_or_default("EVENTS_DB",        "data/events/events.db")
 recordings  := env_var_or_default("RECORDINGS_ROOT",  "data/recordings")
 review_db   := env_var_or_default("REVIEW_DB",        "data/review/reviews.db")
@@ -18,29 +19,20 @@ manifest    := env_var_or_default("CLUSTER_MANIFEST", "data/review/clusters.json
 # When empty, the review UI falls back to the labels baked into the manifest.
 labels      := env_var_or_default("REVIEW_LABELS",    "")
 rec_tz      := env_var_or_default("RECORDING_TZ",     "UTC")
-journal_db  := env_var_or_default("FEED_JOURNAL_DB",  "data/feed_journal/journal.db")
+journal_db  := env_var_or_default("FEED_JOURNAL_DB",  "data/streamhub/feed_journal/journal.db")
 replay_set  := env_var_or_default("REPLAY_SET",       "data/replay")
+streamhub_port := env_var_or_default("STREAMHUB_PORT", "8096")
 
 default:
     @just --list
 
 # ───────────────────────────── stack ─────────────────────────────
+# streamhub, cv-worker, decider, pruner (docker-compose.yml, config.yaml).
 
-# Regenerate mediamtx, per-camera compose, nginx, and cameras.json from cameras.yaml.
+# Build and start the stack.
 [group('stack')]
-configure:
-    python3 tools/configure.py
-
-# Start the production-shaped local stack.
-[group('stack')]
-up: configure
+up:
     {{COMPOSE}} up -d --build
-
-# Start the development stack with Vite/watchfiles in the foreground.
-[group('stack')]
-dev: configure
-    {{COMPOSE}} down --remove-orphans 2>/dev/null || true
-    {{DEV_COMPOSE}} up --build
 
 # Stop the stack.
 [group('stack')]
@@ -52,48 +44,19 @@ down:
 ps:
     {{COMPOSE}} ps
 
-# Tail logs. Example: `just logs detector-grey`.
+# Tail logs. Example: `just logs cv-worker`.
 [group('stack')]
 logs SERVICE="":
     {{COMPOSE}} logs -f --tail=200 {{SERVICE}}
 
-# ─────────────────────────── new stack ───────────────────────────
-# Runs alongside the old stack during the migration (see PLAN.md).
-
-SH_COMPOSE := "docker compose -f docker-compose.streamhub.yml"
-
-# Build and start streamhub.
-[group('streamhub')]
-sh-up:
-    {{SH_COMPOSE}} up -d --build
-
-# Stop streamhub.
-[group('streamhub')]
-sh-down:
-    {{SH_COMPOSE}} down
-
-# Tail streamhub logs.
-[group('streamhub')]
-sh-logs:
-    {{SH_COMPOSE}} logs -f --tail=200 streamhub
-
 # Per-camera ingest status (connection, fps, clock correction).
-[group('streamhub')]
-sh-status PORT=env_var_or_default("STREAMHUB_PORT", "8096"):
-    curl -s http://127.0.0.1:{{PORT}}/api/status | python3 -m json.tool
-
-# Run the new stack's tests (streamhub, webui, hubclient, cv-worker, decider).
-[group('streamhub')]
-sh-test:
-    cd streamhub && go vet ./... && go test ./...
-    cd webui && npm test
-    cd hubclient && uv run --quiet --python 3.12 --group dev pytest -q
-    cd cv-worker && uv run --quiet --python 3.12 --group dev pytest -q
-    cd decider && uv run --quiet --python 3.12 --group dev pytest -q
+[group('stack')]
+status:
+    curl -s http://127.0.0.1:{{streamhub_port}}/api/status | python3 -m json.tool
 
 # Webui dev server (hot reload) against a running streamhub.
-[group('streamhub')]
-webui-dev STREAMHUB=("http://127.0.0.1:" + env_var_or_default("STREAMHUB_PORT", "8096")):
+[group('stack')]
+webui-dev STREAMHUB=("http://127.0.0.1:" + streamhub_port):
     cd webui && npm install --no-audit --no-fund && STREAMHUB={{STREAMHUB}} npm run dev
 
 # ───────────────────────────── setup ─────────────────────────────
@@ -126,8 +89,7 @@ setup TARGET="all":
 
 # ──────────────────────────── labeling ───────────────────────────
 
-# Cold-start clustering manifest. Uses one detector container as the Python runtime.
-# Override CLUSTER_SERVICE only if detector-grey is not present.
+# Cold-start clustering manifest. Uses the cv-worker container as the Python runtime.
 # Override REVIEW_LABELS/RECORDING_TZ; pass --embedding efficientnet if weights are cached.
 [group('label')]
 label-build *ARGS:
@@ -225,8 +187,8 @@ label-reset:
 
 # ──────────────────────────── training ───────────────────────────
 
-# Rebuild detector events from recordings with offline YOLO. Useful when live
-# detector events are polluted by static false positives.
+# Rebuild the previous stack's detector events from its recordings with
+# offline YOLO. Useful when those events are polluted by static false positives.
 [group('train')]
 train-rescan *ARGS:
     {{COMPOSE}} run --rm --no-deps \
@@ -274,10 +236,9 @@ train-compare *ARGS:
 
 # Promote a trained checkpoint to the active runtime model volume
 # (models/classifier/versions/<id> + switch the `current` symlink). Default (no
-# SRC) selects the newest models/trained/*/cat_classifier.pt. Runs inside a
-# detector container (torch + openvino) to export the OpenVINO IR; writes to the
+# SRC) selects the newest models/trained/*/cat_classifier.pt. Runs inside the
+# cv-worker container (torch + openvino) to export the OpenVINO IR; writes to the
 # host repo via the bind mount. Restart after: `just classifier-restart`.
-# Override CLUSTER_SERVICE if detector-grey is not present.
 [group('train')]
 classifier-promote SRC="":
     {{COMPOSE}} run --rm --no-deps -v "$PWD":/work -w /work {{CLUSTER_SERVICE}} \
@@ -289,20 +250,10 @@ classifier-promote SRC="":
 classifier-rollback VERSION="":
     python3 tools/promote_classifier.py rollback --version "{{VERSION}}"
 
-# Restart only the detector containers that mount the classifier model volume, so
-# they pick up a freshly promoted `current`. Does not rebuild images.
+# Restart cv-worker so it picks up a freshly promoted `current`. No image rebuild.
 [group('train')]
 classifier-restart:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    svc=$({{COMPOSE}} config --services | python3 tools/promote_classifier.py services)
-    if [ -z "$svc" ]; then
-        echo "No detector services found that use the classifier volume." >&2
-        exit 1
-    fi
-    echo "Restarting detector services:"
-    printf ' - %s\n' $svc
-    {{COMPOSE}} restart $svc
+    {{COMPOSE}} restart cv-worker
 
 # ──────────────────────────── journal ────────────────────────────
 
@@ -312,27 +263,13 @@ classifier-restart:
 journal-feed CAT DAYS="3":
     python3 tools/feed_log.py {{CAT}} --days {{DAYS}} --db {{journal_db}}
 
-# Full rebuild of the SQLite recording segment index from files under
-# RECORDINGS_ROOT. Recovery/backfill only — the `indexer` service keeps the
-# index live during normal operation, so you should not need this routinely.
-[group('dev')]
-recordings-index-rebuild:
-    uv run --extra test python -m detector.recordings_index rebuild \
-        --db "{{events_db}}" \
-        --recordings "{{recordings}}"
-
-# One-shot incremental index of recent files (what the indexer service does
-# every cycle). Handy for manual verification without the container.
-[group('dev')]
-recordings-index-incremental:
-    uv run --extra test python -m detector.recordings_index incremental \
-        --db "{{events_db}}" \
-        --recordings "{{recordings}}"
-
-# ─────────────────────────────── dev ─────────────────────────────
-
-# Fast local checks for changed Python code.
+# Run all tests (new stack, then training/review).
 [group('dev')]
 check:
-    uv run --extra test python -m compileall feeder detector training/*.py pruner indexer review
-    uv run --extra test pytest
+    cd streamhub && go vet ./... && go test ./...
+    cd webui && npm test
+    cd hubclient && uv run --quiet --python 3.12 --group dev pytest -q
+    cd cv-worker && uv run --quiet --python 3.12 --group dev pytest -q
+    cd decider && uv run --quiet --python 3.12 --group dev pytest -q
+    uv run --extra test python -m compileall -q training review tools
+    uv run --extra test pytest -q tests

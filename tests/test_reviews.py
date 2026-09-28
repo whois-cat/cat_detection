@@ -22,6 +22,9 @@ def test_load_reviews_falls_back_to_cwd_reviews_db(tmp_path, monkeypatch):
         conn.close()
 
     monkeypatch.chdir(tmp_path)
+    # Don't let the checkout's own data/review/reviews.db win the lookup.
+    import training.reviews
+    monkeypatch.setattr(training.reviews, "ROOT", tmp_path / "repo")
 
     assert resolve_reviews_db("data/review/reviews.db") == db
     assert load_reviews("data/review/reviews.db") == {10: "alisa", 11: "discard"}

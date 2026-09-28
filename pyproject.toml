@@ -32,6 +32,10 @@ dev = [
 test = [
     "Pillow>=10",
     "pytest",
+    # starlette.testclient (review app tests)
+    "httpx",
+    # training artifact plots
+    "matplotlib",
 ]
 
 [tool.uv]

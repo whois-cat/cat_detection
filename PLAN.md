@@ -1,7 +1,14 @@
 # Redesign plan: video pipeline
 
-Status: draft for discussion (2026-09-27, revision 2). Start fresh — no backward
-compatibility with existing recordings, `events.db`, or services.
+Status (2026-09-28): M1–M6 implemented on branch `redesign`; the previous
+stack's services are removed from it (see README.md, Migration). Decided while
+building: cv-worker caps inferences per camera (`CV_MAX_FPS`, default 2); decider
+has `dry_run` for running next to the old feeders; decider's empty-bowl feeding
+is dropped (needed the old detector's bowl monitor); per-feeder
+`door_close_timeout_sec` 10 s and `min_meal_sec` 15 s.
+
+Start fresh — no backward compatibility with existing recordings, `events.db`,
+or services (training still reads them until it is adapted).
 
 ## 1. Components
 

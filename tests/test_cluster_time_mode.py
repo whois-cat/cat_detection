@@ -65,7 +65,7 @@ def test_dedupe_time_only_drops_in_window_keeps_spaced_and_other_camera():
 # ---- end-to-end main() in time mode (no recordings / torch needed) ----
 
 def test_time_mode_manifest_end_to_end(tmp_path, monkeypatch):
-    from storage import init_db, insert_event  # detector storage (on sys.path)
+    from training.events_store import init_db, insert_event
     import training.build_cluster_manifest as bcm
 
     db = tmp_path / "events.db"

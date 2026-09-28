@@ -40,8 +40,8 @@ class TorchPtModel:
         import torch.nn as nn
         from torchvision import models
 
-        sys.path.insert(0, str(ROOT / "detector"))
-        from classifier import _preprocess
+        sys.path.insert(0, str(ROOT / "cv-worker"))
+        from cv_worker.models.classifier import preprocess as _preprocess
 
         checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
         self.class_names = list(checkpoint["class_names"])
@@ -65,8 +65,8 @@ class TorchPtModel:
 
 class OpenVinoModel:
     def __init__(self, path: Path) -> None:
-        sys.path.insert(0, str(ROOT / "detector"))
-        from classifier import CatClassifier
+        sys.path.insert(0, str(ROOT / "cv-worker"))
+        from cv_worker.models.classifier import CatClassifier
 
         self._model = CatClassifier(path)
         self.class_names = list(self._model.class_names)

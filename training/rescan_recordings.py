@@ -15,7 +15,7 @@ import av
 import numpy as np
 import yaml
 
-from detector.storage import init_db, insert_event
+from training.events_store import init_db, insert_event
 from training.db import Box
 from training.regions import (
     box_in_ignore_region,
