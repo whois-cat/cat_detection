@@ -2,6 +2,9 @@
 them all (P-frames depend on earlier frames), and runs the model on the newest
 decoded frame per camera whenever it's free — frames arriving while the model
 is busy are dropped, so nothing queues up. Cameras are served round robin.
+
+max_fps caps CPU use: each camera is inferred at most that many times per
+second, so when a pass over all cameras finishes early the loop sleeps.
 """
 from __future__ import annotations
 
@@ -32,8 +35,10 @@ class _Camera:
 
 
 class Harness:
-    def __init__(self, model: Model) -> None:
+    def __init__(self, model: Model, max_fps: float = 0) -> None:
         self.model = model
+        # Minimum seconds between two inferences of one camera; 0 = no cap.
+        self._min_interval = 1 / max_fps if max_fps > 0 else 0.0
         self._cams: dict[str, _Camera] = {}
         self._cond = threading.Condition()
         self._closed = False
@@ -101,14 +106,19 @@ class Harness:
             while True:
                 if self._closed:
                     return None
-                ready = [(c.served_at, cam) for cam, c in self._cams.items() if c.frame is not None]
-                if ready:
-                    _, cam = min(ready)
+                now = time.monotonic()
+                fresh = [(c.served_at, cam) for cam, c in self._cams.items() if c.frame is not None]
+                due = [(at, cam) for at, cam in fresh if now - at >= self._min_interval]
+                if due:
+                    _, cam = min(due)
                     c = self._cams[cam]
                     frame, pts, c.frame = c.frame, c.pts, None
-                    c.served_at = time.monotonic()
+                    c.served_at = now
                     return cam, c, frame, pts
-                self._cond.wait()
+                # Nothing fresh: wait for a frame. Fresh but capped: wait until
+                # the earliest camera is due (a newer frame may replace it meanwhile).
+                timeout = min(at for at, _ in fresh) + self._min_interval - now if fresh else None
+                self._cond.wait(timeout)
 
     def _infer_loop(self, conn: HubConnection) -> None:
         while (item := self._next()) is not None:

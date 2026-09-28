@@ -42,6 +42,63 @@ def send(conn, msg):
     conn.sendall(struct.pack(">I", len(body)) + body)
 
 
+def run_session(model, frames_per_camera, cameras=("grey",), frame_gap=0.01, **harness_kw):
+    """Stream frames of the tiny clip to a Harness through a fake hub; return results."""
+    aus = access_units(TINY.read_bytes())[:frames_per_camera]
+    server = socket.create_server(("127.0.0.1", 0))
+    results = []
+
+    def hub():
+        conn, _ = server.accept()
+        f = conn.makefile("rb")
+
+        def read():
+            (n,) = struct.unpack(">I", f.read(4))
+            return msgpack.unpackb(f.read(n), raw=False)
+
+        assert read()["type"] == "hello"
+        for cam in cameras:
+            send(conn, {"type": "stream", "camera": cam, "width": 64, "height": 64, "config": {}})
+        for i, au in enumerate(aus):
+            for cam in cameras:
+                send(conn, {"type": "frame", "camera": cam, "pts": 1000 + i, "key": i % 10 == 0, "data": au})
+            time.sleep(frame_gap)
+        conn.settimeout(1.5)
+        try:
+            while True:
+                m = read()
+                if m["type"] == "result":
+                    results.append(m)
+        except (OSError, struct.error):
+            pass
+        conn.close()
+
+    t = threading.Thread(target=hub)
+    t.start()
+    started = time.monotonic()
+    with hubclient.HubConnection(f"127.0.0.1:{server.getsockname()[1]}", {"role": "cv"}) as conn:
+        Harness(model, **harness_kw).session(conn)
+    t.join()
+    return results, time.monotonic() - started
+
+
+class FastModel:
+    name, version = "stub", "1"
+
+    def infer(self, img):
+        return []
+
+
+def test_max_fps_caps_each_camera():
+    # 45 frames per camera over ~2.3 s, model instant: uncapped it would infer
+    # almost every frame; capped at 4/s it may do ~4 per second per camera.
+    results, _ = run_session(FastModel(), 45, cameras=("grey", "beige"), frame_gap=0.05, max_fps=4)
+    for cam in ("grey", "beige"):
+        pts = [r["pts"] for r in results if r["camera"] == cam]
+        assert 5 <= len(pts) <= 12, (cam, len(pts))
+        assert pts[-1] == 1044, "the newest frame must still be inferred after the cap"
+
+
 def test_session_drops_stale_frames_and_maps_boxes():
     aus = access_units(TINY.read_bytes())
     assert len(aus) == 45
