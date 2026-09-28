@@ -54,7 +54,20 @@ logs SERVICE="":
 # Per-camera ingest status (connection, fps, clock correction).
 [group('stack')]
 status:
-    curl -s http://127.0.0.1:{{streamhub_port}}/api/status | python3 -m json.tool
+    @curl -s http://127.0.0.1:{{streamhub_port}}/api/status | python3 -m json.tool
+
+# Config, secrets, data and models stay. Lists only unless ARGS=--yes.
+# Remove ignored junk: venvs, node_modules, caches, build output, old-stack leftovers.
+[group('stack')]
+clean *ARGS:
+    python3 tools/clean.py junk {{ARGS}}
+
+# State (feed journal, pins), config, models and the previous stack's training
+# data stay. Lists only unless ARGS=--yes.
+# `clean` + the new stack's history: recordings (with sidecars), dry-run journal.
+[group('stack')]
+clean-history *ARGS:
+    python3 tools/clean.py history {{ARGS}}
 
 # Webui dev server (hot reload) against a running streamhub.
 [group('stack')]

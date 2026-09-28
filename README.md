@@ -62,23 +62,31 @@ reload against a running streamhub), labeling/training recipes: `just --list`.
 
 ## Migration from the previous stack
 
-Everything below is outside git; copy it from the old checkout.
+This workdir is set up and tested as production (`config.yaml` with
+`dry_run: false`, `secrets/streamhub.env`, `models/classifier/`); only its
+`.env` sets `DECIDER_DRY_RUN=1` so it never drives the real feeders.
 
-| What | Where it goes | Why |
-|---|---|---|
-| `cameras.yaml` | → `config.yaml` + `secrets/streamhub.env` | camera URLs/credentials, feeder ids and serials (already transcribed in `config.example.yaml`) |
-| `models/classifier/` (incl. symlinks) | same path | the deployed classifier |
-| `models/trained/` | same path | trained checkpoints (re-exportable, needed for promote) |
-| `data/feed_journal/journal.db` (+ `-wal`) | `data/decider/feed_journal/` | **at switchover, right before `dry_run: false`**, with the old feeders stopped: scheduled feeding checks it for slots already fed today — with an empty journal it would feed the latest missed slots again. (A dry run uses `journal.dry-run.db`.) Containers run as UID 1000: `chown` it. |
-| `data/review/`, `reviews.db` (repo root) | same paths | human labels; the root `reviews.db` holds more reviews than `data/review/reviews.db` |
-| `data/events/`, `data/recordings/`, `data/replay/`, `data/mlflow/` | same paths | training data and history, if you still train on them |
+On the test machine:
 
-Not needed: `.env` (old pruner knobs; start from `.env.example`),
-`secrets/cameras.env`, `cameras.yaml` (once `config.yaml` exists),
-`docker-compose.cameras*.yml`, `mediamtx/`, `data/cooldowns/`, any `.venv/`,
-`webui/node_modules/`, `webui/dist/`.
+```bash
+just down
+just clean-history --yes      # test recordings, dry-run journal
+just clean --yes              # venvs, node_modules, build output, old-stack leftovers
+rsync -a --exclude=/.env --exclude=/data/ ./ server:<new dir>/
+```
 
-Running next to the old stack: give it its own compose project (a different
-directory name, or `COMPOSE_PROJECT_NAME` in `.env`) — the old stack also has
-`pruner` and `mlflow` services — and a free `MLFLOW_PORT`. Each camera allows
-two RTSP sessions, one per stack.
+On the server (new dir; old stack in <old dir>):
+
+```bash
+(cd <old dir> && docker compose -f docker-compose.yml -f docker-compose.cameras.yml down)
+cp .env.example .env          # set UID/GID if not 1000
+mkdir -p data/decider/feed_journal
+cp <old dir>/data/feed_journal/journal.db* data/decider/feed_journal/
+mv <old dir>/data/{events,recordings,review,mlflow} data/   # training data (optional)
+mv <old dir>/reviews.db .                                   # labels (optional)
+just up
+```
+
+The journal must come from the stopped old feeders: scheduled feeding checks it
+for slots already fed today — with an empty journal it would feed the latest
+missed slots again.

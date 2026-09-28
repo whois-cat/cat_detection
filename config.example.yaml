@@ -53,6 +53,7 @@ pruner:
 decider:
   # While the old feeder services still drive the feeders, keep this on: the
   # decider then decides and journals but never calls the feeder API.
+  # DECIDER_DRY_RUN=1 in .env forces it on per machine, whatever this says.
   dry_run: true
   # Default: <data_dir>/feed_journal/journal.db (journal.dry-run.db while
   # dry_run, so pretend feeds never reach the real journal). When taking over

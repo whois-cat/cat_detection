@@ -116,7 +116,9 @@ def parse(text: str) -> DeciderConfig:
     if len(set(ids)) != len(ids):
         raise ValueError("duplicate feeder ids")
     hub = d.get("hub") or "127.0.0.1:" + str(doc.get("streamhub", {}).get("hub_listen", ":9000")).rpartition(":")[2]
-    dry_run = bool(d.get("dry_run", False))
+    # DECIDER_DRY_RUN=1 forces a dry run regardless of the config (e.g. a test
+    # machine sharing the production config); it can never turn one off.
+    dry_run = bool(d.get("dry_run", False)) or os.environ.get("DECIDER_DRY_RUN", "") not in ("", "0")
     # A dry run journals pretend feeds and door sessions: keep them out of the
     # real journal, which scheduled feeding trusts for "already fed today".
     default_journal = "journal.dry-run.db" if dry_run else "journal.db"

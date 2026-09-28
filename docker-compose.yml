@@ -58,6 +58,10 @@ services:
     volumes:
       - ./config.yaml:/config.yaml:ro
       - ./data/streamhub:/data
+    # config.yaml is shared, so its ${VAR} references must resolve here too.
+    env_file:
+      - path: ./secrets/streamhub.env
+        required: false
 
   # Feeding decisions: drives the feeders (config.yaml: decider).
   decider:
@@ -69,6 +73,8 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       STREAMHUB_HUB: streamhub:9000
+      # 1 forces a dry run (never calls the feeder API), whatever config.yaml says.
+      DECIDER_DRY_RUN: ${DECIDER_DRY_RUN:-}
       # Scheduled feeding times are local to feed.tz; logs use this.
       TZ: ${TZ:-UTC}
     volumes:
