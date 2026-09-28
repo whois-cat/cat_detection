@@ -69,8 +69,11 @@ decider:
       unknown_conf: 0.5
       # Close the door once the cat has been out of view this long.
       door_close_timeout_sec: 10
+      # A door session counts as a meal (journal stats only) when the cat was
+      # seen at least this long.
+      min_meal_sec: 15
       # Other tuning keeps the old feeder defaults:
-      # min_meal_sec 10, presence_window_sec 5, classifier_min_conf 0.9,
+      # presence_window_sec 5, classifier_min_conf 0.9,
       # open_debounce_sec 3, multi_debounce_sec 2, stream_blip_grace_sec 25,
       # action_polygon: whole frame. See decider/decider/config.py.
       # Opt-in short status code on the feeder display (see decider/display.py).
@@ -82,6 +85,7 @@ decider:
       serial_number: AF06003100027DFB110L5V
       allowed_cats: [alisa]
       door_close_timeout_sec: 10
+      min_meal_sec: 15
       unknown_conf: 0.8
       feed:
         mode: scheduled
@@ -95,6 +99,7 @@ decider:
       serial_number: AF060103031EA0DA037F
       allowed_cats: [felisis, unknown]  # TEMP: felisis unrecognisable after haircut; remove once retrained
       door_close_timeout_sec: 10
+      min_meal_sec: 15
       unknown_conf: 0.8
       feed:
         mode: scheduled
