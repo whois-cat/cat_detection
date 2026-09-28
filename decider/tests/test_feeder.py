@@ -184,6 +184,7 @@ def test_dry_run_client_never_calls_api():
 
 def test_config(monkeypatch):
     monkeypatch.setenv("SERIAL", "AF0")
+    monkeypatch.delenv("DECIDER_DRY_RUN", raising=False)  # e.g. from a test machine's .env
     c = parse(CONFIG)
     assert not c.dry_run
     dry = parse(CONFIG.replace("decider:\n", "decider:\n  dry_run: true\n"))
