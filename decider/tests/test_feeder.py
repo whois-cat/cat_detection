@@ -78,7 +78,7 @@ def test_observations():
 
 
 def test_allowed_cat_opens_then_leaves(tmp_path):
-    f, client, clock, decisions = make(tmp_path)
+    f, client, clock, decisions = make(tmp_path, display="name")
     feed_frames(f, clock, 2, [cat("chuzh")])
     assert doors(client) == []  # still debouncing (3 s)
     feed_frames(f, clock, 2, [cat("chuzh")])
@@ -124,7 +124,7 @@ def test_silence_closes_open_door(tmp_path):
 
 
 def test_status_display(tmp_path):
-    f, client, clock, decisions = make(tmp_path, status_display=True)
+    f, client, clock, decisions = make(tmp_path, display="status")
     feed_frames(f, clock, 5, [cat("chuzh", 0.93)])
     texts = [c[1] for c in client.calls if c[0] == "display"]
     assert texts[0] in ("- C", "C C")   # idle, then chuzh recognised while arming
@@ -268,3 +268,20 @@ def test_open_if_any_allowed(tmp_path):
     feed_frames(f, clock, 6, [cat("alisa", 0.95)])
     assert doors(client)[-1] == ("close", "no_cat")
     assert decisions[-1]["reason"] == "not_allowed:alisa"
+
+
+def test_display_off_never_touches_it(tmp_path):
+    f, client, clock, _ = make(tmp_path)  # display not configured = off
+    for _ in range(40):  # 40 s with chuzh, periodic ticks included
+        feed_frames(f, clock, 1, [cat("chuzh")])
+        f.tick()
+    feed_frames(f, clock, 7, [])
+    assert doors(client) == [("open", "chuzh"), ("close", "no_cat")]
+    assert not [c for c in client.calls if c[0] == "display"]
+
+
+def test_display_mode_validated(monkeypatch):
+    monkeypatch.setenv("SERIAL", "AF0")
+    with pytest.raises(ValueError, match="display"):
+        parse(CONFIG.replace("unknown_conf: 0.8", "unknown_conf: 0.8\n      display: fancy"))
+    assert parse(CONFIG.replace("unknown_conf: 0.8", "unknown_conf: 0.8\n      display: null")).feeders[0].display is None

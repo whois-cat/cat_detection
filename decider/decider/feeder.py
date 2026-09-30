@@ -135,7 +135,9 @@ class Feeder:
         self.status = DisplayThrottle(
             lambda text: client.set_display_text(text, status_hold),
             refresh_sec=cfg.display_refresh_min_sec,
-        ) if cfg.status_display else None
+        ) if cfg.display == "status" else None
+        # "name": the cat's name on open (and slow refresh while open).
+        self.show_name = cfg.display == "name"
 
         self.schedule: ScheduleFeeder | None = None
         if cfg.feed.mode == "scheduled":
@@ -222,7 +224,7 @@ class Feeder:
                 self.fsm.confirm_open(cmd.cat, wall_t)
                 self.open_session_id = self.journal.open_session(self.id, cmd.cat, wall_t)
                 self._reset_close_backstop()
-                if self.status is None:
+                if self.show_name:
                     self._set_display_for_open(cmd.cat)
                 self.log.info("door opened: cat=%s", cmd.cat)
                 self.log.info("decision: %s", ctx)
@@ -241,7 +243,7 @@ class Feeder:
             else:
                 event = "close_failed"
                 self._close_backstop_after_failure(cmd.cat)
-        elif self.fsm.state in (OPEN, CLOSING) and self.status is None:
+        elif self.fsm.state in (OPEN, CLOSING) and self.show_name:
             # No door command this step: a slow display refresh may go out
             # (the door always has priority over the display bridge).
             self._maybe_slow_refresh_display(self.fsm.door_cat)

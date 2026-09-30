@@ -1,4 +1,4 @@
-"""Short live status for the feeder's small display (opt-in: status_display).
+"""Short live status for the feeder's small display (display: status).
 
 Format: "<cat> <door>"
   cat:   first letter of the cat the door is open for, else of the currently

@@ -13,6 +13,7 @@ import yaml
 
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 FULL_FRAME = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+DISPLAY_MODES = ("status", "name", None)
 
 
 @dataclass
@@ -56,9 +57,11 @@ class FeederConfig:
     # another cat won the vote; all allowed identities then count as one (so
     # alternating between them neither delays opening nor closes the door).
     open_if_any_allowed: bool = False
-    # Show a short live status ("<cat letter> <C/O>") on the feeder display
-    # instead of only the cat name on open (see display.py).
-    status_display: bool = False
+    # What decider shows on the feeder's display:
+    #   "status": live "<cat letter> <C/O>" (see display.py)
+    #   "name":   the cat's name when the door opens
+    #   None:     never call the display API at all
+    display: str | None = None
     feed: FeedConfig = field(default_factory=FeedConfig)
 
 
@@ -113,6 +116,8 @@ def parse(text: str) -> DeciderConfig:
             raise ValueError(f"feeder {f.id}: allowed_cats must not be empty")
         if feed.mode not in ("none", "scheduled"):
             raise ValueError(f"feeder {f.id}: feed.mode must be none or scheduled")
+        if f.display not in DISPLAY_MODES:
+            raise ValueError(f"feeder {f.id}: display must be one of status, name or null")
         if len(f.action_polygon) < 3:
             raise ValueError(f"feeder {f.id}: action_polygon needs at least 3 points")
         feeders.append(f)
