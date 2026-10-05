@@ -285,3 +285,41 @@ def test_display_mode_validated(monkeypatch):
     with pytest.raises(ValueError, match="display"):
         parse(CONFIG.replace("unknown_conf: 0.8", "unknown_conf: 0.8\n      display: fancy"))
     assert parse(CONFIG.replace("unknown_conf: 0.8", "unknown_conf: 0.8\n      display: null")).feeders[0].display is None
+
+
+def test_door_always_open(tmp_path):
+    f, client, clock, decisions = make(tmp_path, door="open", display="status")
+    assert doors(client) == [("open", "always_open")]
+    assert ("force_closed",) not in client.calls
+    feed_frames(f, clock, 5, [cat("alisa")])   # not allowed: still open
+    feed_frames(f, clock, 5, [cat("chuzh")])
+    feed_frames(f, clock, 10, [])              # gone: still open
+    clock.t += 60
+    f.tick()                                   # silence: still open
+    assert doors(client) == [("open", "always_open")]
+    assert decisions[-1]["state"] == "always_open" and decisions[-1]["door"] == "open"
+    texts = [c[1] for c in client.calls if c[0] == "display"]
+    assert "A O" in texts and "C O" in texts and texts[-1] == "- O"
+    assert f.journal.recover_interrupted("feeder1") == 0  # no door sessions
+
+
+def test_door_always_open_retries(tmp_path):
+    clock = Clock()
+    cfg = FeederConfig(id="feeder1", camera="grey", api_base_url="http://x", serial_number="S",
+                       allowed_cats=["chuzh"], door="open")
+    client = FakeClient()
+    client.set_door = lambda desired, reason: client.calls.append(("door", desired, reason)) or False
+    f = Feeder(cfg, client, FeedJournal(tmp_path / "j.db"), lambda d: None, monotonic=clock, wall=clock)
+    f.start()
+    f.tick()
+    assert len(doors(client)) == 1  # not retried every tick
+    clock.t += 31
+    f.tick()
+    assert len(doors(client)) == 2
+
+
+def test_door_mode_validated(monkeypatch):
+    monkeypatch.setenv("SERIAL", "AF0")
+    with pytest.raises(ValueError, match="door must be"):
+        parse(CONFIG.replace("unknown_conf: 0.8", "unknown_conf: 0.8\n      door: closed"))
+    assert parse(CONFIG).feeders[0].door == "auto"

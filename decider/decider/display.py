@@ -1,8 +1,8 @@
 """Short live status for the feeder's small display (display: status).
 
 Format: "<cat> <door>"
-  cat:   first letter of the cat the door is open for, else of the currently
-         recognised cat (upper case); ? unknown; 2 several cats; - nobody
+  cat:   first letter of the cat the door is open for, else (door shut, or
+         held open by door: open) of the currently recognised cat (upper case); ? unknown; 2 several cats; - nobody
   door:  O open (incl. closing), C closed (incl. arming)
 e.g. "C O" door open for chuzh; "A C" alisa present, door shut; "- C" idle.
 """
@@ -20,7 +20,7 @@ def _letter(name: str | None) -> str:
 
 
 def status_text(state: str, door_cat: str | None, snap: ZoneSummary) -> str:
-    if state in _OPEN_STATES:
+    if state in _OPEN_STATES and door_cat:
         cat = _letter(door_cat)
     elif snap.present and snap.n_cats >= 2:
         cat = "2"

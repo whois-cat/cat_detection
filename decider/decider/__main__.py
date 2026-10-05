@@ -52,8 +52,8 @@ def main() -> None:
                   FeederClient(api_base_url=fc.api_base_url, serial_number=fc.serial_number, feeder_id=fc.id))
         # One journal connection per feeder: each is used only by its feeder's thread.
         f = Feeder(fc, client, FeedJournal(cfg.journal_db), send)
-        log.info("feeder %s: camera=%s allowed=%s feed=%s display=%s",
-                 fc.id, fc.camera, fc.allowed_cats, fc.feed.mode, fc.display or "off")
+        log.info("feeder %s: camera=%s allowed=%s feed=%s display=%s door=%s",
+                 fc.id, fc.camera, fc.allowed_cats, fc.feed.mode, fc.display or "off", fc.door)
         f.start()
         threading.Thread(target=f.run, args=(stop,), name=f"feeder-{fc.id}", daemon=True).start()
         by_camera.setdefault(fc.camera, []).append(f)

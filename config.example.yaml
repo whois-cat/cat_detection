@@ -86,6 +86,9 @@ decider:
       # name on open) or null (never touched). Off while testing whether
       # display updates make the feeders hang.
       display: null
+      # Door: auto (open/close from CV) or open (held open all the time; CV,
+      # decisions and scheduled feeding go on, no meal sessions journaled).
+      door: auto
       feed: {mode: none}
     - id: feeder2
       camera: beige

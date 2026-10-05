@@ -14,6 +14,7 @@ import yaml
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 FULL_FRAME = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
 DISPLAY_MODES = ("status", "name", None)
+DOOR_MODES = ("auto", "open")
 
 
 @dataclass
@@ -62,6 +63,10 @@ class FeederConfig:
     #   "name":   the cat's name when the door opens
     #   None:     never call the display API at all
     display: str | None = None
+    # "auto": open/close from CV decisions; "open": keep the door open at all
+    # times (detections, decisions and scheduled feeding go on; no door
+    # sessions are journaled). Back to auto closes it on decider start.
+    door: str = "auto"
     feed: FeedConfig = field(default_factory=FeedConfig)
 
 
@@ -118,6 +123,8 @@ def parse(text: str) -> DeciderConfig:
             raise ValueError(f"feeder {f.id}: feed.mode must be none or scheduled")
         if f.display not in DISPLAY_MODES:
             raise ValueError(f"feeder {f.id}: display must be one of status, name or null")
+        if f.door not in DOOR_MODES:
+            raise ValueError(f"feeder {f.id}: door must be auto or open")
         if len(f.action_polygon) < 3:
             raise ValueError(f"feeder {f.id}: action_polygon needs at least 3 points")
         feeders.append(f)

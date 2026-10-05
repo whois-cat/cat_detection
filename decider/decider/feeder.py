@@ -34,6 +34,8 @@ from .zone_state import UNKNOWN, ZoneState, ZoneSummary
 CLOCK_RATE = 90000
 SCHEDULE_TICK_SEC = 30.0
 TICK_SEC = 1.0
+OPEN_RETRY_SEC = 30.0
+ALWAYS_OPEN = "always_open"
 
 # FSM verdicts are terse and "no_cat" reads like "no cat was here" when it
 # actually means the cat LEFT the zone (present==False) — the normal end of a
@@ -159,6 +161,9 @@ class Feeder:
         self._close_fail_since: float | None = None
         self._last_not_opening_key: tuple | None = None
         self._last_decision_key: tuple | None = None
+        # door: open — the door is held open and the FSM is bypassed.
+        self.always_open = cfg.door == "open"
+        self._next_open_retry = 0.0
 
     # ---- lifecycle ----
 
@@ -166,7 +171,10 @@ class Feeder:
         recovered = self.journal.recover_interrupted(self.id)
         if recovered:
             self.log.info("recovered %d interrupted door session(s)", recovered)
-        self.client.force_closed()
+        if self.always_open:
+            self._hold_open()
+        else:
+            self.client.force_closed()
 
     def run(self, stop: threading.Event) -> None:
         """Own this feeder: handle results, and tick the watchdog/schedule."""
@@ -217,6 +225,15 @@ class Feeder:
         else:
             self._last_not_opening_key = None
 
+        if self.always_open:
+            text = None
+            if self.status is not None:
+                text = status_text(self.client.state, None, snap)
+                self.status.set(text)
+                self.status.flush(self._monotonic())
+            self._report(pts, snap, action, reason, ALWAYS_OPEN, None, text)
+            return
+
         cmd = self.fsm.step(wall_t, snap, action, reason)
         event = None
         if cmd.kind == "open":
@@ -259,6 +276,8 @@ class Feeder:
     # ---- periodic ----
 
     def tick(self) -> None:
+        if self.always_open:
+            self._hold_open()
         self._watchdog()
         if self.schedule is not None and self._monotonic() >= self._next_schedule:
             self._next_schedule = self._monotonic() + SCHEDULE_TICK_SEC
@@ -298,6 +317,15 @@ class Feeder:
                 self.log.info("scheduled:maintenance slot=%s (beyond catch-up cap)", slot.time)
 
     # ---- door helpers (as in the previous feeder service) ----
+
+    def _hold_open(self) -> None:
+        """door: open — open the door, retrying until it worked."""
+        now = self._monotonic()
+        if self.client.state == "open" or now < self._next_open_retry:
+            return
+        self._next_open_retry = now + OPEN_RETRY_SEC
+        if self.client.set_door("open", ALWAYS_OPEN):
+            self.log.info("door held open (door: open)")
 
     def _fail_safe_close(self, reason: str) -> None:
         if self.fsm.state not in (OPEN, CLOSING) and self.client.state != "open":
@@ -375,7 +403,7 @@ class Feeder:
         d: dict[str, Any] = {
             "type": "decision", "camera": self.camera, "pts": pts, "feeder": self.id,
             # FeederClient.state is "closed" initially but "close" after a close command.
-            "state": self.fsm.state, "door": "open" if self.client.state == "open" else "closed",
+            "state": ALWAYS_OPEN if self.always_open else self.fsm.state, "door": "open" if self.client.state == "open" else "closed",
             "action": action, "reason": reason,
             "step": step,
         }
