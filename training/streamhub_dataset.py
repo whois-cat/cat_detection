@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+import sys
+
 import av
 import cv2
 import numpy as np
@@ -27,6 +29,11 @@ from training.frame_geometry import apply_frame_geometry, camera_box_to_model
 
 
 CLOCK_RATE = 90_000
+
+
+def _log(message: str) -> None:
+    """Progress to stderr (flushed), so a long scan is never silent."""
+    print(message, file=sys.stderr, flush=True)
 SEGMENT_RE = re.compile(
     r"^(?P<start>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z)_(?P<duration>\d+)ms\.mp4$"
 )
@@ -793,10 +800,24 @@ def main(argv: list[str] | None = None) -> int:
         if unknown:
             raise ValueError(f"unknown camera(s): {', '.join(unknown)}")
         args.out.mkdir(parents=True, exist_ok=True)
+        if args.report_json is not None:
+            _log(f"run report will be written on completion to {args.report_json.resolve()}")
         conn = open_catalog(args.out / "catalog.sqlite3")
         try:
             states = {camera: load_state(conn, camera, args.from_ms) for camera in args.cameras}
-            for seg in iter_segments(args.recordings, set(args.cameras), args.from_ms, args.to_ms):
+            segments = list(
+                iter_segments(args.recordings, set(args.cameras), args.from_ms, args.to_ms)
+            )
+            _log(
+                f"scanning {len(segments)} segment(s): cameras={args.cameras} "
+                f"range={args.from_time}..{args.to_time} recordings={args.recordings} "
+                f"-> catalog {args.out / 'catalog.sqlite3'}"
+            )
+            if not segments:
+                searched = [str(args.recordings / camera) for camera in args.cameras]
+                _log(f"no segments matched; check that these camera dirs exist: {searched}")
+            last_log = time.monotonic()
+            for index, seg in enumerate(segments, 1):
                 n_decoded, n_saved = collect_segment(
                     args, conn, args.out, seg, states[seg.camera], configs[seg.camera]
                 )
@@ -810,6 +831,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     metrics["evicted_images"] += n_evicted
                     metrics["evicted_bytes"] += n_freed
+                now = time.monotonic()
+                if index == len(segments) or now - last_log >= 2.0:
+                    _log(f"[{index}/{len(segments)}] {seg.relpath} "
+                         f"decoded={n_decoded} saved={n_saved} new_total={metrics['new_images']}")
+                    last_log = now
             # Enforce once even when there were no source segments: a dataset
             # version/cache may have consumed the remaining budget meanwhile.
             if args.budget_gb > 0:
