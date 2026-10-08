@@ -117,8 +117,32 @@ just yolo-train \
 Writes `models/trained/<run>/` with `weights/best.pt`, Ultralytics plots, and a
 durable `report.json`. The runtime model is **not** replaced. Uses the same
 `imgsz`/geometry as runtime; keep the current architecture (yolov8n) first so
-only one factor changes. Add old examples alongside new ones rather than
-training only on the latest look of the shaved cat.
+only one factor changes.
+
+This is always **fine-tuning** (transfer learning) from a pretrained `.pt`,
+never random-init "from scratch", and never from an INT8 export (rejected). Two
+bases:
+
+- from the COCO base: `--weights yolov8n.pt` (first fine-tune);
+- from the previous fine-tune (incremental): `--weights models/trained/<prev>/weights/best.pt`.
+
+**Mixing in old versions (anti-forgetting).** Verified samples stay in the
+catalog, so a fresh `yolo-build-version` already includes old visits. When you
+train on a version that does *not* contain older appearances (e.g. a recent-only
+version), mix them back with `--replay-version` (repeatable):
+
+```bash
+just yolo-train \
+  --dataset data/yolo_dataset/versions/<recent> \
+  --weights yolov8n.pt \
+  --replay-version data/yolo_dataset/versions/<older> \
+  --replay-version data/yolo_dataset/versions/<pre-haircut>
+```
+
+Only each replay version's **train** split is added. Replay samples that collide
+with the current version's val/test (by sample id, image checksum, or visit
+group) are dropped, so mixing never inflates evaluation. The run report records
+`replay_added` / `replay_skipped_leakage`.
 
 ## 5. Evaluate / compare base .pt vs INT8
 

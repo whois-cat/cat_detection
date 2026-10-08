@@ -106,6 +106,21 @@ def code_identity(root: Path = ROOT) -> dict[str, Any]:
     return result
 
 
+def link_or_copy(source: Path, dest: Path) -> None:
+    """Hardlink ``source`` to ``dest`` (fall back to copy across filesystems).
+
+    Lets dataset versions and merged training sets reference the catalog's images
+    without a second copy of every frame.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    try:
+        os.link(source, dest)
+    except OSError:
+        dest.write_bytes(source.read_bytes())
+
+
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")

@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from training.streamhub_dataset import hamming, open_catalog
-from training.yolo_common import atomic_write_json, sha256_tree
+from training.yolo_common import atomic_write_json, link_or_copy, sha256_tree
 
 SPLITS = ("train", "val", "test")
 
@@ -170,16 +169,6 @@ def cross_split_near_duplicates(samples: list[SampleRow], threshold: int) -> int
     return pairs
 
 
-def _link_or_copy(source: Path, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        dest.unlink()
-    try:
-        os.link(source, dest)
-    except OSError:
-        dest.write_bytes(source.read_bytes())
-
-
 def build_version(
     catalog: Path,
     root: Path,
@@ -248,7 +237,7 @@ def build_version(
         for sample in sorted(present, key=lambda s: s.sample_id):
             image_dest = version_dir / "images" / sample.split / f"{sample.sample_id}.jpg"
             label_dest = version_dir / "labels" / sample.split / f"{sample.sample_id}.txt"
-            _link_or_copy(root / sample.image_relpath, image_dest)
+            link_or_copy(root / sample.image_relpath, image_dest)
             label_dest.parent.mkdir(parents=True, exist_ok=True)
             label_dest.write_text(
                 "".join(f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n"

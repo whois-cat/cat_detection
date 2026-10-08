@@ -15,8 +15,10 @@ from typing import Any
 
 from training.mltracking import start_run
 from training.yolo_common import (
+    DatasetInfo,
     ReportSession,
     convert_termination_to_interrupt,
+    link_or_copy,
     load_dataset,
     print_report_summary,
     sha256_file,
@@ -48,10 +50,72 @@ def _finite_metrics(raw: Any) -> dict[str, float]:
     return values
 
 
+def merge_training_dataset(
+    current: DatasetInfo, replays: list[DatasetInfo], dest: Path
+) -> dict[str, Any]:
+    """Train on the current train split plus old versions' train splits.
+
+    Evaluation stays on ``current`` (its own val/test). Replay samples that
+    collide with the current val/test by ``sample_id``, image ``sha256`` or visit
+    ``group_id`` are dropped, so mixing in old data never leaks into evaluation.
+    Returns a merged ``data.yaml`` (``val`` = current val) and a mix summary.
+    """
+    held_ids: set[str] = set()
+    held_sha: set[str] = set()
+    held_groups: set[str] = set()
+    for split in ("val", "test"):
+        for sample in current.split_samples(split):
+            held_ids.add(sample["sample_id"])
+            held_sha.add(sample.get("sha256"))
+            held_groups.add(sample.get("group_id"))
+
+    def link_sample(dataset: DatasetInfo, sample: dict[str, Any], subdir: str) -> None:
+        sid = sample["sample_id"]
+        link_or_copy(dataset.image_path(sample), dest / "images" / subdir / f"{sid}.jpg")
+        link_or_copy(dataset.label_path(sample), dest / "labels" / subdir / f"{sid}.txt")
+
+    seen: set[str] = set()
+    for sample in current.split_samples("train"):
+        link_sample(current, sample, "train")
+        seen.add(sample["sample_id"])
+    current_train = len(seen)
+    for sample in current.split_samples("val"):
+        link_sample(current, sample, "val")
+
+    added = skipped = 0
+    for replay in replays:
+        for sample in replay.split_samples("train"):
+            sid = sample["sample_id"]
+            if (sid in seen or sid in held_ids
+                    or sample.get("sha256") in held_sha
+                    or sample.get("group_id") in held_groups):
+                skipped += 1
+                continue
+            link_sample(replay, sample, "train")
+            seen.add(sid)
+            added += 1
+
+    (dest / "data.yaml").write_text(
+        "\n".join([f"path: {dest.resolve()}", "train: images/train", "val: images/val",
+                   "names:", "  0: cat", ""]),
+        encoding="utf-8",
+    )
+    return {
+        "data_yaml": dest / "data.yaml",
+        "current_train_images": current_train,
+        "replay_added": added,
+        "replay_skipped_leakage": skipped,
+        "merged_train_images": current_train + added,
+        "replay_versions": [r.manifest.get("version_id") or str(r.version_dir)
+                            for r in replays],
+    }
+
+
 def train(
     *,
     dataset_path: Path,
     weights_path: Path,
+    replay_paths: list[Path] = (),
     output_root: Path,
     run_name: str,
     epochs: int,
@@ -79,6 +143,17 @@ def train(
         raise FileExistsError(f"refusing to reuse training run directory: {run_dir}")
     run_dir.mkdir(parents=True)
     report_path = run_dir / "report.json"
+    # Mix in old dataset versions' TRAIN samples so fine-tuning does not forget
+    # earlier appearances (e.g. the cat before the haircut). Evaluation stays on
+    # the current version; colliding replay samples are dropped.
+    replays = [load_dataset(path, require_splits=("train",)) for path in replay_paths]
+    if replays:
+        merge = merge_training_dataset(dataset, replays, run_dir / "merged_dataset")
+        train_data_yaml = merge["data_yaml"]
+        replay_summary = {key: value for key, value in merge.items() if key != "data_yaml"}
+    else:
+        train_data_yaml = dataset.data_yaml
+        replay_summary = None
     parameters: dict[str, Any] = {
         "epochs": epochs, "imgsz": imgsz, "batch": batch, "device": device,
         "workers": workers, "seed": seed, "patience": patience,
@@ -86,6 +161,7 @@ def train(
         "evaluation_confidence": confidence, "evaluation_iou": iou_threshold,
         "augmentation": "Ultralytics train defaults; training split only",
         "architecture": "inherited from initial .pt checkpoint",
+        "replay": replay_summary,
     }
     session = ReportSession(
         report_path, kind="yolo_training", parameters=parameters, dataset=dataset,
@@ -116,7 +192,7 @@ def train(
                 model.add_callback("on_fit_epoch_end", epoch_finished)
             train_started = time.monotonic()
             kwargs: dict[str, Any] = {
-                "data": str(dataset.data_yaml), "project": str(output_root), "name": run_name,
+                "data": str(train_data_yaml), "project": str(output_root), "name": run_name,
                 "exist_ok": True, "epochs": epochs, "imgsz": imgsz, "batch": batch,
                 "device": device, "workers": workers, "seed": seed, "deterministic": True,
                 "patience": patience, "optimizer": optimizer, "augment": True,
@@ -188,6 +264,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="immutable version directory (or its data.yaml)")
     parser.add_argument("--weights", type=Path, required=True,
                         help="existing pretrained trainable .pt checkpoint")
+    parser.add_argument("--replay-version", action="append", dest="replay_versions",
+                        type=Path, default=None, metavar="VERSION_DIR",
+                        help="older dataset version to mix into training (repeatable); "
+                             "only its train split is added, collisions with the current "
+                             "val/test are dropped")
     parser.add_argument("--output-root", type=Path, default=Path("models/trained"))
     parser.add_argument("--name", default=None, help="new run directory name")
     parser.add_argument("--epochs", type=int, default=50)
@@ -209,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     code, _report = train(
         dataset_path=args.dataset, weights_path=args.weights,
+        replay_paths=args.replay_versions or [],
         output_root=args.output_root, run_name=args.name or _run_name(),
         epochs=args.epochs, imgsz=args.imgsz, batch=args.batch, device=args.device,
         workers=args.workers, seed=args.seed, patience=args.patience,
