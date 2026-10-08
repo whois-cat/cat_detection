@@ -982,6 +982,7 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "opencv-python-headless" },
+    { name = "pyyaml" },
 ]
 
 [package.optional-dependencies]
@@ -1002,6 +1003,7 @@ review = [
     { name = "uvicorn" },
 ]
 yolo = [
+    { name = "psutil" },
     { name = "ultralytics" },
 ]
 
@@ -1013,6 +1015,8 @@ requires-dist = [
     { name = "numpy" },
     { name = "opencv-python-headless" },
     { name = "pillow", marker = "extra == 'review'" },
+    { name = "psutil", marker = "extra == 'yolo'" },
+    { name = "pyyaml" },
     { name = "scikit-learn", marker = "extra == 'classifier'" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'classifier'", specifier = "==2.5.1", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "sys_platform != 'linux' and extra == 'classifier'", specifier = "==2.5.1" },

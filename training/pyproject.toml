@@ -10,12 +10,16 @@ dependencies = [
     "av",
     "numpy",
     "opencv-python-headless",
+    # streamhub_dataset / yolo_common read config.yaml for per-camera geometry.
+    "pyyaml",
 ]
 
 # Optional extras the modeller will add when they actually train a model.
 # Kept out of the base set so the extraction step alone is fast to install.
 [project.optional-dependencies]
-yolo       = ["ultralytics"]
+# psutil lets the YOLO run report measure job-vs-system CPU/RAM honestly;
+# yolo_common degrades gracefully to self peak RSS when it is absent.
+yolo       = ["ultralytics", "psutil"]
 # train_classifier.py needs only torch + torchvision. On Linux, uv is configured
 # below to resolve both from PyTorch's CPU-only wheel index so it does not pull
 # nvidia-* CUDA runtime wheels on machines without a GPU.

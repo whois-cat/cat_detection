@@ -33,6 +33,7 @@ import av
 import numpy as np
 
 from .db import Box, FrameRecord, iter_frames, open_db_ro
+from .frame_geometry import rotate_image
 from .segments import Segment, SegmentIndex
 
 
@@ -336,16 +337,12 @@ class CropSource(SampleSource):
 def rotate_crop(crop: np.ndarray, rotate_deg: int | None) -> np.ndarray:
     """Rotate a camera-orientation crop into the detector's INFERENCE orientation.
 
-    SINGLE shared helper — same convention as cv-worker's geometry.prepare(): the
-    camera is mounted rotated and we rotate the inference input CW by rotate_deg;
-    np.rot90 turns CCW, so the matching factor is k = (-rotate_deg // 90) % 4.
-    rotate_deg is per-event (0/90/180/270); 0/None is a no-op so users with no
-    tilt are unaffected.
+    Thin wrapper over the single shared helper in ``training.frame_geometry`` so
+    classifier crops, the YOLO collector and the dataset-version builder all
+    rotate identically to cv-worker's ``geometry.prepare`` (CW by rotate_deg;
+    0/None is a no-op).
     """
-    k = (-int(rotate_deg or 0) // 90) % 4
-    if k == 0:
-        return crop
-    return np.ascontiguousarray(np.rot90(crop, k=k))
+    return rotate_image(crop, rotate_deg)
 
 
 def _local_box(box: Box, pad_frac: float, frame_w: int, frame_h: int,

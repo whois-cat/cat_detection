@@ -22,6 +22,12 @@ rec_tz      := env_var_or_default("RECORDING_TZ",     "UTC")
 journal_db  := env_var_or_default("FEED_JOURNAL_DB",  "data/decider/feed_journal/journal.db")
 replay_set  := env_var_or_default("REPLAY_SET",       "data/replay")
 streamhub_port := env_var_or_default("STREAMHUB_PORT", "8096")
+# New-stack YOLO fine-tune pipeline (independent of the old events.db path).
+yolo_recordings := env_var_or_default("YOLO_RECORDINGS", "data/streamhub/recordings")
+yolo_dataset    := env_var_or_default("YOLO_DATASET",    "data/yolo_dataset")
+config_yaml     := env_var_or_default("CONFIG_YAML",     "config.yaml")
+YOLO_RUN       := TRAINING_RUN
+YOLO_TRAIN_RUN := TRAINING_RUN + " --extra yolo"
 
 default:
     @just --list
@@ -269,6 +275,72 @@ classifier-rollback VERSION="":
 [group('train')]
 classifier-restart:
     {{COMPOSE}} restart cv-worker
+
+# ───────────────────────── yolo fine-tune ────────────────────────
+# Prepare data for a single-class `cat` YOLO fine-tune from streamhub recordings.
+# All commands are offline/manual and never touch the running stack or models.
+
+# Collect full, un-annotated frames (saved as the detector sees them: ROI +
+# rotation) into the review catalog. Resumable; sidecar boxes are hints only.
+# Example: just yolo-collect --camera black,grey --from 2026-10-01 --to 2026-10-02 --tag shaved
+[group('yolo')]
+yolo-collect *ARGS:
+    {{YOLO_RUN}} python -m training.streamhub_dataset \
+        --recordings "{{yolo_recordings}}" \
+        --config "{{config_yaml}}" \
+        --out "{{yolo_dataset}}" \
+        {{ARGS}}
+
+# Review-queue composition and storage usage (read-only).
+[group('yolo')]
+yolo-queue *ARGS:
+    {{YOLO_RUN}} python -m training.yolo_review \
+        --catalog "{{yolo_dataset}}/catalog.sqlite3" --root "{{yolo_dataset}}" \
+        status {{ARGS}}
+
+# Export an unreviewed batch as a CVAT/COCO zip (model-suggested boxes included,
+# marked as suggestions, never as truth). Example: just yolo-review-export out/batch.zip 200
+[group('yolo')]
+yolo-review-export OUT LIMIT="100" *ARGS:
+    {{YOLO_RUN}} python -m training.yolo_review \
+        --catalog "{{yolo_dataset}}/catalog.sqlite3" --root "{{yolo_dataset}}" \
+        export --out "{{OUT}}" --limit {{LIMIT}} {{ARGS}}
+
+# Import a verified CVAT COCO export back into the catalog (validates IDs, dims,
+# boxes; empty frames need --confirm-empty). Example: just yolo-review-import cvat.zip
+[group('yolo')]
+yolo-review-import PACKAGE *ARGS:
+    {{YOLO_RUN}} python -m training.yolo_review \
+        --catalog "{{yolo_dataset}}/catalog.sqlite3" --root "{{yolo_dataset}}" \
+        import "{{PACKAGE}}" {{ARGS}}
+
+# Build an immutable, visit-group-split dataset version from reviewed samples.
+[group('yolo')]
+yolo-build-version *ARGS:
+    {{YOLO_RUN}} python -m training.yolo_build_version \
+        --catalog "{{yolo_dataset}}/catalog.sqlite3" --root "{{yolo_dataset}}" {{ARGS}}
+
+# Fine-tune YOLO from a pretrained .pt on a dataset version. Writes a report to
+# models/trained/<run>/ and never deploys. Example:
+#   just yolo-train --dataset data/yolo_dataset/versions/<id> --weights yolov8n.pt
+[group('yolo')]
+yolo-train *ARGS:
+    {{YOLO_TRAIN_RUN}} python -m training.yolo_train {{ARGS}}
+
+# Evaluate a trained .pt or OpenVINO export on the held-out test split.
+[group('yolo')]
+yolo-evaluate *ARGS:
+    {{YOLO_TRAIN_RUN}} python -m training.yolo_evaluate {{ARGS}}
+
+# Export a trained .pt to OpenVINO with a parity gate against the source .pt.
+[group('yolo')]
+yolo-export *ARGS:
+    {{YOLO_TRAIN_RUN}} python -m training.yolo_export {{ARGS}}
+
+# Compare two run reports: same data/config? how long, what resources, quality delta.
+[group('yolo')]
+yolo-compare A B *ARGS:
+    {{YOLO_RUN}} python -m training.compare_yolo_reports "{{A}}" "{{B}}" {{ARGS}}
 
 # ──────────────────────────── journal ────────────────────────────
 
