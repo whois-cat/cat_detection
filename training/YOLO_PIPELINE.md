@@ -62,34 +62,37 @@ Check the queue any time (read-only):
 just yolo-queue
 ```
 
-## 2. Label in CVAT (manual import/export)
+## 2. Label boxes in the browser (Label Studio, under the hood)
 
-Export an un-reviewed batch as a CVAT/COCO zip (with model boxes pre-filled as
-**suggestions**, clearly not truth). The file is auto-named under
-`data/yolo_dataset/exports/<batch_id>.zip` — no need to invent a filename:
+No COCO, no zips, no manual config. Label Studio runs locally and serves the
+collected frames straight from the catalog folder; the model's boxes are
+pre-filled as suggestions.
 
+**First time only** — start it and get an access token:
 ```bash
-just yolo-review-export            # default 200 frames, auto-named
-just yolo-review-export 300        # pick the batch size
-# one-shot everything (label over several CVAT sessions, import once):
-just yolo-review-export 5000
+just yolo-label-up        # starts Label Studio at http://localhost:8080 (localhost only)
+# open it (SSH tunnel if remote: ssh -L 8080:localhost:8080 <server>), log in with
+# LABEL_STUDIO_USERNAME/PASSWORD from .env, then copy
+# Account & Settings -> Access Token into .env as LABEL_STUDIO_API_KEY
 ```
 
-The command prints the path it wrote. Exported frames leave the queue
-(`status=exported`), so the next export never repeats them.
-
-In CVAT: import the zip, then for each frame draw **one box per cat** around the
-whole visible cat (head + body together), label it `cat`, fix/add/delete boxes.
-A frame with no cat is a negative **only after a human confirms it**. Export from
-CVAT as COCO and import back:
-
+**Each round:**
 ```bash
-just yolo-review-import path/to/cvat-export.zip               # cat boxes present
-just yolo-review-import path/to/cvat-export.zip --confirm-empty  # allow empty frames as negatives
+just yolo-label           # starts LS if needed + pushes unreviewed frames (with suggestions)
+# label in the browser: one box per cat (head + body), class `cat`; fix/add/delete.
+# a frame submitted with no box = confirmed-empty negative. Untouched = stays unreviewed.
+just yolo-sync            # pull submitted boxes back into the catalog (verified)
 ```
 
-Import validates image IDs, dimensions and box bounds, accepts only the `cat`
-class, and keeps stable sample IDs. Corrections are non-destructive.
+Because the model pre-fills boxes, most frames are "accept/adjust", and you only
+draw from scratch where YOLO was wrong. `just yolo-label --limit 300` pushes a
+smaller first batch. Stop the server with `just yolo-label-down` (projects and
+labels persist in a docker volume).
+
+> Label Studio itself is a third-party service pinned in `docker-compose.label.yml`.
+> It is standalone and localhost-only; the main stack is untouched. The CVAT
+> COCO export/import path (`training/yolo_review.py`) still exists for anyone who
+> prefers it, but is no longer the default.
 
 ## 3. Build an immutable dataset version
 

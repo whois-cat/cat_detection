@@ -28,6 +28,9 @@ yolo_dataset    := env_var_or_default("YOLO_DATASET",    "data/yolo_dataset")
 config_yaml     := env_var_or_default("CONFIG_YAML",     "config.yaml")
 YOLO_RUN       := TRAINING_RUN
 YOLO_TRAIN_RUN := TRAINING_RUN + " --extra yolo"
+YOLO_LABEL_RUN := TRAINING_RUN + " --extra label"
+LABEL_COMPOSE  := COMPOSE + " -f docker-compose.label.yml"
+label_studio_port := env_var_or_default("LABEL_STUDIO_PORT", "8080")
 
 default:
     @just --list
@@ -298,24 +301,37 @@ yolo-queue *ARGS:
         --catalog "{{yolo_dataset}}/catalog.sqlite3" --root "{{yolo_dataset}}" \
         status {{ARGS}}
 
-# Export an unreviewed batch as a CVAT/COCO zip (model-suggested boxes included,
-# marked as suggestions, never as truth). Auto-named under
-# data/yolo_dataset/exports/<batch_id>.zip — no need to invent a filename.
-# Examples: just yolo-review-export        |  just yolo-review-export 300
-# Custom name: just yolo-review-export 300 --out out/mine.zip
-[group('yolo')]
-yolo-review-export LIMIT="200" *ARGS:
-    {{YOLO_RUN}} python -m training.yolo_review \
-        --catalog "{{yolo_dataset}}/catalog.sqlite3" --root "{{yolo_dataset}}" \
-        export --limit {{LIMIT}} {{ARGS}}
+# Label boxes in the browser with Label Studio — all under the hood.
+# First run: `just yolo-label-up`, open the URL, log in, copy Account & Settings
+# -> Access Token into .env as LABEL_STUDIO_API_KEY. Then `just yolo-label`
+# starts Label Studio (if needed) and pushes the collected frames with the
+# model's boxes pre-filled. Label in the browser, then `just yolo-sync`.
 
-# Import a verified CVAT COCO export back into the catalog (validates IDs, dims,
-# boxes; empty frames need --confirm-empty). Example: just yolo-review-import cvat.zip
+# Start local Label Studio (localhost only), dataset folder mounted read-only.
 [group('yolo')]
-yolo-review-import PACKAGE *ARGS:
-    {{YOLO_RUN}} python -m training.yolo_review \
-        --catalog "{{yolo_dataset}}/catalog.sqlite3" --root "{{yolo_dataset}}" \
-        import "{{PACKAGE}}" {{ARGS}}
+yolo-label-up:
+    {{LABEL_COMPOSE}} up -d
+    @echo "Label Studio: http://localhost:{{label_studio_port}}"
+    @echo "Log in, then copy Account & Settings -> Access Token into .env as LABEL_STUDIO_API_KEY"
+
+# Push unreviewed frames (with model suggestions) into Label Studio.
+[group('yolo')]
+yolo-label *ARGS:
+    {{LABEL_COMPOSE}} up -d
+    {{YOLO_LABEL_RUN}} python -m training.yolo_label_studio \
+        --catalog "{{yolo_dataset}}/catalog.sqlite3" push {{ARGS}}
+    @echo "Label at http://localhost:{{label_studio_port}} — when done: just yolo-sync"
+
+# Pull submitted boxes from Label Studio back into the catalog.
+[group('yolo')]
+yolo-sync:
+    {{YOLO_LABEL_RUN}} python -m training.yolo_label_studio \
+        --catalog "{{yolo_dataset}}/catalog.sqlite3" pull
+
+# Stop local Label Studio (data/projects persist in a docker volume).
+[group('yolo')]
+yolo-label-down:
+    {{LABEL_COMPOSE}} down
 
 # Build an immutable, visit-group-split dataset version from reviewed samples.
 [group('yolo')]

@@ -34,6 +34,9 @@ classifier = ["torch==2.5.1", "torchvision==0.20.1", "scikit-learn", "mlflow>=2.
 # Stage B label-review web app (see ../review/requirements.txt). Decode-only —
 # deliberately no openvino/torch; av+numpy come from the base deps above.
 review     = ["fastapi", "uvicorn", "Pillow"]
+# Drive Label Studio for YOLO box review (push frames + pull boxes). The legacy
+# SDK Client API is what training.yolo_label_studio uses.
+label      = ["label-studio-sdk<1"]
 
 [tool.uv.sources]
 torch = [
