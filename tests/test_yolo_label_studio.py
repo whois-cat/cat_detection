@@ -6,6 +6,8 @@ from pathlib import Path
 from training.streamhub_dataset import open_catalog
 from training.yolo_label_studio import (
     LABEL_NAME,
+    LOCAL_STORAGE_PATH,
+    _ensure_local_storage,
     _pending_tasks,
     annotation_boxes,
     build_label_config,
@@ -34,6 +36,42 @@ def test_label_config_is_single_cat_rectangle():
 
 def test_image_url_points_at_local_files():
     assert image_url("images/black/abc.jpg") == "/data/local-files/?d=images/black/abc.jpg"
+
+
+class _FakeProject:
+    id = 7
+
+    def __init__(self, storages):
+        self.storages = storages
+        self.posted = []
+
+    def make_request(self, method, url, params=None, json=None):
+        assert url == "/api/storages/localfiles"
+        if method == "POST":
+            self.posted.append(json)
+        storages = self.storages
+
+        class _Resp:
+            def json(self):
+                return storages
+        return _Resp()
+
+
+def test_local_storage_created_so_local_files_urls_are_served():
+    project = _FakeProject([])
+    _ensure_local_storage(project)
+    assert project.posted == [{
+        "project": 7, "path": LOCAL_STORAGE_PATH, "title": "catalog frames",
+        "use_blob_urls": True, "regex_filter": "",
+    }]
+    # The served path must be the storage root + the relpath used in task URLs.
+    assert LOCAL_STORAGE_PATH.endswith("/images")
+
+
+def test_local_storage_not_duplicated_when_already_covered():
+    project = _FakeProject([{"path": "/label-studio/files"}])
+    _ensure_local_storage(project)
+    assert project.posted == []
 
 
 def test_box_fraction_round_trips_through_label_studio_percent():

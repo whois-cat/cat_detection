@@ -26,6 +26,9 @@ from training.streamhub_dataset import open_catalog
 LABEL_NAME = "cat"
 PROJECT_TITLE = "cat-detection YOLO boxes"
 MODEL_VERSION = "yolo-suggestion"
+# Must sit under LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT in docker-compose.label.yml;
+# every catalog frame lives under images/ (streamhub_dataset).
+LOCAL_STORAGE_PATH = "/label-studio/files/images"
 
 
 def build_label_config() -> str:
@@ -127,8 +130,27 @@ def _connect(url: str, api_key: str):
 def _ensure_project(client):
     for project in client.get_projects():
         if project.get_params().get("title") == PROJECT_TITLE:
-            return project
-    return client.start_project(title=PROJECT_TITLE, label_config=build_label_config())
+            break
+    else:
+        project = client.start_project(title=PROJECT_TITLE, label_config=build_label_config())
+    _ensure_local_storage(project)
+    return project
+
+
+def _ensure_local_storage(project) -> None:
+    # Label Studio refuses /data/local-files/ URLs unless the project has a Local
+    # Storage whose path covers the file. It is never synced: tasks are imported
+    # by push() with their own URLs, the storage only authorises serving.
+    storages = project.make_request(
+        "GET", "/api/storages/localfiles", params={"project": project.id}
+    ).json()
+    if any(LOCAL_STORAGE_PATH.startswith(s.get("path", "").rstrip("/") or "\0")
+           for s in storages):
+        return
+    project.make_request("POST", "/api/storages/localfiles", json={
+        "project": project.id, "path": LOCAL_STORAGE_PATH, "title": "catalog frames",
+        "use_blob_urls": True, "regex_filter": "",
+    })
 
 
 def _pending_tasks(conn) -> list[dict]:
