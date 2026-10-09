@@ -131,9 +131,11 @@ def _ensure_project(client):
     return client.start_project(title=PROJECT_TITLE, label_config=build_label_config())
 
 
-def _unreviewed_tasks(conn) -> list[dict]:
+def _pending_tasks(conn) -> list[dict]:
+    # Everything not yet human-verified, so frames left in 'exported' by an
+    # earlier CVAT export are picked up too (not only fresh 'unreviewed' ones).
     tasks = []
-    for row in conn.execute("SELECT * FROM samples WHERE status='unreviewed' ORDER BY wall_ms"):
+    for row in conn.execute("SELECT * FROM samples WHERE status!='verified' ORDER BY wall_ms"):
         pred = conn.execute(
             "SELECT detections_json FROM predictions WHERE sample_id=?", (row["sample_id"],)
         ).fetchone()
@@ -152,7 +154,7 @@ def push(url: str, api_key: str, catalog: Path, limit: int | None = None) -> dic
     }
     conn = open_catalog(catalog)
     try:
-        tasks = [t for t in _unreviewed_tasks(conn)
+        tasks = [t for t in _pending_tasks(conn)
                  if t["data"]["sample_id"] not in existing]
     finally:
         conn.close()

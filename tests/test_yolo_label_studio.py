@@ -1,13 +1,30 @@
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
+from training.streamhub_dataset import open_catalog
 from training.yolo_label_studio import (
     LABEL_NAME,
+    _pending_tasks,
     annotation_boxes,
     build_label_config,
     image_url,
     prediction_results,
     sample_task,
 )
+
+
+def _insert(conn, sample_id: str, status: str, pts: int) -> None:
+    conn.execute(
+        """INSERT INTO samples(
+             sample_id,camera,segment_relpath,pts,wall_ms,image_relpath,width,height,
+             jpeg_bytes,sha256,dhash,reasons_json,rotate_deg,status,protected,created_at_ms
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (sample_id, "black", "black/seg.mp4", pts, pts // 90, f"images/black/{sample_id}.jpg",
+         24, 32, 100, f"sha-{sample_id}", "0000000000000000", "[]", 90, status, 0,
+         int(time.time() * 1000)),
+    )
 
 
 def test_label_config_is_single_cat_rectangle():
@@ -47,3 +64,14 @@ def test_sample_task_carries_id_image_and_suggestions():
 def test_empty_annotation_is_a_confirmed_negative():
     # A submitted annotation with no rectangles yields zero boxes (negative).
     assert annotation_boxes([], 100, 50) == []
+
+
+def test_pending_tasks_include_exported_but_not_verified(tmp_path: Path):
+    conn = open_catalog(tmp_path / "catalog.sqlite3")
+    _insert(conn, "fresh", "unreviewed", 90)
+    _insert(conn, "from_cvat", "exported", 180)   # left over from a CVAT export
+    _insert(conn, "done", "verified", 270)
+    conn.commit()
+    ids = {task["data"]["sample_id"] for task in _pending_tasks(conn)}
+    conn.close()
+    assert ids == {"fresh", "from_cvat"}
