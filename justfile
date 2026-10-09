@@ -299,12 +299,15 @@ yolo-queue *ARGS:
         status {{ARGS}}
 
 # Export an unreviewed batch as a CVAT/COCO zip (model-suggested boxes included,
-# marked as suggestions, never as truth). Example: just yolo-review-export out/batch.zip 200
+# marked as suggestions, never as truth). Auto-named under
+# data/yolo_dataset/exports/<batch_id>.zip — no need to invent a filename.
+# Examples: just yolo-review-export        |  just yolo-review-export 300
+# Custom name: just yolo-review-export 300 --out out/mine.zip
 [group('yolo')]
-yolo-review-export OUT LIMIT="100" *ARGS:
+yolo-review-export LIMIT="200" *ARGS:
     {{YOLO_RUN}} python -m training.yolo_review \
         --catalog "{{yolo_dataset}}/catalog.sqlite3" --root "{{yolo_dataset}}" \
-        export --out "{{OUT}}" --limit {{LIMIT}} {{ARGS}}
+        export --limit {{LIMIT}} {{ARGS}}
 
 # Import a verified CVAT COCO export back into the catalog (validates IDs, dims,
 # boxes; empty frames need --confirm-empty). Example: just yolo-review-import cvat.zip

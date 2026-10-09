@@ -77,6 +77,24 @@ def test_cvat_roundtrip_keeps_suggestions_separate_until_import(tmp_path: Path):
     conn.close()
 
 
+def test_export_auto_names_under_exports_dir(tmp_path: Path):
+    catalog = tmp_path / "catalog.sqlite3"
+    conn = open_catalog(catalog)
+    add_sample(conn, tmp_path, "sample-a", [{"box": [0.1, 0.2, 0.3, 0.4], "score": 0.2}])
+    conn.close()
+    result = export_batch(catalog, tmp_path, None, 10)  # no filename given
+    written = Path(result["path"])
+    assert written.parent == tmp_path / "exports"
+    assert written.name == f"{result['batch_id']}.zip"
+    assert written.is_file()
+    # A second auto-named export of fresh samples is a different, non-colliding file.
+    conn = open_catalog(catalog)
+    add_sample(conn, tmp_path, "sample-b", [{"box": [0.1, 0.2, 0.3, 0.4], "score": 0.3}])
+    conn.close()
+    second = Path(export_batch(catalog, tmp_path, None, 10)["path"])
+    assert second != written and second.is_file()
+
+
 def test_empty_frame_requires_explicit_human_confirmation(tmp_path: Path):
     catalog = tmp_path / "catalog.sqlite3"
     conn = open_catalog(catalog)

@@ -45,15 +45,18 @@ def _publish_zip_without_overwrite(temporary: Path, output: Path) -> None:
         raise FileExistsError(f"refusing to overwrite existing export: {output}") from exc
 
 
-def export_batch(catalog: Path, root: Path, output: Path, limit: int,
+def export_batch(catalog: Path, root: Path, output: Path | None, limit: int,
                  include_suggestions: bool = True) -> dict:
     if limit <= 0:
         raise ValueError("export limit must be greater than zero")
-    if output.exists():
+    # When no name is given, auto-name later as <root>/exports/<batch_id>.zip so
+    # operators never have to invent a unique filename per batch.
+    export_dir = output.parent if output is not None else (root / "exports")
+    export_dir.mkdir(parents=True, exist_ok=True)
+    if output is not None and output.exists():
         raise FileExistsError(f"refusing to overwrite existing export: {output}")
-    output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+        prefix=".export.", suffix=".tmp", dir=export_dir
     )
     os.close(descriptor)
     temporary = Path(temporary_name)
@@ -99,6 +102,10 @@ def export_batch(catalog: Path, root: Path, output: Path, limit: int,
                     ann_id += 1
         manifest_hash = _manifest_hash(manifest_samples)
         batch_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + manifest_hash[:8]
+        if output is None:
+            output = export_dir / f"{batch_id}.zip"
+            if output.exists():
+                raise FileExistsError(f"refusing to overwrite existing export: {output}")
         manifest = {
             "schema": 1, "batch_id": batch_id,
             "manifest_sha256": manifest_hash, "samples": manifest_samples,
@@ -452,7 +459,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path("data/yolo_dataset"))
     sub = parser.add_subparsers(dest="command", required=True)
     export = sub.add_parser("export")
-    export.add_argument("--out", type=Path, required=True)
+    export.add_argument("--out", type=Path, default=None,
+                        help="output zip (default: <root>/exports/<batch_id>.zip)")
     export.add_argument("--limit", type=int, default=100)
     export.add_argument("--no-suggestions", action="store_true")
     imp = sub.add_parser("import")

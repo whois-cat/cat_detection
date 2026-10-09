@@ -65,11 +65,18 @@ just yolo-queue
 ## 2. Label in CVAT (manual import/export)
 
 Export an un-reviewed batch as a CVAT/COCO zip (with model boxes pre-filled as
-**suggestions**, clearly not truth):
+**suggestions**, clearly not truth). The file is auto-named under
+`data/yolo_dataset/exports/<batch_id>.zip` — no need to invent a filename:
 
 ```bash
-just yolo-review-export out/batch-001.zip 200
+just yolo-review-export            # default 200 frames, auto-named
+just yolo-review-export 300        # pick the batch size
+# one-shot everything (label over several CVAT sessions, import once):
+just yolo-review-export 5000
 ```
+
+The command prints the path it wrote. Exported frames leave the queue
+(`status=exported`), so the next export never repeats them.
 
 In CVAT: import the zip, then for each frame draw **one box per cat** around the
 whole visible cat (head + body together), label it `cat`, fix/add/delete boxes.
