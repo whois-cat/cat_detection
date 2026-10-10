@@ -15,6 +15,7 @@ import resource
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -167,6 +168,26 @@ class DatasetInfo:
 
     def label_path(self, sample: dict[str, Any]) -> Path:
         return self.version_dir / "labels" / str(sample["split"]) / f"{sample['sample_id']}.txt"
+
+
+def ultralytics_data_yaml(dataset: "DatasetInfo") -> Path:
+    """data.yaml to hand to Ultralytics for this version.
+
+    A version's data.yaml records the absolute ``path:`` it was built at, so the
+    same version opened elsewhere (inside a container under /work, copied to a
+    GPU box) points Ultralytics at a directory that does not exist. Then return
+    a copy with ``path`` set to where the version actually is; the immutable
+    version itself is never rewritten.
+    """
+    raw = yaml.safe_load(dataset.data_yaml.read_text(encoding="utf-8")) or {}
+    recorded = raw.get("path")
+    if recorded and Path(str(recorded)).expanduser().resolve() == dataset.version_dir.resolve():
+        return dataset.data_yaml
+    raw["path"] = str(dataset.version_dir.resolve())
+    digest = hashlib.sha256(raw["path"].encode()).hexdigest()[:12]
+    out = Path(tempfile.gettempdir()) / f"cat-yolo-{dataset.dataset_sha256[:12]}-{digest}.yaml"
+    out.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return out
 
 
 def resolve_dataset_path(path: Path) -> tuple[Path, Path]:

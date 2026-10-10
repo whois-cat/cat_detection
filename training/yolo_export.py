@@ -19,6 +19,7 @@ from training.yolo_common import (
     print_report_summary,
     sha256_file,
     sha256_tree,
+    ultralytics_data_yaml,
     validate_training_weights,
 )
 from training.yolo_evaluate import evaluate_artifact, validate_model_artifact
@@ -134,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             if args.int8:
                 # Ultralytics uses the training split for calibration.
-                export_kwargs["data"] = str(dataset.data_yaml)
+                export_kwargs["data"] = str(ultralytics_data_yaml(dataset))
             exported_value = model.export(**export_kwargs)
             exported = validate_model_artifact(Path(str(exported_value)))
             session.report["timing_seconds"]["export"] = time.monotonic() - export_started

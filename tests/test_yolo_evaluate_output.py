@@ -23,7 +23,7 @@ def _dataset(tmp_path: Path):
         (version / "labels" / "test").mkdir(parents=True, exist_ok=True)
         (version / "images" / "test" / f"{sid}.jpg").write_bytes(b"jpeg")
         (version / "labels" / "test" / f"{sid}.txt").write_text(rows)
-    (version / "data.yaml").write_text("path: x\n")
+    (version / "data.yaml").write_text(f"path: {version}\nnames:\n  0: cat\n")
     manifest = {"samples": [{"sample_id": "a", "split": "test"},
                             {"sample_id": "b", "split": "test"},
                             {"sample_id": "c", "split": "train"}]}
@@ -54,3 +54,23 @@ def test_coco_model_gets_labels_renumbered_to_its_cat_id(tmp_path: Path):
         assert "  15: cat" in text and "test: images/test" in text
     assert not root.exists()                                     # throwaway copy removed
     assert (dataset.version_dir / "labels" / "test" / "a.txt").read_text().startswith("0 ")
+
+
+def test_data_yaml_follows_the_version_when_it_moved(tmp_path: Path):
+    import yaml
+
+    from training.yolo_common import ultralytics_data_yaml
+
+    dataset = _dataset(tmp_path)
+    # built on another machine / outside the container
+    dataset.data_yaml.write_text("path: /home/elsewhere/versions/v1\ntrain: images/train\n"
+                                 "val: images/val\ntest: images/test\nnames:\n  0: cat\n")
+    moved = ultralytics_data_yaml(dataset)
+    assert moved != dataset.data_yaml
+    data = yaml.safe_load(moved.read_text())
+    assert data["path"] == str(dataset.version_dir.resolve())
+    assert data["names"] == {0: "cat"} and data["test"] == "images/test"
+    assert "elsewhere" in dataset.data_yaml.read_text()      # version left untouched
+
+    dataset.data_yaml.write_text(f"path: {dataset.version_dir}\nnames:\n  0: cat\n")
+    assert ultralytics_data_yaml(dataset) == dataset.data_yaml

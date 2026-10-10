@@ -22,6 +22,7 @@ from training.yolo_common import (
     load_dataset,
     print_report_summary,
     sha256_file,
+    ultralytics_data_yaml,
     validate_training_weights,
 )
 from training.yolo_evaluate import evaluate_artifact
@@ -152,7 +153,7 @@ def train(
         train_data_yaml = merge["data_yaml"]
         replay_summary = {key: value for key, value in merge.items() if key != "data_yaml"}
     else:
-        train_data_yaml = dataset.data_yaml
+        train_data_yaml = ultralytics_data_yaml(dataset)
         replay_summary = None
     parameters: dict[str, Any] = {
         "epochs": epochs, "imgsz": imgsz, "batch": batch, "device": device,

@@ -28,6 +28,7 @@ from training.yolo_common import (
     link_or_copy,
     load_dataset,
     print_report_summary,
+    ultralytics_data_yaml,
     resolve_model_cat_id,
     sample_subsets,
     sha256_tree,
@@ -260,7 +261,7 @@ def official_val_data(dataset: DatasetInfo, model_cat_id: int) -> Iterator[Path]
     split whose labels are renumbered to the model's cat id.
     """
     if model_cat_id == dataset.cat_id:
-        yield dataset.data_yaml
+        yield ultralytics_data_yaml(dataset)
         return
     tmp = Path(tempfile.mkdtemp(prefix=".eval-", dir=dataset.version_dir.parent))
     try:
