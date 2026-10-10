@@ -10,6 +10,7 @@ from training.yolo_label_studio import (
     _ensure_local_storage,
     _pending_tasks,
     annotation_boxes,
+    task_priority,
     build_label_config,
     image_url,
     prediction_results,
@@ -17,14 +18,14 @@ from training.yolo_label_studio import (
 )
 
 
-def _insert(conn, sample_id: str, status: str, pts: int) -> None:
+def _insert(conn, sample_id: str, status: str, pts: int, reasons: str = "[]") -> None:
     conn.execute(
         """INSERT INTO samples(
              sample_id,camera,segment_relpath,pts,wall_ms,image_relpath,width,height,
              jpeg_bytes,sha256,dhash,reasons_json,rotate_deg,status,protected,created_at_ms
            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (sample_id, "black", "black/seg.mp4", pts, pts // 90, f"images/black/{sample_id}.jpg",
-         24, 32, 100, f"sha-{sample_id}", "0000000000000000", "[]", 90, status, 0,
+         24, 32, 100, f"sha-{sample_id}", "0000000000000000", reasons, 90, status, 0,
          int(time.time() * 1000)),
     )
 
@@ -92,9 +93,12 @@ def test_prediction_skips_degenerate_boxes():
 
 def test_sample_task_carries_id_image_and_suggestions():
     sample = {"sample_id": "s1", "camera": "black", "wall_ms": 123,
-              "image_relpath": "images/black/s1.jpg", "reasons": "[]"}
+              "image_relpath": "images/black/s1.jpg",
+              "reasons_json": '["regular","low_confidence"]'}
     task = sample_task(sample, [{"box": [0.1, 0.2, 0.3, 0.4]}])
     assert task["data"]["sample_id"] == "s1"
+    assert task["data"]["reasons"] == "regular,low_confidence"
+    assert task["data"]["priority"] == 0
     assert task["data"]["image"] == "/data/local-files/?d=images/black/s1.jpg"
     assert task["predictions"][0]["result"][0]["value"]["rectanglelabels"] == [LABEL_NAME]
 
@@ -102,6 +106,25 @@ def test_sample_task_carries_id_image_and_suggestions():
 def test_empty_annotation_is_a_confirmed_negative():
     # A submitted annotation with no rectangles yields zero boxes (negative).
     assert annotation_boxes([], 100, 50) == []
+
+
+def test_priority_puts_likely_model_mistakes_first():
+    assert task_priority(["low_confidence"]) < task_priority(["multiple_boxes"])
+    assert task_priority(["multiple_boxes"]) < task_priority(["visual_change"])
+    assert task_priority(["visit_sample"]) < task_priority(["regular"])
+    assert task_priority(["regular", "low_confidence"]) == task_priority(["low_confidence"])
+    assert task_priority([]) > task_priority(["regular"])
+
+
+def test_pending_tasks_ordered_by_priority_then_time(tmp_path: Path):
+    conn = open_catalog(tmp_path / "catalog.sqlite3")
+    _insert(conn, "early_regular", "unreviewed", 90, '["regular"]')
+    _insert(conn, "late_unsure", "unreviewed", 900, '["low_confidence"]')
+    _insert(conn, "mid_unsure", "unreviewed", 450, '["low_confidence"]')
+    conn.commit()
+    order = [task["data"]["sample_id"] for task in _pending_tasks(conn)]
+    conn.close()
+    assert order == ["mid_unsure", "late_unsure", "early_regular"]
 
 
 def test_pending_tasks_include_exported_but_not_verified(tmp_path: Path):

@@ -69,15 +69,37 @@ def prediction_results(dets: Iterable[dict]) -> list[dict]:
     return results
 
 
+# Review order: frames the model is most likely wrong about first. Lower = sooner.
+REASON_PRIORITY = {
+    "low_confidence": 0, "multiple_boxes": 1, "visual_change": 2,
+    "visit_sample": 3, "regular": 4,
+}
+
+
+def sample_reasons(sample: dict) -> list[str]:
+    try:
+        return list(json.loads(sample.get("reasons_json") or "[]"))
+    except (TypeError, ValueError):
+        return []
+
+
+def task_priority(reasons: Iterable[str]) -> int:
+    """Best (lowest) priority among a frame's selection reasons."""
+    return min((REASON_PRIORITY.get(r, len(REASON_PRIORITY)) for r in reasons),
+               default=len(REASON_PRIORITY))
+
+
 def sample_task(sample: dict, dets: Iterable[dict]) -> dict:
     """One Label Studio task: the frame plus the model's boxes as a prediction."""
+    reasons = sample_reasons(sample)
     task: dict[str, Any] = {
         "data": {
             "image": image_url(sample["image_relpath"]),
             "sample_id": sample["sample_id"],
             "camera": sample["camera"],
             "wall_ms": sample["wall_ms"],
-            "reasons": sample.get("reasons"),
+            "reasons": ",".join(reasons),
+            "priority": task_priority(reasons),
         }
     }
     results = prediction_results(dets)
@@ -163,29 +185,44 @@ def _pending_tasks(conn) -> list[dict]:
         ).fetchone()
         dets = json.loads(pred[0]) if pred and pred[0] else []
         tasks.append(sample_task(dict(row), dets))
+    # Stable sort: hardest frames first, chronological within a priority. Label
+    # Studio's "Label All Tasks" stream walks tasks in import (id) order.
+    tasks.sort(key=lambda t: t["data"]["priority"])
     return tasks
 
 
 def push(url: str, api_key: str, catalog: Path, limit: int | None = None) -> dict:
-    """Create/refresh the project and import unreviewed frames (skip already pushed)."""
+    """Create/refresh the project and import unreviewed frames (skip already pushed).
+
+    Tasks pushed before priorities existed get ``priority``/``reasons`` patched
+    in, so the Data Manager can sort them by the ``priority`` column."""
     client = _connect(url, api_key)
     project = _ensure_project(client)
     existing = {
-        task["data"].get("sample_id")
+        task["data"].get("sample_id"): task
         for task in project.get_tasks(only_ids=False)
     }
     conn = open_catalog(catalog)
     try:
-        tasks = [t for t in _pending_tasks(conn)
-                 if t["data"]["sample_id"] not in existing]
+        pending = _pending_tasks(conn)
     finally:
         conn.close()
+    tasks = [t for t in pending if t["data"]["sample_id"] not in existing]
+    reprioritised = 0
+    for fresh in pending:
+        old = existing.get(fresh["data"]["sample_id"])
+        if old is None or old["data"].get("priority") == fresh["data"]["priority"]:
+            continue
+        data = {**old["data"], "priority": fresh["data"]["priority"],
+                "reasons": fresh["data"]["reasons"]}
+        project.make_request("PATCH", f"/api/tasks/{old['id']}", json={"data": data})
+        reprioritised += 1
     if limit is not None:
         tasks = tasks[:limit]
     if tasks:
         project.import_tasks(tasks)
     return {"project_id": project.id, "pushed": len(tasks),
-            "already_present": len(existing)}
+            "already_present": len(existing), "reprioritised": reprioritised}
 
 
 def pull(url: str, api_key: str, catalog: Path) -> dict:
