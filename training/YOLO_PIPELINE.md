@@ -1,4 +1,4 @@
-# YOLO fine-tune pipeline (single-class `cat`)
+# YOLO fine-tune pipeline (`cat`)
 
 Offline, manual pipeline that turns existing **streamhub** recordings into a
 hand-labelled dataset and a fine-tuned YOLO detector. It is fully independent of
@@ -116,7 +116,12 @@ just box-build --val-frac 0.15 --test-frac 0.15
 - Exact-duplicate images are de-duplicated before the split; near-duplicates
   across splits are counted and reported.
 - Images are **hardlinked** (no second copy of every frame); labels are written
-  as `0 cx cy w h`.
+  as `15 cx cy w h`.
+- Uses the **COCO class numbering** of the base model and the runtime detector
+  (80 names, only `cat` = 15 labelled). The fine-tune keeps the whole pretrained
+  head, cat output included, and every model and version agree on the cat id.
+  Versions built with the earlier single-class numbering are refused with a
+  hint to rebuild.
 - Reports loudly when there are too few independent groups or a required split
   is empty — **honest evaluation is not yet possible**, collect/review more
   visits.
@@ -191,10 +196,21 @@ beyond the limits. Exit code 2 = gate failed. It never promotes a runtime model.
 just box-compare models/trained/<run_a>/report.json models/trained/<run_b>/report.json
 ```
 
-## Deploying later (separate, deliberate decision)
+## Deploying (separate, deliberate decision)
 
-Not part of this pipeline. When you decide to deploy a single-class model, the
-runtime filters the COCO `cat` class id `15` in
-`cv-worker/cv_worker/models/yolo.py` — a single-class fine-tune uses id `0`, so
-that filter must change (or auto-detect from `model.names`). Changing bounding
-boxes also changes the classifier's input crop, so re-check the whole chain.
+A fine-tune has the same 80 COCO classes as the baked-in model (cv-worker
+looks the `cat` id up in the model's own names), so it is a drop-in replacement:
+
+```bash
+# .env
+YOLO_WEIGHTS=/opt/models/trained/<run>/weights/best_int8_openvino_model
+```
+then `just up`. Roll back by removing the line and `just up` again. The web UI
+and sidecars show the running detector by its run name.
+
+Export with `just box-export` (above): it runs in the cv-worker image, so the
+IR is produced by the exact ultralytics/OpenVINO versions that serve it.
+
+Changing boxes also changes the classifier's input crops, and per-camera
+`cv.yolo_conf` values tuned for the COCO model (e.g. a very low threshold set
+to catch missed cats) should be revisited after a few days in `dry_run`.

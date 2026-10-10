@@ -111,7 +111,7 @@ setup TARGET="all":
     esac
 
 # ─────────────────────── box: where is the cat ───────────────────────
-# Single-class `cat` YOLO fine-tune from streamhub recordings, in pipeline order:
+# `cat` YOLO fine-tune from streamhub recordings, in pipeline order:
 #   box-collect -> box-label (in Label Studio) -> box-sync -> box-build
 #   -> box-train -> box-eval -> box-export
 # All offline/manual; never touches the running stack or deployed models.
@@ -175,10 +175,17 @@ box-train *ARGS:
 box-eval *ARGS:
     {{YOLO_TRAIN_RUN}} python -m training.yolo_evaluate {{ARGS}}
 
+# Runs in the cv-worker image so the IR is built by the same ultralytics/OpenVINO
+# that will serve it. Writes models/trained/<run>/weights/best_int8_openvino_model;
+# to deploy, set YOLO_WEIGHTS=/opt/models/trained/<run>/weights/best_int8_openvino_model
+# in .env and `just up` (remove it to roll back).
 # Export a trained .pt to OpenVINO with a parity gate against the source .pt.
 [group('box')]
 box-export *ARGS:
-    {{YOLO_TRAIN_RUN}} python -m training.yolo_export {{ARGS}}
+    {{COMPOSE}} run --rm --no-deps --user "$(id -u):$(id -g)" \
+        -e YOLO_CONFIG_DIR=/tmp/ultralytics -e HOME=/tmp \
+        -v "$PWD":/work -w /work {{CLUSTER_SERVICE}} \
+        python -m training.yolo_export {{ARGS}}
 
 # Compare two run reports: same data/config? how long, what resources, quality delta.
 [group('box')]

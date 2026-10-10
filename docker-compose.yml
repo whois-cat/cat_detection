@@ -38,6 +38,11 @@ services:
       CV_MODEL: yolo_cat
       # Inferences per second per camera at most; caps CPU use (0 = unlimited).
       CV_MAX_FPS: "2"
+      # Detector weights. Default: the COCO yolov8n baked into the image. A
+      # fine-tune (see `just box-export`) is switched on by setting YOLO_WEIGHTS
+      # in .env to /opt/models/trained/<run>/weights/best_int8_openvino_model;
+      # remove it to roll back. Then `just up`.
+      YOLO_WEIGHTS: ${YOLO_WEIGHTS:-/opt/models/yolov8n_int8_openvino_model/}
       CLASSIFIER_DIR: /opt/models/classifier/current
       # Must match the crop padding the classifier was trained with.
       CLASSIFIER_PAD_FRAC: "0.05"
@@ -45,6 +50,7 @@ services:
       # Mount the parent dir (not the `current` symlink) so a promoted version
       # switch is visible on restart.
       - ./models/classifier:/opt/models/classifier:ro
+      - ./models/trained:/opt/models/trained:ro
 
   # Sparsifies old recordings and enforces the size cap (config.yaml: pruner).
   pruner:
