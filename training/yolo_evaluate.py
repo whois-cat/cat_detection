@@ -11,10 +11,13 @@ import json
 import math
 import statistics
 import time
+import shutil
+import tempfile
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import cv2
 
@@ -22,6 +25,7 @@ from training.yolo_common import (
     DatasetInfo,
     ReportSession,
     convert_termination_to_interrupt,
+    link_or_copy,
     load_dataset,
     print_report_summary,
     resolve_model_cat_id,
@@ -246,6 +250,45 @@ def val_output_kwargs(plots_dir: Path | None) -> dict[str, Any]:
     return {"project": str(plots_dir.parent), "name": plots_dir.name, "exist_ok": True}
 
 
+@contextmanager
+def official_val_data(dataset: DatasetInfo, model_cat_id: int) -> Iterator[Path]:
+    """data.yaml for Ultralytics ``val`` with ``classes=[model_cat_id]``.
+
+    That filter applies to the ground-truth labels too, so a model whose cat id
+    differs from the dataset's (the COCO base: 15 vs our single-class 0) would
+    see no labels at all. In that case evaluate a throwaway copy of the test
+    split whose labels are renumbered to the model's cat id.
+    """
+    if model_cat_id == dataset.cat_id:
+        yield dataset.data_yaml
+        return
+    tmp = Path(tempfile.mkdtemp(prefix=".eval-", dir=dataset.version_dir.parent))
+    try:
+        for sample in dataset.split_samples("test"):
+            link_or_copy(dataset.image_path(sample),
+                         tmp / "images" / "test" / dataset.image_path(sample).name)
+            source = dataset.label_path(sample)
+            rows = source.read_text(encoding="utf-8").splitlines() if source.is_file() else []
+            renumbered = [
+                " ".join([str(model_cat_id), *parts[1:]])
+                for parts in (row.split() for row in rows)
+                if parts and int(float(parts[0])) == dataset.cat_id
+            ]
+            label = tmp / "labels" / "test" / source.name
+            label.parent.mkdir(parents=True, exist_ok=True)
+            label.write_text("".join(f"{row}\n" for row in renumbered), encoding="utf-8")
+        names = [f"  {i}: {'cat' if i == model_cat_id else f'class{i}'}"
+                 for i in range(model_cat_id + 1)]
+        data_yaml = tmp / "data.yaml"
+        data_yaml.write_text("\n".join([
+            f"path: {tmp}", "train: images/test", "val: images/test", "test: images/test",
+            "names:", *names, "",
+        ]), encoding="utf-8")
+        yield data_yaml
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def evaluate_artifact(
     model_path: Path,
     dataset: DatasetInfo,
@@ -264,11 +307,12 @@ def evaluate_artifact(
     model = model_factory(model_path)
     cat_id = resolve_model_cat_id(model)
     official_started = time.monotonic()
-    validation = model.val(
-        data=str(dataset.data_yaml), split="test", imgsz=imgsz, batch=batch,
-        device=device, workers=workers, classes=[cat_id], single_cls=True, verbose=False,
-        **val_output_kwargs(plots_dir),
-    )
+    with official_val_data(dataset, cat_id) as data_yaml:
+        validation = model.val(
+            data=str(data_yaml), split="test", imgsz=imgsz, batch=batch,
+            device=device, workers=workers, classes=[cat_id], single_cls=True, verbose=False,
+            **val_output_kwargs(plots_dir),
+        )
     official_elapsed = time.monotonic() - official_started
     custom_started = time.monotonic()
     custom = fixed_confidence_evaluation(
