@@ -191,7 +191,7 @@ Concepts:
 3. Fine-tune from the previous model:
    `just cat-train --init-from models/trained/<previous>/cat_classifier.pt`.
 4. `just cat-compare` the candidate against the deployed model.
-5. Promote only if metrics and threshold behavior are acceptable.
+5. `just deploy classifier <run>` only if metrics and threshold behavior are acceptable.
 
 Catalog frames are kept (verified samples are protected), so old examples stay
 trainable after the recordings are pruned; the replay memory the previous stack
@@ -260,7 +260,7 @@ kept; older segments are deleted unless a detection is within `event_margin`
 - `webui/src/`: `App.svelte`, `Player.svelte`, `Timeline.svelte`, `lib/`.
 - `training/…`, `review/…`: labeling and training; `training/catalog_crops.py`
   turns verified catalog boxes into classifier crops.
-- `tools/promote_classifier.py`, `tools/feed_log.py`.
+- `tools/models.py` (deploy/rollback of both models), `tools/feed_log.py`.
 
 ## Gotchas
 

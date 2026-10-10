@@ -181,19 +181,7 @@ confidence, errors on confirmed-empty frames, per-subset metrics (tag the shaved
 period with `--tag shaved` at collection to get the shaved-cat split separately),
 and offline inference timing (explicitly **not** end-to-end feeder latency).
 
-## 6. Export to OpenVINO (parity-gated) — optional, still not deployed
-
-```bash
-just box-export --dataset <version> --model models/trained/<run>/weights/best.pt --int8
-```
-
-Evaluates `.pt` vs the export on the same test split and fails if quality drops
-beyond the limits: mAP50-95 (threshold-free), and recall and false positives at
-the runtime confidence (`--eval-conf`, 0.25). Ultralytics' own precision/recall
-are reported but not gated — they sit at each model's max-F1 threshold, which
-moves between the two. Exit code 2 = gate failed. It never promotes a runtime model.
-
-## 7. Compare two runs
+## 6. Compare two runs
 
 ```bash
 just box-compare models/trained/<run_a>/report.json models/trained/<run_b>/report.json
@@ -201,19 +189,24 @@ just box-compare models/trained/<run_a>/report.json models/trained/<run_b>/repor
 
 ## Deploying (separate, deliberate decision)
 
-A fine-tune has the same 80 COCO classes as the baked-in model (cv-worker
-looks the `cat` id up in the model's own names), so it is a drop-in replacement:
-
 ```bash
-# .env
-YOLO_WEIGHTS=/opt/models/trained/<run>/weights/best_int8_openvino_model
+just deploy detector <run>     # e.g. yolo-20261010-011816; default: newest run
+just models                    # what runs now
+just rollback detector         # previous version, or the built-in COCO model
 ```
-then `just up`. Roll back by removing the line and `just up` again. The web UI
-and sidecars show the running detector by its run name.
 
-Export with `just box-export` (above): it runs in the cv-worker image, so the
-IR is produced by the exact ultralytics/OpenVINO versions that serve it.
+`deploy` exports the run's `best.pt` to INT8 OpenVINO in the cv-worker image
+(the ultralytics/OpenVINO versions that serve it) and evaluates `.pt` vs export
+on the run's own test split. It refuses on a quality drop: mAP50-95
+(threshold-free), and recall and false positives at the runtime confidence
+(0.25). Ultralytics' own precision/recall are reported, not gated — they sit at
+each model's max-F1 threshold, which moves between the two. On a pass it
+installs `models/detector/versions/<run>`, switches `current` and restarts
+cv-worker; the web UI and sidecars show the detector by its run name. The
+classifier deploys the same way (`just deploy classifier <run>`).
 
+A fine-tune has the same 80 COCO classes as the built-in model (cv-worker looks
+the `cat` id up in the model's own names), so it is a drop-in replacement.
 Changing boxes also changes the classifier's input crops, and per-camera
-`cv.yolo_conf` values tuned for the COCO model (e.g. a very low threshold set
-to catch missed cats) should be revisited after a few days in `dry_run`.
+`cv.yolo_conf` values tuned for the COCO model (e.g. a very low threshold set to
+catch missed cats) should be revisited.

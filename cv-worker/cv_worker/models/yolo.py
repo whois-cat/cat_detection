@@ -28,21 +28,9 @@ def identity_crop_box(x1: int, y1: int, x2: int, y2: int, frame_w: int, frame_h:
     return max(0, x1 - pad), max(0, y1 - pad), min(frame_w, x2 + pad), min(frame_h, y2 + pad)
 
 
-def weights_label(weights: str) -> str:
-    """Name shown in the UI/sidecars for a weights path. A fine-tune's export
-    lives at models/trained/<run>/weights/best_int8_openvino_model, so name it
-    after <run>; a `current` symlink is resolved to the version it points at."""
-    path = os.path.realpath(os.path.normpath(weights))
-    stem = os.path.splitext(os.path.basename(path))[0]
-    parent = os.path.dirname(path)
-    if os.path.basename(parent) == "weights":
-        return f"{os.path.basename(os.path.dirname(parent))}-{stem.split('_')[0]}"
-    return stem
-
-
 class YoloModel:
     def __init__(self, weights: str, conf: float = 0.25, classifier_dir: str | None = None,
-                 pad_frac: float = 0.05) -> None:
+                 pad_frac: float = 0.05, label: str | None = None) -> None:
         from ultralytics import YOLO
 
         # task='detect' because OpenVINO export dirs carry no task metadata.
@@ -50,7 +38,8 @@ class YoloModel:
         self.cat_id = cat_class_id(self._yolo.names)
         self.conf = conf
         self.pad_frac = pad_frac
-        stem = weights_label(weights)
+        # Shown in the UI/sidecars: the deployed version, else the weights' stem.
+        stem = label or os.path.splitext(os.path.basename(os.path.normpath(weights)))[0]
         self._classifier = None
         self.name, self.version = stem, "0"
         if classifier_dir:

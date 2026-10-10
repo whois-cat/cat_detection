@@ -565,10 +565,8 @@ yolo train data=data/datasets/detector/data.yaml \
           model=yolov8n.pt imgsz=640 epochs=50
 ```
 
-After training, drop the resulting `best.pt` into the detector container
-and point `YOLO_WEIGHTS` at it. You can also export to OpenVINO INT8
-for the same ~3-4× CPU speedup the off-the-shelf weights get — see the
-Dockerfile in [`../detector/`](../detector/) for the recipe.
+The current path is [YOLO_PIPELINE.md](YOLO_PIPELINE.md): `just box-train`, then
+`just deploy detector <run>` (INT8 OpenVINO export with a quality gate).
 
 ---
 

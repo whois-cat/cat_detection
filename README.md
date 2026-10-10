@@ -48,12 +48,12 @@ feeder services are stopped (see Migration).
 
 ### Models
 
-- YOLO is exported to INT8 OpenVINO when the cv-worker image is built.
-- The identity classifier is mounted from `models/classifier/` (not in git):
-  `versions/<id>/{cat_classifier.xml,.bin,classes.json}` with `current` and
-  `previous` symlinks. `just cat-promote` exports the newest
-  `models/trained/*/cat_classifier.pt` (with a torch↔OpenVINO parity gate) and
-  switches `current`; `just cat-restart` loads it.
+- Both models are mounted from `models/detector/` and `models/classifier/` (not
+  in git): `versions/<run>/` with `current` and `previous` symlinks.
+  `just deploy detector|classifier [run]` exports a trained run with that model's
+  quality gate, switches `current` and restarts cv-worker; `just rollback` goes
+  back; `just models` shows what runs. With no deployed detector, cv-worker runs
+  the COCO yolov8n exported to INT8 OpenVINO when its image is built.
 
 ### Commands
 

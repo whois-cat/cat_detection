@@ -13,10 +13,26 @@ def test_model_without_cat_fails_loudly():
         cat_class_id({0: "dog"})
 
 
-def test_weights_label_names_finetunes_after_their_run():
-    from cv_worker.models.yolo import weights_label
+def test_detector_weights_prefers_deployed_then_builtin(monkeypatch, tmp_path):
+    import cv_worker.models as models
 
-    assert weights_label("/opt/models/yolov8n_int8_openvino_model/") == "yolov8n_int8_openvino_model"
-    assert weights_label(
-        "/opt/models/trained/yolo-20261009-183756/weights/best_int8_openvino_model"
-    ) == "yolo-20261009-183756-best"
+    deployed = tmp_path / "detector" / "current"
+    monkeypatch.setattr(models, "DEPLOYED_DETECTOR", str(deployed))
+    no_env = {}.get
+    assert models.detector_weights(no_env) == (models.BUILTIN_DETECTOR, None)
+
+    export = tmp_path / "detector" / "versions" / "yolo-20261010-011816" / "best_int8_openvino_model"
+    export.mkdir(parents=True)
+    deployed.symlink_to("versions/yolo-20261010-011816")
+    assert models.detector_weights(no_env) == (
+        str(deployed / "best_int8_openvino_model"), "yolo-20261010-011816")
+    assert models.detector_weights({"YOLO_WEIGHTS": "/x"}.get) == ("/x", None)
+
+
+def test_deployed_detector_without_one_export_fails_loudly(monkeypatch, tmp_path):
+    import cv_worker.models as models
+
+    (tmp_path / "current").mkdir()
+    monkeypatch.setattr(models, "DEPLOYED_DETECTOR", str(tmp_path / "current"))
+    with pytest.raises(RuntimeError, match="exactly one"):
+        models.detector_weights({}.get)

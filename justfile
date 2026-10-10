@@ -28,6 +28,9 @@ YOLO_RUN       := TRAINING_RUN
 YOLO_TRAIN_RUN := TRAINING_RUN + " --extra yolo"
 YOLO_LABEL_RUN := TRAINING_RUN + " --extra label"
 LABEL_COMPOSE  := COMPOSE + " -f docker-compose.label.yml"
+# One-off command in the cv-worker image (torch + openvino + ultralytics, the
+# serving versions), as you, on the repo mounted at /work.
+CV_WORKER_RUN  := COMPOSE + " run --rm --no-deps --user \"$(id -u):$(id -g)\" -e HOME=/tmp -e YOLO_CONFIG_DIR=/tmp/ultralytics -e YOLO_DATASET=" + yolo_dataset + " -v \"$PWD\":/work -w /work " + CLUSTER_SERVICE
 label_studio_port := env_var_or_default("LABEL_STUDIO_PORT", "8080")
 
 default:
@@ -41,7 +44,7 @@ default:
 # Build and start the stack.
 [group('stack')]
 up:
-    mkdir -p data/streamhub data/decider
+    mkdir -p data/streamhub data/decider models/detector models/classifier
     {{COMPOSE}} up -d --build
 
 # Stop the stack.
@@ -113,7 +116,7 @@ setup TARGET="all":
 # ─────────────────────── box: where is the cat ───────────────────────
 # `cat` YOLO fine-tune from streamhub recordings, in pipeline order:
 #   box-collect -> box-label (in Label Studio) -> box-sync -> box-build
-#   -> box-train -> box-eval -> box-export
+#   -> box-train -> box-eval, then `just deploy detector <run>`
 # All offline/manual; never touches the running stack or deployed models.
 
 # Frames are saved as the detector sees them (ROI + rotation). Resumable;
@@ -175,18 +178,6 @@ box-train *ARGS:
 box-eval *ARGS:
     {{YOLO_TRAIN_RUN}} python -m training.yolo_evaluate {{ARGS}}
 
-# Runs in the cv-worker image so the IR is built by the same ultralytics/OpenVINO
-# that will serve it. Writes models/trained/<run>/weights/best_int8_openvino_model;
-# to deploy, set YOLO_WEIGHTS=/opt/models/trained/<run>/weights/best_int8_openvino_model
-# in .env and `just up` (remove it to roll back).
-# Export a trained .pt to OpenVINO with a parity gate against the source .pt.
-[group('box')]
-box-export *ARGS:
-    {{COMPOSE}} run --rm --no-deps --user "$(id -u):$(id -g)" \
-        -e YOLO_CONFIG_DIR=/tmp/ultralytics -e HOME=/tmp \
-        -v "$PWD":/work -w /work {{CLUSTER_SERVICE}} \
-        python -m training.yolo_export {{ARGS}}
-
 # Compare two run reports: same data/config? how long, what resources, quality delta.
 [group('box')]
 box-compare A B *ARGS:
@@ -194,8 +185,8 @@ box-compare A B *ARGS:
 
 # ─────────────────────── cat: which cat is it ───────────────────────
 # Identity classifier, from the boxes verified with box-label/box-sync:
-#   cat-groups -> cat-label (in the browser) -> cat-train -> cat-compare
-#   -> cat-promote -> cat-restart
+#   cat-groups -> cat-label (in the browser) -> cat-train -> cat-compare,
+#   then `just deploy classifier <run>`
 # Crops are cut from the catalog frames with the runtime padding (cat_pad_frac).
 
 # One feeding visit per camera becomes one group (EPISODE_GAP_SEC, default 30);
@@ -251,26 +242,6 @@ cat-compare *ARGS:
         --pad-frac {{cat_pad_frac}} \
         {{ARGS}}
 
-# Writes models/classifier/versions/<id> and switches the `current` symlink.
-# Default (no SRC): the newest models/trained/*/cat_classifier.pt. Runs in the
-# cv-worker container (torch + openvino) to export the OpenVINO IR.
-# Promote a trained checkpoint to the runtime model (then: just cat-restart).
-[group('cat')]
-cat-promote SRC="":
-    {{COMPOSE}} run --rm --no-deps -v "$PWD":/work -w /work {{CLUSTER_SERVICE}} \
-        python tools/promote_classifier.py promote --src "{{SRC}}"
-
-# No export needed, so this runs on the host.
-# Roll back to the previous model or VERSION=<id> (then: just cat-restart).
-[group('cat')]
-cat-rollback VERSION="":
-    python3 tools/promote_classifier.py rollback --version "{{VERSION}}"
-
-# Restart cv-worker so it picks up a freshly promoted `current`. No image rebuild.
-[group('cat')]
-cat-restart:
-    {{COMPOSE}} restart cv-worker
-
 # MOVES (never deletes) reviews.db + clusters.json into data/review/_backup_<ts>/
 # (restore by moving them back). The catalog is never touched. Stop cat-label
 # first. Set CONFIRM=1 to skip the prompt.
@@ -307,6 +278,30 @@ cat-reset:
 mlflow-ui PORT="5000":
     {{CLASSIFIER_RUN}} python -m mlflow ui \
         --backend-store-uri "data/mlflow" --port {{PORT}}
+
+# ─────────────────── model: what cv-worker runs ───────────────────
+# Detector and classifier are deployed the same way: models/<kind>/versions/<run>
+# plus a `current` symlink (tools/models.py). KIND is `detector` or `classifier`.
+
+# Show which detector and classifier versions are running.
+[group('model')]
+models:
+    {{TRAINING_RUN}} python tools/models.py status
+
+# Exports the run with its model's quality gate in the cv-worker image (nothing
+# switches if it fails). RUN: a models/trained/<run> name, default the newest.
+# Example: just deploy detector yolo-20261010-011816
+# Put a trained run into service and restart cv-worker.
+[group('model')]
+deploy KIND RUN="":
+    {{CV_WORKER_RUN}} python tools/models.py deploy {{KIND}} {{RUN}}
+    {{COMPOSE}} restart cv-worker
+
+# Switch to the previous version (or VERSION) and restart cv-worker.
+[group('model')]
+rollback KIND VERSION="":
+    {{TRAINING_RUN}} python tools/models.py rollback {{KIND}} {{VERSION}}
+    {{COMPOSE}} restart cv-worker
 
 # ──────────────────────────── journal ────────────────────────────
 
