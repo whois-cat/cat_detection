@@ -186,8 +186,12 @@ def verdict(results: dict, baseline: str | None, threshold_key: str) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", type=Path, required=True)
-    ap.add_argument("--recordings", type=Path, required=True)
+    ap.add_argument("--catalog", type=Path, default=None,
+                    help="YOLO catalog.sqlite3: evaluate on its human-verified boxes "
+                         "(replaces the legacy --db + --recordings source)")
+    ap.add_argument("--db", type=Path, default=None, help="legacy: previous stack's events.db")
+    ap.add_argument("--recordings", type=Path, default=None,
+                    help="legacy: previous stack's recordings root")
     ap.add_argument("--reviews-db", type=Path, required=True)
     ap.add_argument("--candidate", action="append", type=parse_candidate, required=True,
                     help="NAME=PATH; PATH is trained .pt or OpenVINO classifier dir")
@@ -205,15 +209,17 @@ def main() -> None:
     ap.add_argument("--thresholds", default="0.5,0.7,0.8,0.9")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
+    if args.catalog is None and (args.db is None or args.recordings is None):
+        ap.error("pass --catalog, or the legacy --db + --recordings")
 
-    from training import CropSource, load_reviews
+    from training import CropSource, CropUnavailable, load_reviews
     from training.replay import load_replay_set
 
     thresholds = [float(v) for v in args.thresholds.split(",") if v.strip()]
     review_labels = load_reviews(args.reviews_db)
     candidates = [(name, load_model(path)) for name, path in args.candidate]
 
-    src = CropSource(
+    src = None if args.catalog is not None else CropSource(
         db_path=args.db,
         recordings_root=args.recordings,
         camera_id=args.camera,
@@ -227,7 +233,23 @@ def main() -> None:
 
     primary_true: list[str] = []
     primary_pred: dict[str, list[Prediction]] = {name: [] for name, _model in candidates}
-    for sample in src:
+    if args.catalog is not None:
+        from training.catalog_crops import load_catalog_crops, read_catalog_crop
+        for crop in load_catalog_crops(args.catalog, camera=args.camera):
+            label = review_labels.get(crop.key)
+            if label is None or label in DROP_LABELS:
+                continue
+            try:
+                image = read_catalog_crop(args.catalog.parent, crop.image_relpath,
+                                          crop.box, args.pad_frac)
+            except CropUnavailable:
+                continue
+            primary_true.append(label)
+            for name, model in candidates:
+                primary_pred[name].append(model.predict(image))
+            if args.limit is not None and len(primary_true) >= args.limit:
+                break
+    for sample in src or ():
         sb = sample.src_box
         if sb is None or sb.rowid is None:
             continue

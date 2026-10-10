@@ -114,7 +114,7 @@ def require_min_classes(classes: list[str]) -> None:
     if len(classes) < 2:
         raise SystemExit(
             "need at least 2 labeled classes to train the identity classifier; "
-            f"found classes: {classes}. Review more crops (just label-review) or "
+            f"found classes: {classes}. Review more crops (just cat-label) or "
             "check your drop labels / review labels."
         )
 
@@ -798,8 +798,12 @@ def configure_finetune(model, *, head_only: bool, full_finetune: bool):
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--db", type=Path, required=True)
-    ap.add_argument("--recordings", type=Path, required=True)
+    ap.add_argument("--catalog", type=Path, default=None,
+                    help="YOLO catalog.sqlite3: train on its human-verified boxes "
+                         "(replaces the legacy --db + --recordings source)")
+    ap.add_argument("--db", type=Path, default=None, help="legacy: previous stack's events.db")
+    ap.add_argument("--recordings", type=Path, default=None,
+                    help="legacy: previous stack's recordings root")
     ap.add_argument("--reviews-db", type=Path, default=None,
                     help="reviews.db with human corrections (strongly recommended)")
     ap.add_argument("--camera", default=None)
@@ -899,7 +903,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    ap = build_parser()
+    args = ap.parse_args()
+    if args.catalog is None and (args.db is None or args.recordings is None):
+        ap.error("pass --catalog, or the legacy --db + --recordings")
     if args.cache_max_side is not None:
         args.batch_max_side = args.cache_max_side
 
@@ -931,7 +938,7 @@ def main() -> None:
     from training import load_reviews
     from training.reviews import load_review_rows
     from training.ram import log_rss
-    from training.db import iter_frames, open_db_ro
+    from training.db import Box, iter_frames, open_db_ro
     from training.replay import decode_replay_image, load_replay_items
     from training.leakage import (
         apply_leakage_policy,
@@ -941,7 +948,17 @@ def main() -> None:
         replay_identities,
     )
     from training.segments import SegmentIndex
-    from training.sources import decode_crop_batch
+    from training.sources import CropUnavailable, decode_crop_batch
+    from training.catalog_crops import CatalogCropRef, load_catalog_crops, read_catalog_crop
+
+    def catalog_crop(ref: CatalogCropRef):
+        try:
+            return read_catalog_crop(args.catalog.parent, ref.image_relpath,
+                                     (ref.box.x, ref.box.y, ref.box.w, ref.box.h),
+                                     args.pad_frac)
+        except CropUnavailable as exc:
+            log.warning("skipping catalog crop: %s", exc)
+            return None
 
     # Determinism.
     random.seed(args.seed)
@@ -979,9 +996,32 @@ def main() -> None:
     scanned = 0
     unavailable = 0
     warned_missing_rotate = False
-    conn = open_db_ro(args.db)
+    if args.catalog is not None:
+        # Verified catalog boxes; identity comes ONLY from human reviews (there is
+        # no stored classifier guess to --trust here).
+        for crop in load_catalog_crops(args.catalog, camera=args.camera):
+            scanned += 1
+            review_row = review_rows.get(crop.key)
+            human = review_row.label if review_row is not None else reviews.get(crop.key)
+            label = decide_label(None, None, human, False, args.trust_conf)
+            if label is None:
+                continue
+            x, y, w, h = crop.box
+            box = Box(x=x, y=y, w=w, h=h, cat=None, score=1.0, track_id=None, rowid=crop.key)
+            meta = Meta(
+                label=label, camera=crop.camera, wall_ms=crop.wall_ms, rowid=crop.key,
+                duplicate_group_id=(
+                    review_row.duplicate_group_id if review_row is not None else None),
+                suspicious_score=(
+                    review_row.suspicious_score if review_row is not None else 0.0),
+                sampling_reason=(
+                    review_row.sampling_reason if review_row is not None else None),
+            )
+            ref = CatalogCropRef(crop.camera, crop.wall_ms, box, crop.image_relpath)
+            fresh_items.append(TrainItem(meta=meta, ref=ref, image=None, replay=None))
+    conn = open_db_ro(args.db) if args.catalog is None else None
     try:
-        frames = iter_frames(
+        frames = () if conn is None else iter_frames(
             conn,
             camera_id=args.camera,
             model=args.model,
@@ -1034,7 +1074,8 @@ def main() -> None:
                 ref = CropRefLite(frame.camera_id, frame.wall_ms, box, int(rot or 0))
                 fresh_items.append(TrainItem(meta=meta, ref=ref, image=None, replay=None))
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     if not fresh_items:
         raise SystemExit("no usable crops after the label policy — loosen "
@@ -1258,6 +1299,10 @@ def main() -> None:
                 img = decode_replay_image(item.replay, missing_ok=True)
                 if img is not None:
                     batch_images[slot] = shrink_bgr_for_batch(img, max_side)
+            elif isinstance(item.ref, CatalogCropRef):
+                img = catalog_crop(item.ref)
+                if img is not None:
+                    batch_images[slot] = shrink_bgr_for_batch(img, max_side)
             else:
                 refs.append(item.ref)
                 ref_slots.append(slot)
@@ -1297,6 +1342,10 @@ def main() -> None:
                 bgr_by_pos[pos] = it.image
             elif getattr(it, "replay", None) is not None:
                 img = decode_replay_image(it.replay, missing_ok=True)
+                if img is not None:
+                    bgr_by_pos[pos] = img
+            elif isinstance(it.ref, CatalogCropRef):
+                img = catalog_crop(it.ref)
                 if img is not None:
                     bgr_by_pos[pos] = img
             elif getattr(it, "ref", None) is not None:
@@ -1397,6 +1446,7 @@ def main() -> None:
         run_name=run_stamp,
         params={
             # dataset source / reproducibility
+            "catalog": str(args.catalog) if args.catalog else "",
             "events_db": str(args.db), "recordings": str(args.recordings),
             "reviews_db": str(args.reviews_db) if args.reviews_db else "",
             # labels/classes (dynamic — never hardcoded)
@@ -1619,6 +1669,7 @@ def main() -> None:
             "weight_decay": 1e-4, "lr": lr, "epochs": args.epochs,
             "batch_size": args.batch_size, "seed": args.seed,
             "finetune_mode": finetune_mode, "augment": args.augment,
+            "catalog": str(args.catalog) if args.catalog else None,
             "events_db": str(args.db), "recordings": str(args.recordings),
             "reviews_db": str(args.reviews_db) if args.reviews_db else None,
             "classes": classes, "num_classes": len(classes),

@@ -497,8 +497,12 @@ def default_cluster_count(n: int) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", type=Path, required=True, help="events.db")
-    ap.add_argument("--recordings", type=Path, required=True, help="data/recordings root")
+    ap.add_argument("--catalog", type=Path, default=None,
+                    help="YOLO catalog.sqlite3: cluster its human-verified boxes "
+                         "(replaces the legacy --db + --recordings source)")
+    ap.add_argument("--db", type=Path, default=None, help="legacy: previous stack's events.db")
+    ap.add_argument("--recordings", type=Path, default=None,
+                    help="legacy: previous stack's data/recordings root")
     ap.add_argument("--out", type=Path, required=True, help="clusters.json path")
     ap.add_argument("--camera", default=None)
     ap.add_argument("--model", default=None)
@@ -558,8 +562,10 @@ def main() -> None:
     ap.add_argument("--labels", default="",
                     help="optional comma-separated label names for the review UI")
     args = ap.parse_args()
+    if args.catalog is None and (args.db is None or args.recordings is None):
+        ap.error("pass --catalog, or the legacy --db + --recordings")
 
-    from training import CropSource
+    from training import CropSource, CropUnavailable
     from training.regions import (
         box_in_ignore_region,
         load_ignore_regions_from_camera_config,
@@ -569,9 +575,11 @@ def main() -> None:
     )
 
     ignored_by_region = 0
+    # Catalog boxes are human-verified cats: ignore regions (detector false-positive
+    # masks) don't apply to them.
     config_regions = (
         {}
-        if args.no_ignore_config
+        if args.no_ignore_config or args.catalog is not None
         else load_ignore_regions_from_camera_config(args.ignore_config)
     )
     cli_regions = parse_region_specs(args.ignore_region)
@@ -591,7 +599,14 @@ def main() -> None:
             return False
         return True
 
-    src = CropSource(
+    catalog_crops = None
+    if args.catalog is not None:
+        from training.catalog_crops import load_catalog_crops, manifest_item, read_catalog_crop
+        catalog_crops = load_catalog_crops(args.catalog, camera=args.camera)
+        if args.limit is not None:
+            catalog_crops = catalog_crops[:args.limit]
+        print(f"[cluster] catalog: {len(catalog_crops)} verified cat box(es)")
+    src = None if catalog_crops is not None else CropSource(
         db_path=args.db,
         recordings_root=args.recordings,
         camera_id=args.camera,
@@ -614,8 +629,10 @@ def main() -> None:
         if args.clusters is not None:
             print(f"[cluster] --clusters={args.clusters} ignored in time mode "
                   "(episodes define the clusters)")
+        if catalog_crops is not None:
+            items.extend(manifest_item(c, args.pad_frac) for c in catalog_crops)
         # Metadata only — iter_crop_refs never decodes pixels.
-        for n, (stub, _ref) in enumerate(src.iter_crop_refs()):
+        for n, (stub, _ref) in enumerate(src.iter_crop_refs() if src else ()):
             if args.limit is not None and n >= args.limit:
                 break
             sb = stub.src_box
@@ -666,7 +683,19 @@ def main() -> None:
             feats.extend(extractor.encode_batch(pending_images))
             pending_images = []
 
-        for n, sample in enumerate(src):
+        for crop in catalog_crops or ():
+            try:
+                image = read_catalog_crop(args.catalog.parent, crop.image_relpath,
+                                          crop.box, args.pad_frac)
+            except CropUnavailable as exc:
+                print(f"[cluster] skip {crop.crop_id}: {exc}")
+                continue
+            pending_images.append(image)
+            items.append(manifest_item(crop, args.pad_frac))
+            if len(pending_images) >= max(1, args.embedding_batch_size):
+                flush_features()
+
+        for n, sample in enumerate(src or ()):
             if args.limit is not None and n >= args.limit:
                 break
             sb = sample.src_box
@@ -758,6 +787,8 @@ def main() -> None:
         "kind": "cluster_manifest",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "params": {
+            "source": "catalog" if args.catalog is not None else "events_db",
+            "catalog": str(args.catalog) if args.catalog is not None else None,
             "min_score": args.min_score,
             "pad_frac": args.pad_frac,
             "default_rotate_deg": args.default_rotate_deg,

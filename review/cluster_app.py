@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw
 
 from training import CropRef, CropUnavailable, decode_one_crop
 from training.build_cluster_manifest import kmeans
+from training.catalog_crops import read_catalog_crop
 from training.db import Box
 from training.label_stats import episode_camera_counts
 from training.segments import SegmentIndex
@@ -39,19 +40,19 @@ EPISODE_GAP_MS = int(float(os.environ.get("EPISODE_GAP_SEC", "60")) * 1000)
 def _load_manifest() -> dict:
     if not MANIFEST.exists():
         # Actionable failure instead of a bare traceback. The manifest is either
-        # not built yet, or was archived by `just label-reset` into a sibling
+        # not built yet, or was archived by `just cat-reset` into a sibling
         # _backup_<ts>/ dir — surface both fixes, and any backup we can see.
         lines = [
             f"cluster manifest not found: {MANIFEST}",
             "",
             "Build it first (writes data/review/clusters.json):",
-            "    just label-build",
+            "    just cat-groups",
         ]
         backups = sorted(MANIFEST.parent.glob("_backup_*/clusters.json"), reverse=True)
         if backups:
             lines += [
                 "",
-                "Or restore the most recent label-reset backup:",
+                "Or restore the most recent cat-reset backup:",
                 f"    mv {backups[0]} {MANIFEST}",
             ]
         msg = "\n".join(lines)
@@ -70,6 +71,9 @@ BY_ID = {it["crop_id"]: it for it in ITEMS}
 # own labels. No hardcoded cat names — an empty list here means "set
 # REVIEW_LABELS or rebuild the manifest with --labels".
 LABELS = LABELS_ENV or MAN.get("labels") or []
+# Catalog manifests cut crops from the YOLO catalog's frame JPEGs, not recordings.
+_CATALOG = MAN.get("params", {}).get("catalog")
+CATALOG_ROOT = (ROOT / _CATALOG).parent if _CATALOG else None
 
 _db_lock = threading.Lock()
 REVIEW_DB.parent.mkdir(parents=True, exist_ok=True)
@@ -320,6 +324,14 @@ def _index_for(camera: str) -> SegmentIndex:
 def _crop_rgb(crop_id: str) -> np.ndarray:
     item = BY_ID[crop_id]
     b = item["box"]
+    pad_frac = item.get("pad_frac", MAN.get("params", {}).get("pad_frac", 0.15))
+    if item.get("catalog_image"):
+        if CATALOG_ROOT is None:
+            raise CropUnavailable("catalog crop in a manifest without params.catalog")
+        crop_bgr = read_catalog_crop(
+            CATALOG_ROOT, item["catalog_image"], (b["x"], b["y"], b["w"], b["h"]), pad_frac,
+        )
+        return np.ascontiguousarray(crop_bgr[..., ::-1])
     ref = CropRef(
         camera_id=item["camera"],
         wall_ms=item["wall_ms"],
@@ -333,7 +345,7 @@ def _crop_rgb(crop_id: str) -> np.ndarray:
     crop_bgr = decode_one_crop(
         ref,
         RECORDINGS,
-        pad_frac=item.get("pad_frac", MAN.get("params", {}).get("pad_frac", 0.15)),
+        pad_frac=pad_frac,
         index=_index_for(item["camera"]),
     )
     return np.ascontiguousarray(crop_bgr[..., ::-1])
