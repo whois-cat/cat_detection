@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from training.yolo_common import DatasetInfo
+from training.yolo_common import COCO_NAMES, DatasetInfo
 from training.yolo_train import merge_training_dataset
 
 
@@ -11,11 +11,11 @@ def _make_version(root: Path, version_id: str, samples: list[dict]) -> DatasetIn
         for kind, ext in (("images", "jpg"), ("labels", "txt")):
             path = root / kind / sample["split"] / f"{sample['sample_id']}.{ext}"
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"x" if ext == "jpg" else b"0 0.5 0.5 0.2 0.2\n")
+            path.write_bytes(b"x" if ext == "jpg" else b"15 0.5 0.5 0.2 0.2\n")
     return DatasetInfo(
         version_dir=root, data_yaml=root / "data.yaml", manifest_path=root / "manifest.json",
         manifest={"version_id": version_id, "samples": samples},
-        dataset_sha256="d", manifest_file_sha256="m", names={0: "cat"}, cat_id=0, summary={},
+        dataset_sha256="d", manifest_file_sha256="m", names=dict(enumerate(COCO_NAMES)), cat_id=15, summary={},
     )
 
 
@@ -49,6 +49,6 @@ def test_merge_mixes_replay_train_and_drops_eval_collisions(tmp_path: Path):
     assert summary["replay_versions"] == ["old"]
 
     data_yaml = (dest / "data.yaml").read_text()
-    assert "0: cat" in data_yaml and "train: images/train" in data_yaml
+    assert "15: cat" in data_yaml and "train: images/train" in data_yaml
     # No evaluation sample may leak into the merged training set.
     assert not ({"v1", "e1"} & train_ids)

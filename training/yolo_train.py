@@ -24,6 +24,7 @@ from training.yolo_common import (
     sha256_file,
     ultralytics_data_yaml,
     validate_training_weights,
+    write_data_yaml,
 )
 from training.yolo_evaluate import evaluate_artifact
 
@@ -96,13 +97,8 @@ def merge_training_dataset(
             seen.add(sid)
             added += 1
 
-    (dest / "data.yaml").write_text(
-        "\n".join([f"path: {dest.resolve()}", "train: images/train", "val: images/val",
-                   "names:", "  0: cat", ""]),
-        encoding="utf-8",
-    )
     return {
-        "data_yaml": dest / "data.yaml",
+        "data_yaml": write_data_yaml(dest, ("train", "val")),
         "current_train_images": current_train,
         "replay_added": added,
         "replay_skipped_leakage": skipped,

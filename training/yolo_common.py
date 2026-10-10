@@ -133,6 +133,36 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+# Dataset versions use the COCO class numbering of the base model and the
+# runtime detector, so a fine-tune keeps the full pretrained head (cat included)
+# and every model and dataset agree on the cat class id. Only cat is labelled.
+COCO_NAMES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush",
+)
+CAT_CLASS_ID = COCO_NAMES.index("cat")
+
+
+def write_data_yaml(dest: Path, splits: tuple[str, ...] = ("train", "val", "test")) -> Path:
+    """Write an Ultralytics data.yaml for a dataset directory (COCO class names)."""
+    path = dest / "data.yaml"
+    path.write_text(yaml.safe_dump({
+        "path": str(dest.resolve()),
+        **{split: f"images/{split}" for split in splits},
+        "names": dict(enumerate(COCO_NAMES)),
+    }, sort_keys=False), encoding="utf-8")
+    return path
+
+
 def _parse_names(raw: Any) -> dict[int, str]:
     if isinstance(raw, list):
         return {index: str(value) for index, value in enumerate(raw)}
@@ -216,11 +246,12 @@ def load_dataset(path: Path, *, require_splits: tuple[str, ...] = ()) -> Dataset
         raise ValueError("dataset manifest checksum mismatch; do not train from a modified version")
     raw_yaml = yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
     names = _parse_names(raw_yaml.get("names"))
-    cat_ids = [class_id for class_id, name in names.items() if name.strip().casefold() == "cat"]
-    if len(cat_ids) != 1 or len(names) != 1:
-        raise ValueError(f"expected exactly one dataset class named cat, got {names}")
-    if cat_ids[0] != 0:
-        raise ValueError(f"immutable YOLO dataset must encode cat as class 0, got {cat_ids[0]}")
+    if names != dict(enumerate(COCO_NAMES)):
+        raise ValueError(
+            f"dataset version {version_dir.name} does not use the COCO class numbering "
+            f"(cat = {CAT_CLASS_ID}); it was built before the switch. Rebuild it with "
+            "`just box-build` (same split) and retrain."
+        )
 
     per_split = {split: 0 for split in ("train", "val", "test")}
     for sample in samples:
@@ -254,7 +285,7 @@ def load_dataset(path: Path, *, require_splits: tuple[str, ...] = ()) -> Dataset
         dataset_sha256=declared,
         manifest_file_sha256=sha256_file(manifest_path),
         names=names,
-        cat_id=cat_ids[0],
+        cat_id=CAT_CLASS_ID,
         summary=summary,
     )
 

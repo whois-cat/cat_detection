@@ -68,7 +68,11 @@ def test_build_version_is_loadable_and_group_split(tmp_path: Path):
     version_dir = Path(result["path"])
 
     dataset = load_dataset(version_dir, require_splits=("train", "val", "test"))
-    assert dataset.cat_id == 0
+    # COCO numbering, same as the base model and the runtime detector.
+    assert dataset.cat_id == 15 and dataset.names[15] == "cat" and len(dataset.names) == 80
+    labels = [line for path in version_dir.glob("labels/*/*.txt")
+              for line in path.read_text().splitlines()]
+    assert labels and all(line.startswith("15 ") for line in labels)
     assert dataset.summary["images"] == result["summary"]["images"]
 
     # No visit group may appear in more than one split (cross-camera included).

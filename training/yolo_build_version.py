@@ -5,10 +5,10 @@ and training. It is the only writer of the version layout that
 ``training.yolo_common.load_dataset`` reads:
 
     <out>/<version_id>/
-        data.yaml                       names: {0: cat}
+        data.yaml                       names: the 80 COCO classes (cat = 15)
         manifest.json                   samples + checksum + summary
         images/{train,val,test}/<id>.jpg   hardlinked from the catalog store
-        labels/{train,val,test}/<id>.txt   "0 cx cy w h" (normalised, model space)
+        labels/{train,val,test}/<id>.txt   "15 cx cy w h" (normalised, model space)
 
 Key properties:
 
@@ -36,7 +36,13 @@ from pathlib import Path
 from typing import Any
 
 from training.streamhub_dataset import hamming, open_catalog
-from training.yolo_common import atomic_write_json, link_or_copy, sha256_tree
+from training.yolo_common import (
+    CAT_CLASS_ID,
+    atomic_write_json,
+    link_or_copy,
+    sha256_tree,
+    write_data_yaml,
+)
 
 SPLITS = ("train", "val", "test")
 
@@ -240,7 +246,7 @@ def build_version(
             link_or_copy(root / sample.image_relpath, image_dest)
             label_dest.parent.mkdir(parents=True, exist_ok=True)
             label_dest.write_text(
-                "".join(f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n"
+                "".join(f"{CAT_CLASS_ID} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n"
                         for cx, cy, w, h in sample.boxes),
                 encoding="utf-8",
             )
@@ -293,7 +299,7 @@ def build_version(
             "samples": manifest_samples,
         }
         atomic_write_json(version_dir / "manifest.json", manifest)
-        _write_data_yaml(version_dir)
+        write_data_yaml(version_dir)
 
         files_sha256 = sha256_tree(version_dir / "labels")
         record_version(conn, version, version_dir, manifest_hash, present)
@@ -310,21 +316,6 @@ def build_version(
                 "summary": summary}
     finally:
         conn.close()
-
-
-def _write_data_yaml(version_dir: Path) -> None:
-    (version_dir / "data.yaml").write_text(
-        "\n".join([
-            f"path: {version_dir}",
-            "train: images/train",
-            "val: images/val",
-            "test: images/test",
-            "names:",
-            "  0: cat",
-            "",
-        ]),
-        encoding="utf-8",
-    )
 
 
 def record_version(conn, version_id: str, version_dir: Path, manifest_hash: str,
