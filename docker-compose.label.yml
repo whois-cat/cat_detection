@@ -1,5 +1,5 @@
 # Optional, standalone Label Studio for YOLO box review. NOT part of the main
-# stack (streaming/recording/feeders are untouched). Start with `just yolo-label`.
+# stack (streaming/recording/feeders are untouched). Start with `just box-label`.
 # Bound to localhost only, like the rest of the stack; reach it over SSH tunnel:
 #   ssh -L 8080:localhost:8080 <server>
 services:

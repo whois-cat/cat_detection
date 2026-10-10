@@ -6,6 +6,12 @@ captures recordings + per-frame detection events; this package turns that
 on-disk data into datasets you can feed to a YOLO fine-tune (object
 detection) or a classifier (per-cat identity).
 
+> **Current workflow:** the classifier now trains from the YOLO catalog's
+> human-verified boxes (`just cat-groups` -> `just cat-label` -> `just cat-train`,
+> see [../REPO_CONTEXT.md](../REPO_CONTEXT.md#labeling-workflow) and
+> [YOLO_PIPELINE.md](YOLO_PIPELINE.md)). The `events.db` + recordings material
+> below describes the previous stack; those tools still accept `--db`/`--recordings`.
+
 > If you are picking this up cold: read [../README.md](../README.md) first
 > to understand the rest of the system. The short version: a camera RTSP
 > stream is recorded as 30-second fMP4 segments to `data/recordings/`, and
@@ -197,13 +203,13 @@ Quick review workflow (copy-paste):
 cd ~/compose-services/cat_detection_current
 
 # Start a clean review pass (MOVES the old reviews.db + clusters.json aside).
-CONFIRM=1 just label-reset
+CONFIRM=1 just cat-reset
 
 # Build a compact, review-only manifest (one episode = one cluster, deduped,
 # hard-capped at 16 crops per cluster).
 REVIEW_LABELS=alisa,chuzh,ellie,felisis \
 RECORDING_TZ=UTC \
-just label-build \
+just cat-groups \
   --min-score 0.5 \
   --mode time \
   --episode-gap-sec 30 \
@@ -213,7 +219,7 @@ just label-build \
 # Bulk-label in the browser at http://localhost:8095
 REVIEW_LABELS=alisa,chuzh,ellie,felisis \
 RECORDING_TZ=UTC \
-just label-review 8095
+just cat-label 8095
 ```
 
 The detailed stages below explain each step and its options.
@@ -230,7 +236,7 @@ later in the browser.
 
 ```bash
 REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-just label-build --min-score 0.7
+just cat-groups --min-score 0.7
 ```
 
 If the live detector event pool is polluted by static false positives, rebuild
@@ -238,10 +244,10 @@ review-only events from the recordings with the non-quantized YOLO path:
 
 ```bash
 just train-rescan --conf 0.3 --imgsz 512 --sample-interval-sec 1
-just label-build --model offline-yolov8n --min-score 0.5 --clusters 100
+just cat-groups --model offline-yolov8n --min-score 0.5 --clusters 100
 ```
 
-`just label-build` writes `data/review/clusters.json` by default. Useful
+`just cat-groups` writes `data/review/clusters.json` by default. Useful
 overrides: `EVENTS_DB`, `RECORDINGS_ROOT`, `CLUSTER_MANIFEST`, `RECORDING_TZ`,
 `--camera`, `--model`, `--clusters`, `--default-rotate-deg`.
 
@@ -292,7 +298,7 @@ recording filenames in the server's EDT/EST timezone.
 ```bash
 just setup label                                  # once
 REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-just label-review 8095                           # http://localhost:8095
+just cat-label 8095                           # http://localhost:8095
 ```
 
 The page shows contact sheets per cluster. Label a pure cluster as one cat, mark
@@ -310,7 +316,7 @@ survives restart.
 Check label balance before training:
 
 ```bash
-just label-stats
+just cat-stats
 ```
 
 The report shows trainable cat labels separately from dropped labels such as
@@ -349,7 +355,7 @@ touch the runtime model — swapping is a later, separate step.
 
 ```bash
 just setup train
-just train-run \
+just cat-train \
     --confuse alisa,felisis \
     --pad-frac 0.15 \
     --min-recall 0.9
@@ -364,12 +370,12 @@ trainable params, and trainable/frozen param counts are logged at startup):
 - `--head-only` — **CPU-friendly**: only the classifier head trains; the backbone
   is a frozen feature extractor. Recommended low-RAM CPU combo:
   ```bash
-  just train-run --head-only --batch-size 4 --batch-max-side 320 --num-workers 0
+  just cat-train --head-only --batch-size 4 --batch-max-side 320 --num-workers 0
   ```
 - `--full-finetune` — the whole backbone (low LR). Passing `--head-only` with
   `--full-finetune` is rejected.
 
-`just train-run` runs through the training uv project with the classifier
+`just cat-train` runs through the training uv project with the classifier
 extra, so `numpy`, `av`, `torch`, and `torchvision` are installed by uv instead
 of being manually added to the system Python. On Linux, `torch` and
 `torchvision` are resolved from PyTorch's CPU-only wheel index; CUDA /
@@ -385,7 +391,7 @@ CPU); raise it when you have RAM headroom. If the machine is still tight, lower
 both:
 
 ```bash
-just train-run --min-recall 0.85 --batch-size 4 --batch-max-side 320
+just cat-train --min-recall 0.85 --batch-size 4 --batch-max-side 320
 ```
 
 RSS is logged before the dataset, after the first batch, and after each epoch.
@@ -468,7 +474,7 @@ python detector/export_classifier.py \
 human-reviewed crops, with closed-set metrics and thresholded runtime behavior:
 
 ```bash
-just train-compare \
+just cat-compare \
     --candidate current=/opt/models/cat_classifier_openvino \
     --candidate new=models/trained/<stamp>/cat_classifier.pt \
     --baseline current \
@@ -489,7 +495,7 @@ active-learning queues, not as truth. Each week:
 1. Build/review new clusters for the recent time range.
 2. Update compact replay memory from human-reviewed crops.
 3. Train from fresh human labels plus replay memory.
-4. Compare current vs candidate with `train-compare`.
+4. Compare current vs candidate with `cat-compare`.
 5. Export/swap only after comparison is clean.
 
 Replay memory stores a small balanced set of compressed numpy crops (`.npz`),
@@ -508,7 +514,7 @@ To continue from the previous weekly classifier rather than ImageNet-only
 initialization, pass:
 
 ```bash
-just train-run \
+just cat-train \
     --init-from models/trained/<previous>/cat_classifier.pt \
     --replay-set data/replay
 ```
@@ -516,7 +522,7 @@ just train-run \
 For regression checking against old memory:
 
 ```bash
-just train-compare \
+just cat-compare \
     --candidate current=/opt/models/cat_classifier_openvino \
     --candidate new=models/trained/<stamp>/cat_classifier.pt \
     --baseline current \
@@ -614,7 +620,7 @@ training/
 ├── build_cluster_manifest.py (cold-start clustering manifest)
 └── train_classifier.py       (train identity classifier; best-by-val → models/trained/)
 
-../review/            (FastAPI bulk label-review app; `just label-review`)
+../review/            (FastAPI bulk cat-label app; `just cat-label`)
 ├── cluster_app.py    (bulk cluster labels; corrections → reviews.db)
 ├── static/cluster.html
 └── requirements.txt  (fastapi/uvicorn/av/numpy/Pillow — no openvino/torch)

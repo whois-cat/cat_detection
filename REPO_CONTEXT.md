@@ -26,7 +26,7 @@ camera RTSP
       -> data/streamhub/recordings/<camera>/<date>/<hour>/*.mp4 + .labels.jsonl
       -> browser                live (WebSocket fMP4 + labels), history (segments)
 pruner                          sparsifies old recordings, enforces the size cap
-training/review                 previous stack's events.db + recordings (for now)
+training/review                 YOLO catalog (verified boxes) -> classifier crops
 ```
 
 ## Important Invariants
@@ -55,10 +55,8 @@ data/
   streamhub/recordings/<camera>/<date>/<hour>/<start>.labels.jsonl  CV results + decisions
   decider/feed_journal/journal.db    decider journal (door sessions, scheduled feeds)
   streamhub/pins.json                ranges the pruner keeps
-  events/events.db                   previous stack's detections (training)
-  recordings/<camera>/*.mp4          previous stack's recordings (training)
+  yolo_dataset/catalog.sqlite3, images/   collected frames, verified boxes
   review/clusters.json, reviews.db   cold-start clusters and human labels
-  replay/                            compact replay memory
   mlflow/                            experiment tracking
 models/
   trained/<timestamp>/cat_classifier.pt
@@ -87,37 +85,36 @@ just logs cv-worker
 just check       # all tests
 ```
 
-## Cold-Start Labeling Workflow
+## Labeling Workflow
 
-Cold start means: assume the old identity classifier is not reliable. Use only
-detector confidence to decide whether a crop is likely worth reviewing.
+Two questions, two passes, one source of frames (the YOLO catalog):
 
-Example:
+1. **Where is the cat** (`box-*`): `just box-collect` saves frames into
+   `data/yolo_dataset`; `just box-label` pushes them to Label Studio, hardest
+   first, with the model's boxes pre-filled; a human fixes boxes and submits;
+   `just box-sync` writes the verified boxes back into the catalog.
+2. **Which cat** (`cat-*`): `just cat-groups` cuts every verified box into a
+   crop (catalog frame + runtime padding `CLASSIFIER_PAD_FRAC`) and groups
+   them by feeding visit; `just cat-label` names the cat per group in the
+   browser; `just cat-train` trains from those names.
 
 ```bash
 export REVIEW_LABELS=alisa,chuzh,ellie,felisis
-export RECORDING_TZ=America/New_York
-
-just label-build --default-rotate-deg 90 --min-score 0.7 --clusters 80
-just setup label
-just label-review 8095
+just box-label --limit 300      # label in Label Studio, then
+just box-sync
+just cat-groups                 # rebuild after every box-sync
+just cat-label                  # http://localhost:8095
+just cat-train --confuse alisa,felisis
 ```
 
-What happens:
+Crops come only from human-verified boxes, so there is no detector-score gate
+and no ignore-region filtering: wall/bowl false positives never reach identity
+labelling. Catalog frames are stored in the detector's input geometry, so crops
+need no rotation. Identity labels live in `data/review/reviews.db`, keyed by a
+stable hash of `(sample_id, annotation_id)`.
 
-1. `training.build_cluster_manifest` reads `events.db` and recordings.
-2. It keeps only detections with detector `score >= --min-score`.
-3. It ignores old `cat` / `cat_score` identity predictions for truth.
-4. It computes embeddings for crops.
-5. It groups similar crops into clusters.
-6. The review UI shows contact sheets, not isolated random crops.
-7. A human labels a whole cluster as a cat, `unknown`, or `discard`.
-8. If a cluster is mixed, use the split button and label the smaller clusters.
-
-Default detector gate is `--min-score 0.7`. For this project that is a good
-starting point because obvious bowl/wall false positives should not enter
-identity labeling. If real cats are getting filtered out, lower it slightly;
-if too much junk remains, raise it.
+The previous stack's `events.db` + recordings path still exists in the Python
+tools (`--db`/`--recordings`), but no `just` recipe uses it.
 
 ## Embeddings And Clustering
 
@@ -159,15 +156,13 @@ Human labels are stored in `data/review/reviews.db`, keyed by source event.
 
 ## Training Workflow
 
-Train only from reviewed human labels by default:
+Train only from reviewed human labels:
 
 ```bash
-just train-run \
-  --default-rotate-deg 90 \
+just cat-train \
   --confuse alisa,felisis \
   --val-frac 0.2 \
-  --test-frac 0.1 \
-  --replay-set data/replay
+  --test-frac 0.1
 ```
 
 Important behavior:
@@ -178,7 +173,6 @@ Important behavior:
   train into validation/test.
 - The train/validation/test ratio is configurable with `--val-frac` and
   `--test-frac`.
-- `--replay-set` examples are used as train-only memory.
 
 Concepts:
 
@@ -190,67 +184,29 @@ Concepts:
 - A threshold is the minimum confidence required before the system acts on a
   prediction. For the feeder, the default identity threshold is `0.9`.
 
-There is a `--trust-classifier` mode for later active-learning workflows, but
-the cold-start path should not use classifier predictions as truth.
-
 ## Weekly Fine-Tuning Workflow
 
-The recommended weekly loop:
+1. `just box-collect` new recordings, `just box-label`, `just box-sync`.
+2. `just cat-groups`, then name the new groups in `just cat-label`.
+3. Fine-tune from the previous model:
+   `just cat-train --init-from models/trained/<previous>/cat_classifier.pt`.
+4. `just cat-compare` the candidate against the deployed model.
+5. Promote only if metrics and threshold behavior are acceptable.
 
-1. Let the system collect new recordings and events.
-2. Build/update the cluster manifest on recent data.
-3. Bulk-label clusters and split mixed clusters.
-4. Rebuild/update the compact replay set.
-5. Fine-tune from the previous model with replay memory.
-6. Compare the candidate model against the current deployed model.
-7. Promote only if metrics and threshold behavior are acceptable.
-
-Example fine-tune:
-
-```bash
-just train-replay-set --per-class 500
-
-just train-run \
-  --init-from models/trained/<previous>/cat_classifier.pt \
-  --replay-set data/replay \
-  --val-frac 0.2 \
-  --test-frac 0.1
-```
-
-Fine-tuning from the previous model helps, but it is not enough by itself if
-old video has been deleted. Without either old recordings or replay memory, the
-model can catastrophically forget older examples. The compact replay set is the
-chosen compromise: keep a small, diverse memory of approved crops without
-turning the repo into a JPG archive.
-
-## Replay Set
-
-`training.build_replay_set` creates/updates a compact training memory:
-
-```bash
-just train-replay-set --per-class 500
-```
-
-It stores compressed crop arrays under `data/replay`, plus a manifest. This is
-local runtime data, not source code. It should not be committed by default.
-
-Use replay for weekly training so the model sees:
-
-- new reviewed examples from the current week;
-- stable older examples for every cat;
-- hard/rare examples that should not be forgotten.
+Catalog frames are kept (verified samples are protected), so old examples stay
+trainable after the recordings are pruned; the replay memory the previous stack
+needed for that is not part of this workflow.
 
 ## Model Comparison
 
 Compare models on the same reviewed data before promoting a candidate:
 
 ```bash
-just train-compare \
+just cat-compare \
   --candidate current=models/classifier/current \
   --candidate new=models/trained/<stamp>/cat_classifier.pt \
   --baseline current \
   --thresholds 0.7,0.8,0.9 \
-  --replay-set data/replay \
   --out reports/classifier_compare.json
 ```
 
@@ -302,7 +258,8 @@ kept; older segments are deleted unless a detection is within `event_margin`
 - `decider/decider/`: `feeder.py` (per-feeder loop), `zone_state.py`,
   `decision.py`, `door_fsm.py`, `journal.py`, `schedule_feed.py`, `display.py`.
 - `webui/src/`: `App.svelte`, `Player.svelte`, `Timeline.svelte`, `lib/`.
-- `training/…`, `review/…`: labeling and training (unchanged).
+- `training/…`, `review/…`: labeling and training; `training/catalog_crops.py`
+  turns verified catalog boxes into classifier crops.
 - `tools/promote_classifier.py`, `tools/feed_log.py`.
 
 ## Gotchas
@@ -312,9 +269,8 @@ kept; older segments are deleted unless a detection is within `event_margin`
   guess.
 - Cold-start manifests should sort/review by detector quality and clusters, not
   old identity names.
-- If many `/api/crop/...` requests return `410 Gone`, the source recording is no
-  longer on disk. Review sooner, retain video longer, or rely on replay memory
-  after approved crops have been exported.
+- A `missing recording` thumbnail in `cat-label` means the catalog frame JPEG
+  is gone; rebuild `cat-groups`.
 - Keep `classifier_pad_frac` consistent between training, export, and runtime.
 - `--no-store-embeddings` makes cluster manifests smaller but removes the data
   needed for later split-mixed-cluster actions.
@@ -325,5 +281,5 @@ kept; older segments are deleted unless a detection is within `event_margin`
 
 - Branch `redesign` replaces mediamtx/detector/feeder/indexer with the stack
   above (see `PLAN.md`, `README.md` for migration).
-- Training/review still read the previous stack's `data/events` and
-  `data/recordings`; adapting them to segments + sidecars is pending.
+- Training/review read the YOLO catalog (`--catalog`); the previous stack's
+  `events.db` path remains in the Python tools only.

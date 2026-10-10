@@ -34,7 +34,7 @@ Full, un-annotated frames. Sidecar detections are **hints only** (selection
 reasons), never labels. Resumable and incremental (safe to re-run / cron).
 
 ```bash
-just yolo-collect \
+just box-collect \
   --camera black,grey \
   --from 2026-10-01 --to 2026-10-02 \
   --tag shaved           # optional range tag, e.g. the shaved-cat period
@@ -59,7 +59,7 @@ not depend on YOLO.
 Check the queue any time (read-only):
 
 ```bash
-just yolo-queue
+just box-queue
 ```
 
 ## 2. Label boxes in the browser (Label Studio, under the hood)
@@ -70,7 +70,7 @@ pre-filled as suggestions.
 
 **First time only** — start it and get an access token:
 ```bash
-just yolo-label-up        # starts Label Studio at http://localhost:8080 (localhost only)
+just box-label        # starts Label Studio at http://localhost:8080 (localhost only)
 # open it (SSH tunnel if remote: ssh -L 8080:localhost:8080 <server>), log in with
 # LABEL_STUDIO_USERNAME/PASSWORD from .env, then copy
 # Account & Settings -> Access Token into .env as LABEL_STUDIO_API_KEY
@@ -78,15 +78,24 @@ just yolo-label-up        # starts Label Studio at http://localhost:8080 (localh
 
 **Each round:**
 ```bash
-just yolo-label           # starts LS if needed + pushes unreviewed frames (with suggestions)
+just box-label           # starts LS if needed + pushes unreviewed frames (with suggestions)
+# in the project click "Label All Tasks": Submit (Ctrl/Cmd+Enter) then moves to the
+# next frame. Opening a single task from the table does NOT auto-advance.
 # label in the browser: one box per cat (head + body), class `cat`; fix/add/delete.
+# no cat names here — which cat it is gets labelled later with `just cat-label`.
 # a frame submitted with no box = confirmed-empty negative. Untouched = stays unreviewed.
-just yolo-sync            # pull submitted boxes back into the catalog (verified)
+just box-sync            # pull submitted boxes back into the catalog (verified)
 ```
 
+Frames are pushed hardest first (`priority` column: 0 model unsure, 1 several
+boxes, 2 visual change, 3 visit sample, 4 regular), so the first few hundred
+teach the model the most. Tasks pushed before priorities existed get the column
+patched in on the next push; sort the Data Manager by `priority` before "Label
+All Tasks" to walk them in that order.
+
 Because the model pre-fills boxes, most frames are "accept/adjust", and you only
-draw from scratch where YOLO was wrong. `just yolo-label --limit 300` pushes a
-smaller first batch. Stop the server with `just yolo-label-down` (projects and
+draw from scratch where YOLO was wrong. `just box-label --limit 300` pushes a
+smaller first batch. Stop the server with `just box-label-stop` (projects and
 labels persist in a docker volume).
 
 > Label Studio itself is a third-party service pinned in `docker-compose.label.yml`.
@@ -97,7 +106,7 @@ labels persist in a docker volume).
 ## 3. Build an immutable dataset version
 
 ```bash
-just yolo-build-version --val-frac 0.15 --test-frac 0.15
+just box-build --val-frac 0.15 --test-frac 0.15
 ```
 
 - Splits by **visit group across all cameras** (related observations of one
@@ -118,14 +127,14 @@ Output: `data/yolo_dataset/versions/<version_id>/` with `data.yaml`,
 ## 4. Fine-tune (from a pretrained `.pt`, not an INT8 export)
 
 ```bash
-just yolo-train \
+just box-train \
   --dataset data/yolo_dataset/versions/<version_id> \
   --weights yolov8n.pt \
   --imgsz 640 --epochs 50 --device cpu
 ```
 
-Writes `models/trained/<run>/` with `weights/best.pt`, Ultralytics plots, and a
-durable `report.json`. The runtime model is **not** replaced. Uses the same
+Writes `models/trained/<run>/` with `weights/best.pt`, Ultralytics plots,
+`test_eval/` (test-split plots), and a durable `report.json`. The runtime model is **not** replaced. Uses the same
 `imgsz`/geometry as runtime; keep the current architecture (yolov8n) first so
 only one factor changes.
 
@@ -137,12 +146,12 @@ bases:
 - from the previous fine-tune (incremental): `--weights models/trained/<prev>/weights/best.pt`.
 
 **Mixing in old versions (anti-forgetting).** Verified samples stay in the
-catalog, so a fresh `yolo-build-version` already includes old visits. When you
+catalog, so a fresh `box-build` already includes old visits. When you
 train on a version that does *not* contain older appearances (e.g. a recent-only
 version), mix them back with `--replay-version` (repeatable):
 
 ```bash
-just yolo-train \
+just box-train \
   --dataset data/yolo_dataset/versions/<recent> \
   --weights yolov8n.pt \
   --replay-version data/yolo_dataset/versions/<older> \
@@ -157,9 +166,9 @@ group) are dropped, so mixing never inflates evaluation. The run report records
 ## 5. Evaluate / compare base .pt vs INT8
 
 ```bash
-just yolo-evaluate --dataset <version> --model models/trained/<run>/weights/best.pt
+just box-eval --dataset <version> --model models/trained/<run>/weights/best.pt
 # tell model vs export error apart:
-just yolo-evaluate --dataset <version> --model <openvino_int8_dir>
+just box-eval --dataset <version> --model <openvino_int8_dir>
 ```
 
 Reports precision/recall/mAP50/mAP50-95, operational TP/FP/FN at a fixed
@@ -170,7 +179,7 @@ and offline inference timing (explicitly **not** end-to-end feeder latency).
 ## 6. Export to OpenVINO (parity-gated) — optional, still not deployed
 
 ```bash
-just yolo-export --dataset <version> --model models/trained/<run>/weights/best.pt --int8
+just box-export --dataset <version> --model models/trained/<run>/weights/best.pt --int8
 ```
 
 Evaluates `.pt` vs the export on the same test split and fails if quality drops
@@ -179,7 +188,7 @@ beyond the limits. Exit code 2 = gate failed. It never promotes a runtime model.
 ## 7. Compare two runs
 
 ```bash
-just yolo-compare models/trained/<run_a>/report.json models/trained/<run_b>/report.json
+just box-compare models/trained/<run_a>/report.json models/trained/<run_b>/report.json
 ```
 
 ## Deploying later (separate, deliberate decision)

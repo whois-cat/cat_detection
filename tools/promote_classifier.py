@@ -11,7 +11,7 @@ The cv-worker container mounts ``./models/classifier:/opt/models/classifier:ro``
 and reads ``CLASSIFIER_DIR=/opt/models/classifier/current``. Promotion exports a
 trained checkpoint to the OpenVINO runtime format into a NEW version dir and
 atomically switches the ``current`` symlink. Containers pick it up only after an
-explicit restart (``just classifier-restart``) — no image rebuild, no hot reload.
+explicit restart (``just cat-restart``) — no image rebuild, no hot reload.
 
 Training never touches this tree; promotion is explicit and validated.
 
@@ -35,7 +35,7 @@ TRAINED_ROOT = ROOT / "models" / "trained"
 CLASSIFIER_ROOT = ROOT / "models" / "classifier"
 
 REQUIRED_RUNTIME_FILES = ("cat_classifier.xml", "cat_classifier.bin", "classes.json")
-RESTART_HINT = "Next: restart cv-worker to load it:\n    just classifier-restart"
+RESTART_HINT = "Next: restart cv-worker to load it:\n    just cat-restart"
 
 
 # ---- discovery / validation -------------------------------------------------
@@ -98,7 +98,7 @@ def default_export(src_pt: Path, out_dir: Path) -> None:
     """Export a torch checkpoint to OpenVINO IR + classes.json by reusing the
     cv-worker/tools/export_classifier.py (which includes the parity gate).
     Runs via subprocess; requires torch + openvino (present in the cv-worker
-    image, which is where `just classifier-promote` runs)."""
+    image, which is where `just cat-promote` runs)."""
     script = ROOT / "cv-worker" / "tools" / "export_classifier.py"
     cmd = [sys.executable, str(script), "--pt", str(src_pt), "--out", str(out_dir)]
     proc = subprocess.run(cmd)
@@ -106,7 +106,7 @@ def default_export(src_pt: Path, out_dir: Path) -> None:
         raise RuntimeError(
             f"export failed (exit {proc.returncode}): {' '.join(cmd)}. "
             "Run this inside the cv-worker image (torch + openvino), e.g. via "
-            "`just classifier-promote`."
+            "`just cat-promote`."
         )
 
 

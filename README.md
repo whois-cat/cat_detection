@@ -51,14 +51,16 @@ feeder services are stopped (see Migration).
 - YOLO is exported to INT8 OpenVINO when the cv-worker image is built.
 - The identity classifier is mounted from `models/classifier/` (not in git):
   `versions/<id>/{cat_classifier.xml,.bin,classes.json}` with `current` and
-  `previous` symlinks. `just classifier-promote` exports the newest
+  `previous` symlinks. `just cat-promote` exports the newest
   `models/trained/*/cat_classifier.pt` (with a torch↔OpenVINO parity gate) and
-  switches `current`; `just classifier-restart` loads it.
+  switches `current`; `just cat-restart` loads it.
 
 ### Commands
 
 `just up | down | ps | logs [service] | status | check`, `just webui-dev` (hot
-reload against a running streamhub), labeling/training recipes: `just --list`.
+reload against a running streamhub). Labeling/training: `just box-*` (where is
+the cat: collect, label boxes, train YOLO) and `just cat-*` (which cat: group,
+name, train the classifier); `just` lists them in pipeline order.
 
 ## Migration from the previous stack
 

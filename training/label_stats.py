@@ -153,8 +153,8 @@ def resolve_events_db(explicit: Path | None, *, root: Path | None = None) -> Pat
 
     With no explicit path, auto-discovers the canonical
     ``<root>/data/events/events.db`` (root defaults to the repo root) so
-    ``just label-stats`` includes usability stats with no extra flags. Returns
-    None when the chosen DB is missing/empty/not an events DB, so label-stats
+    ``just cat-stats`` includes usability stats with no extra flags. Returns
+    None when the chosen DB is missing/empty/not an events DB, so cat-stats
     degrades to the plain report instead of erroring. An explicit --events-db is
     honoured when usable, else skipped (never a hard failure)."""
     base = root if root is not None else ROOT
