@@ -229,7 +229,7 @@ def train(
             evaluation = evaluate_artifact(
                 best, dataset, imgsz=imgsz, batch=batch, device=device, workers=workers,
                 confidence=confidence, iou_threshold=iou_threshold,
-                progress=evaluation_progress,
+                progress=evaluation_progress, plots_dir=run_dir / "test_eval",
             )
             session.report["timing_seconds"]["evaluation"] = time.monotonic() - evaluation_started
             session.report["metrics"]["official"] = evaluation["official"]

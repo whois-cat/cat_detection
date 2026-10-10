@@ -105,8 +105,9 @@ def main(argv: list[str] | None = None) -> int:
         "max_map50_95_drop": args.max_map50_95_drop,
         "max_recall_drop": args.max_recall_drop, "max_fp_increase": args.max_fp_increase,
     }
+    report_path = args.report or _default_report(source)
     session = ReportSession(
-        args.report or _default_report(source), kind="yolo_openvino_export",
+        report_path, kind="yolo_openvino_export",
         parameters=parameters, dataset=dataset,
         model={"source": {"path": str(source), "sha256": sha256_file(source)}},
         sample_interval_sec=args.resource_interval,
@@ -121,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             baseline = evaluate_artifact(
                 source, dataset, imgsz=args.imgsz, batch=args.batch, device=args.device,
                 workers=args.workers, confidence=args.eval_conf, iou_threshold=args.eval_iou,
+                plots_dir=report_path.with_suffix("").with_name(report_path.stem + "-source"),
             )
 
             session.progress(stage="exporting_openvino")
@@ -145,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             candidate = evaluate_artifact(
                 exported, dataset, imgsz=args.imgsz, batch=args.batch, device=args.device,
                 workers=args.workers, confidence=args.eval_conf, iou_threshold=args.eval_iou,
+                plots_dir=report_path.with_suffix("").with_name(report_path.stem + "-export"),
             )
             session.report["timing_seconds"]["evaluation"] = time.monotonic() - evaluation_started
             gate = quality_gate(

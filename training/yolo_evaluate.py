@@ -236,6 +236,16 @@ def fixed_confidence_evaluation(
     }
 
 
+def val_output_kwargs(plots_dir: Path | None) -> dict[str, Any]:
+    """Where Ultralytics ``val`` writes its plots. Without an explicit project it
+    falls back to the global ``runs_dir`` in ~/.config/Ultralytics/settings.json,
+    which can point into an unrelated checkout."""
+    if plots_dir is None:
+        return {}
+    plots_dir = Path(plots_dir).expanduser().resolve()
+    return {"project": str(plots_dir.parent), "name": plots_dir.name, "exist_ok": True}
+
+
 def evaluate_artifact(
     model_path: Path,
     dataset: DatasetInfo,
@@ -248,6 +258,7 @@ def evaluate_artifact(
     iou_threshold: float = 0.5,
     progress: Callable[[int, int], None] | None = None,
     model_factory: Callable[[Path], Any] = _load_yolo,
+    plots_dir: Path | None = None,
 ) -> dict[str, Any]:
     model_path = validate_model_artifact(model_path)
     model = model_factory(model_path)
@@ -256,6 +267,7 @@ def evaluate_artifact(
     validation = model.val(
         data=str(dataset.data_yaml), split="test", imgsz=imgsz, batch=batch,
         device=device, workers=workers, classes=[cat_id], single_cls=True, verbose=False,
+        **val_output_kwargs(plots_dir),
     )
     official_elapsed = time.monotonic() - official_started
     custom_started = time.monotonic()
@@ -305,8 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     model_path = validate_model_artifact(args.model)
     params = {"imgsz": args.imgsz, "batch": args.batch, "device": args.device,
               "workers": args.workers, "confidence": args.conf, "iou": args.iou}
+    report_path = args.report or _default_report_path()
     session = ReportSession(
-        args.report or _default_report_path(), kind="yolo_evaluation", parameters=params,
+        report_path, kind="yolo_evaluation", parameters=params,
         dataset=dataset, model={"path": str(model_path), "sha256": sha256_tree(model_path)},
         sample_interval_sec=args.resource_interval,
     )
@@ -323,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             result = evaluate_artifact(
                 model_path, dataset, imgsz=args.imgsz, batch=args.batch, device=args.device,
                 workers=args.workers, confidence=args.conf, iou_threshold=args.iou,
-                progress=progress,
+                progress=progress, plots_dir=report_path.with_suffix(""),
             )
             session.report["timing_seconds"]["evaluation"] = time.monotonic() - eval_started
             session.report["model"] = result.pop("artifact")
