@@ -45,6 +45,7 @@ def quality_gate(baseline: dict[str, Any], candidate: dict[str, Any], *,
     deltas = {
         "precision": delta("precision"), "recall": delta("recall"),
         "map50": delta("map50"), "map50_95": delta("map50_95"),
+        "fixed_confidence_recall": candidate_fixed["recall"] - base_fixed["recall"],
         "fixed_confidence_fp": candidate_fixed["fp"] - base_fixed["fp"],
         "fixed_confidence_fn": candidate_fixed["fn"] - base_fixed["fn"],
         "empty_image_errors": (candidate_fixed["empty_image_errors"]
@@ -53,8 +54,11 @@ def quality_gate(baseline: dict[str, Any], candidate: dict[str, Any], *,
     checks = {
         "map50_95_drop_within_limit": (deltas["map50_95"] is not None
                                         and deltas["map50_95"] >= -max_map_drop),
-        "recall_drop_within_limit": (deltas["recall"] is not None
-                                      and deltas["recall"] >= -max_recall_drop),
+        # Recall at the fixed (runtime) confidence. Ultralytics' own recall is
+        # taken at each model's max-F1 threshold, which moves between the .pt and
+        # the export, so it trades recall for precision without either model
+        # changing at the threshold that actually serves.
+        "recall_drop_within_limit": deltas["fixed_confidence_recall"] >= -max_recall_drop,
         "false_positive_increase_within_limit": deltas["fixed_confidence_fp"] <= max_fp_increase,
     }
     return {

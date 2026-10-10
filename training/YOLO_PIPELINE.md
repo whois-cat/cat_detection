@@ -188,7 +188,10 @@ just box-export --dataset <version> --model models/trained/<run>/weights/best.pt
 ```
 
 Evaluates `.pt` vs the export on the same test split and fails if quality drops
-beyond the limits. Exit code 2 = gate failed. It never promotes a runtime model.
+beyond the limits: mAP50-95 (threshold-free), and recall and false positives at
+the runtime confidence (`--eval-conf`, 0.25). Ultralytics' own precision/recall
+are reported but not gated — they sit at each model's max-F1 threshold, which
+moves between the two. Exit code 2 = gate failed. It never promotes a runtime model.
 
 ## 7. Compare two runs
 
