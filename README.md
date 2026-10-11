@@ -51,7 +51,8 @@ feeder services are stopped (see Migration).
 - Both models are mounted from `models/detector/` and `models/classifier/` (not
   in git): `versions/<run>/` with `current` and `previous` symlinks.
   `just deploy detector|classifier [run]` exports a trained run with that model's
-  quality gate, switches `current` and restarts cv-worker; `just rollback` goes
+  quality gate (detector: `--skip-gate` overrides a failed one), switches
+  `current` and restarts cv-worker; `just rollback` goes
   back; `just models` shows what runs. With no deployed detector, cv-worker runs
   the COCO yolov8n exported to INT8 OpenVINO when its image is built.
 

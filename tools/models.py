@@ -11,6 +11,9 @@ Both models are delivered the same way, through read-only volumes:
 the training run name under models/trained/. Deploying exports the run's
 checkpoint to OpenVINO with that kind's quality gate, installs it as a new
 version and atomically switches ``current``; nothing switches if the gate fails.
+The detector gate (does the INT8 export keep the .pt's quality?) can be
+overridden with ``--skip-gate`` after comparing the export with the deployed
+model yourself; the classifier's exact torch/OpenVINO parity check cannot.
 cv-worker picks the change up on restart (the `just deploy` / `just rollback`
 recipes do that). With no deployed detector, cv-worker serves the COCO yolov8n
 baked into its image.
@@ -19,7 +22,7 @@ Export needs torch + openvino + ultralytics, so ``deploy`` runs in the
 cv-worker image; ``rollback`` and ``status`` only move symlinks.
 
     python tools/models.py status
-    python tools/models.py deploy   {detector,classifier} [RUN]   # default: newest run
+    python tools/models.py deploy   {detector,classifier} [RUN] [--skip-gate]  # default: newest run
     python tools/models.py rollback {detector,classifier} [VERSION]  # default: previous
 """
 from __future__ import annotations
@@ -70,13 +73,17 @@ def check_classifier_checkpoint(path: Path) -> dict:
     return {"classes": names}
 
 
-def export_classifier(checkpoint: Path, out_dir: Path) -> None:
+def export_classifier(checkpoint: Path, out_dir: Path, skip_gate: bool = False) -> dict:
     """OpenVINO IR + classes.json via cv-worker/tools/export_classifier.py, which
     fails on any torch-vs-OpenVINO parity mismatch."""
+    if skip_gate:
+        raise SystemExit("the classifier export check is exact torch/OpenVINO parity; "
+                         "a mismatch means a broken export, so it cannot be skipped")
     script = ROOT / "cv-worker" / "tools" / "export_classifier.py"
     cmd = [sys.executable, str(script), "--pt", str(checkpoint), "--out", str(out_dir)]
     if subprocess.run(cmd).returncode != 0:
         raise RuntimeError(f"classifier export failed: {' '.join(cmd)}")
+    return {}
 
 
 def check_classifier_artifact(version_dir: Path) -> dict:
@@ -112,9 +119,11 @@ def check_detector_checkpoint(path: Path) -> dict:
     return {"dataset": version.name}
 
 
-def export_detector(checkpoint: Path, out_dir: Path) -> None:
+def export_detector(checkpoint: Path, out_dir: Path, skip_gate: bool = False) -> dict:
     """INT8 OpenVINO export gated against the .pt on the run's own test split
-    (training.yolo_export). Exported from a copy so the run dir is untouched."""
+    (training.yolo_export). Exported from a copy so the run dir is untouched.
+    skip_gate installs an export that failed the gate (exit code 2), never one
+    whose export itself failed."""
     work = out_dir / "export"
     work.mkdir()
     source = work / checkpoint.name
@@ -125,11 +134,20 @@ def export_detector(checkpoint: Path, out_dir: Path) -> None:
     cmd = [sys.executable, "-m", "training.yolo_export",
            "--dataset", str(_training_dataset(checkpoint)), "--model", str(source),
            "--int8", "--report", str(report)]
-    if subprocess.run(cmd, cwd=ROOT).returncode != 0:
-        raise RuntimeError(f"detector export failed its quality gate (see {report})")
+    code = subprocess.run(cmd, cwd=ROOT).returncode
+    if code == 2 and skip_gate:
+        print("[deploy] quality gate FAILED; installing anyway (--skip-gate)")
+        gate = "failed, skipped"
+    elif code != 0:
+        hint = " (--skip-gate overrides it)" if code == 2 else ""
+        raise RuntimeError(f"detector export failed{' its quality gate' if code == 2 else ''}"
+                           f"{hint}; see {report}")
+    else:
+        gate = "passed"
     # Keep Ultralytics' *_openvino_model name: it recognises OpenVINO by it.
     shutil.move(str(work / f"{source.stem}_int8_openvino_model"), out_dir)
     source.unlink()
+    return {"quality_gate": gate, "export_report": str(report)}
 
 
 def check_detector_artifact(version_dir: Path) -> dict:
@@ -154,7 +172,7 @@ class Kind:
     name: str
     checkpoint: str                              # checkpoint path inside a training run
     check_checkpoint: Callable[[Path], dict]
-    export: Callable[[Path, Path], None]         # (checkpoint, empty out dir)
+    export: Callable[..., dict]                  # (checkpoint, empty out dir, skip_gate) -> metadata
     check_artifact: Callable[[Path], dict]
     builtin: str | None = None                   # what cv-worker serves with nothing deployed
 
@@ -206,8 +224,8 @@ def find_checkpoint(kind: Kind, run: str | None, trained_root: Path) -> Path:
     return found[-1]
 
 
-def deploy(kind_name: str, run: str | None = None, *, trained_root: Path = TRAINED_ROOT,
-           models_root: Path = MODELS_ROOT) -> dict:
+def deploy(kind_name: str, run: str | None = None, *, skip_gate: bool = False,
+           trained_root: Path = TRAINED_ROOT, models_root: Path = MODELS_ROOT) -> dict:
     kind = KINDS[kind_name]
     checkpoint = find_checkpoint(kind, run, trained_root)
     run = run_dir(kind, checkpoint)
@@ -224,7 +242,7 @@ def deploy(kind_name: str, run: str | None = None, *, trained_root: Path = TRAIN
     # Export into a temp dir on the same filesystem, check, then move into place.
     tmp = Path(tempfile.mkdtemp(dir=versions, prefix=f".{version}.tmp-"))
     try:
-        kind.export(checkpoint, tmp)
+        exported = kind.export(checkpoint, tmp, skip_gate) or {}
         artifact = kind.check_artifact(tmp)
         metadata = tmp / "metadata.json"
         if (run / "metadata.json").is_file():
@@ -232,7 +250,7 @@ def deploy(kind_name: str, run: str | None = None, *, trained_root: Path = TRAIN
         else:
             metadata.write_text(json.dumps({
                 "kind": kind.name, "version_id": version, "source_checkpoint": str(checkpoint),
-                "deployed_at": datetime.now().isoformat(), **source,
+                "deployed_at": datetime.now().isoformat(), **source, **exported,
             }, indent=2), encoding="utf-8")
         os.replace(tmp, versions / version)
     except BaseException:
@@ -300,6 +318,8 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("deploy")
     d.add_argument("kind", choices=KINDS)
     d.add_argument("run", nargs="?", default="", help="training run name or path; default newest")
+    d.add_argument("--skip-gate", action="store_true",
+                   help="detector only: install even if the export fails its quality gate")
     r = sub.add_parser("rollback")
     r.add_argument("kind", choices=KINDS)
     r.add_argument("version", nargs="?", default="", help="version id; default previous")
@@ -308,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "status":
         print("\n".join(status()))
     elif args.cmd == "deploy":
-        print(f"[deploy] {_describe(deploy(args.kind, args.run or None))}")
+        print(f"[deploy] {_describe(deploy(args.kind, args.run or None, skip_gate=args.skip_gate))}")
     else:
         print(f"[rollback] {_describe(rollback(args.kind, args.version or None))}")
     return 0

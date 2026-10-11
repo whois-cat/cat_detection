@@ -289,12 +289,14 @@ models:
     {{TRAINING_RUN}} python tools/models.py status
 
 # Exports the run with its model's quality gate in the cv-worker image (nothing
-# switches if it fails). RUN: a models/trained/<run> name, default the newest.
+# switches if it fails). ARGS: a models/trained/<run> name (default the newest)
+# and, detector only, --skip-gate to install an export that failed the gate
+# after comparing it with the deployed model yourself.
 # Example: just deploy detector yolo-20261010-011816
 # Put a trained run into service and restart cv-worker.
 [group('model')]
-deploy KIND RUN="":
-    {{CV_WORKER_RUN}} python tools/models.py deploy {{KIND}} {{RUN}}
+deploy KIND *ARGS:
+    {{CV_WORKER_RUN}} python tools/models.py deploy {{KIND}} {{ARGS}}
     {{COMPOSE}} restart cv-worker
 
 # Switch to the previous version (or VERSION) and restart cv-worker.

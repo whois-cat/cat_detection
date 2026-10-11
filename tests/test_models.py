@@ -44,14 +44,14 @@ def _detector_run(tmp: Path, run: str, dataset="v1") -> Path:
     return path
 
 
-def _fake_classifier_export(checkpoint: Path, out: Path) -> None:
+def _fake_classifier_export(checkpoint: Path, out: Path, skip_gate=False) -> None:
     names = torch.load(checkpoint, weights_only=False)["class_names"]
     (out / "cat_classifier.xml").write_text("<net/>")
     (out / "cat_classifier.bin").write_bytes(b"\0")
     (out / "classes.json").write_text(json.dumps(names))
 
 
-def _fake_detector_export(checkpoint: Path, out: Path, *, names=None) -> None:
+def _fake_detector_export(checkpoint: Path, out: Path, skip_gate=False, *, names=None) -> None:
     export = out / "best_int8_openvino_model"
     export.mkdir()
     (export / "best.xml").write_text("<net/>")
@@ -70,8 +70,8 @@ def env(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _deploy(tmp, kind, run=None):
-    return M.deploy(kind, run, trained_root=tmp / "trained", models_root=tmp / "models")
+def _deploy(tmp, kind, run=None, **kw):
+    return M.deploy(kind, run, trained_root=tmp / "trained", models_root=tmp / "models", **kw)
 
 
 def _rollback(tmp, kind, version=None):
@@ -160,7 +160,7 @@ def test_detector_needs_its_training_dataset(env):
 def test_detector_export_without_cat_is_refused(env, monkeypatch):
     monkeypatch.setitem(M.KINDS, "detector", M.KINDS["detector"].__class__(
         **{**M.KINDS["detector"].__dict__,
-           "export": lambda c, o: _fake_detector_export(c, o, names={0: "dog"})}))
+           "export": lambda c, o, s: _fake_detector_export(c, o, s, names={0: "dog"})}))
     _detector_run(env, "run-1")
     with pytest.raises(ValueError, match="no 'cat' class"):
         _deploy(env, "detector", "run-1")
@@ -174,3 +174,50 @@ def test_status_marks_current_and_previous(env):
         _deploy(env, "classifier", run)
     lines = M.status(models_root=env / "models")
     assert "  * run-2" in lines and "  < run-1" in lines
+
+
+# ---- the detector's quality gate (real export_detector, faked yolo_export) -----------
+
+def _gate_exit(monkeypatch, code):
+    """Fake `python -m training.yolo_export`: writes the export dir, exits `code`."""
+    def run(cmd, cwd=None):
+        model = Path(cmd[cmd.index("--model") + 1])
+        _fake_detector_export(model, model.parent)
+        return type("Done", (), {"returncode": code})()
+    monkeypatch.setitem(M.KINDS, "detector", M.KINDS["detector"].__class__(
+        **{**M.KINDS["detector"].__dict__, "export": M.export_detector}))
+    monkeypatch.setattr(M.subprocess, "run", run)
+
+
+def test_failed_detector_gate_switches_nothing(env, monkeypatch):
+    _gate_exit(monkeypatch, 2)
+    _detector_run(env, "run-1")
+    with pytest.raises(RuntimeError, match="--skip-gate"):
+        _deploy(env, "detector", "run-1")
+    assert _current(env, "detector") is None
+
+
+def test_skip_gate_installs_and_records_it(env, monkeypatch):
+    _gate_exit(monkeypatch, 2)
+    _detector_run(env, "run-1")
+    _deploy(env, "detector", "run-1", skip_gate=True)
+    assert _current(env, "detector") == "run-1"
+    meta = json.loads((env / "models/detector/versions/run-1/metadata.json").read_text())
+    assert meta["quality_gate"] == "failed, skipped"
+    assert "yolo-reports" in meta["export_report"]
+
+
+def test_skip_gate_never_installs_a_broken_export(env, monkeypatch):
+    _gate_exit(monkeypatch, 1)
+    _detector_run(env, "run-1")
+    with pytest.raises(RuntimeError):
+        _deploy(env, "detector", "run-1", skip_gate=True)
+    assert _current(env, "detector") is None
+
+
+def test_classifier_parity_cannot_be_skipped(env, monkeypatch):
+    monkeypatch.setitem(M.KINDS, "classifier", M.KINDS["classifier"].__class__(
+        **{**M.KINDS["classifier"].__dict__, "export": M.export_classifier}))
+    _classifier_run(env, "run-1")
+    with pytest.raises(SystemExit, match="cannot be skipped"):
+        _deploy(env, "classifier", "run-1", skip_gate=True)

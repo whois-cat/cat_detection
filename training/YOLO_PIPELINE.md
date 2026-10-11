@@ -205,6 +205,17 @@ installs `models/detector/versions/<run>`, switches `current` and restarts
 cv-worker; the web UI and sidecars show the detector by its run name. The
 classifier deploys the same way (`just deploy classifier <run>`).
 
+The gate only says whether INT8 kept the `.pt`'s quality, and the export report
+is kept in `models/trained/yolo-reports/export-<run>-<time>.json`. INT8 can
+trade errors (e.g. fewer false boxes, a couple more missed cats). To decide,
+evaluate the deployed export on the same test split in the cv-worker image
+(`python -m training.yolo_evaluate --model models/detector/versions/<id>/best_int8_openvino_model`)
+and compare `fixed_confidence.overall`; then
+`just deploy detector <run> --skip-gate` installs it anyway, recording
+`quality_gate: failed, skipped` in its `metadata.json`. A failed export (not a
+failed gate) is never installed; the classifier's exact torch/OpenVINO parity
+check has no override.
+
 A fine-tune has the same 80 COCO classes as the built-in model (cv-worker looks
 the `cat` id up in the model's own names), so it is a drop-in replacement.
 Changing boxes also changes the classifier's input crops, and per-camera
