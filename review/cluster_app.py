@@ -687,7 +687,8 @@ async def api_cluster_split(payload: dict) -> JSONResponse:
     if any("embedding" not in ITEMS[i] for i in members):
         raise HTTPException(
             status_code=400,
-            detail="manifest has no stored embeddings; rebuild with build_cluster_manifest",
+            detail="groups built by time (cat-groups) have no look embeddings to split by; "
+                   "select the other cat's crops and label them with 'selected ->' / 'rest ->'",
         )
 
     x = np.asarray([ITEMS[i]["embedding"] for i in members], dtype=np.float32)
@@ -764,29 +765,55 @@ async def api_cluster_split(payload: dict) -> JSONResponse:
 
 @app.post("/api/crop_label")
 async def api_crop_label(payload: dict) -> JSONResponse:
-    """Label individual crops (fallback for hopelessly mixed clusters). Writes one
-    `reviews` row per crop — same per-crop grain as a cluster label, just scoped
-    to an explicit selection instead of the whole cluster."""
+    """Label just the selected crops; the rest stay as they are. Writes one
+    `reviews` row per crop — same per-crop grain as a cluster label. With a
+    `cluster_id`, the cluster is marked done once none of its visible crops is
+    left unlabelled (a batch can hold two cats, bad crops, ... in any mix)."""
     label = payload.get("label")
     crop_ids = payload.get("crop_ids") or []
+    cluster_id = payload.get("cluster_id")
     _validate_concrete_label(label)
     if not isinstance(crop_ids, list) or not crop_ids:
         raise HTTPException(status_code=400, detail="no crops selected")
     unknown = [cid for cid in crop_ids if cid not in BY_ID]
     if unknown:
         raise HTTPException(status_code=404, detail=f"unknown crop(s): {unknown[:5]}")
+    cluster = None
+    if cluster_id is not None:
+        cluster = _cluster_by_id(int(cluster_id))
+        if cluster is None:
+            raise HTTPException(status_code=404, detail="unknown cluster")
 
     now = datetime.now(timezone.utc).isoformat()
+    remaining = None
     with _db_lock:
         try:
             _conn.execute("BEGIN")
             for cid in crop_ids:
                 _write_review_label(_conn, BY_ID[cid], label, now)
+            if cluster is not None:
+                visible = [item["crop_id"] for item in _cluster_member_items(cluster)
+                           if bool(item.get("review_visible", True))]
+                labels = dict(_conn.execute(
+                    f"SELECT crop_id, label FROM reviews WHERE crop_id IN "
+                    f"({','.join('?' * len(visible))})", visible).fetchall()) if visible else {}
+                remaining = sum(1 for cid in visible if cid not in labels)
+                if remaining == 0:
+                    distinct = set(labels.values())
+                    _conn.execute(
+                        """INSERT INTO cluster_reviews (cluster_id, status, label, reviewed_at)
+                           VALUES (?, 'labeled', ?, ?)
+                           ON CONFLICT(cluster_id) DO UPDATE SET
+                               status=excluded.status, label=excluded.label,
+                               reviewed_at=excluded.reviewed_at""",
+                        (int(cluster_id), distinct.pop() if len(distinct) == 1 else "several", now),
+                    )
             _conn.commit()
         except Exception:
             _conn.rollback()
             raise
-    return JSONResponse({"ok": True, "labeled": len(crop_ids), "label": label})
+    return JSONResponse({"ok": True, "labeled": len(crop_ids), "label": label,
+                         "remaining": remaining, "cluster_done": remaining == 0})
 
 
 @app.get("/api/counts")

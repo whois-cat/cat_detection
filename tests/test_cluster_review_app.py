@@ -162,8 +162,8 @@ def test_mixed_batch_warning_present_in_html(client):
     # The review UI must warn that a time-based batch can contain multiple cats,
     # near the whole-batch labelling controls, before any apply-all action.
     html = client.get("/").text
-    assert "This batch may contain multiple cats." in html
-    assert "Label only selected crops." in html
+    assert "A batch can mix cats and bad crops" in html
+    assert "select crops → label them → repeat" in html
     assert 'id="mixedBatchWarning"' in html
 
 
@@ -353,3 +353,27 @@ def test_hidden_duplicate_can_be_overridden_as_exception(client):
     assert rows["grey:0"] == "cat_a"            # visible → majority
     assert rows["grey:3"] == "cat_a"            # visible → majority
     assert "grey:1" not in rows                 # hidden, not selected → untouched
+
+
+def test_labelling_selected_crops_closes_the_cluster_when_none_is_left(client):
+    # Two cats and a bad crop in one batch: label each selection, no "rest".
+    r = client.post("/api/crop_label", json={
+        "cluster_id": 1, "crop_ids": ["grey:6", "grey:7"], "label": "cat_a"}).json()
+    assert r["remaining"] == 1 and not r["cluster_done"]
+    status = {c["cluster_id"]: c["status"] for c in client.get("/api/clusters").json()["queue"]}
+    assert status[1] is None
+
+    r = client.post("/api/crop_label", json={
+        "cluster_id": 1, "crop_ids": ["grey:8"], "label": "discard"}).json()
+    assert r["cluster_done"]
+    status = {c["cluster_id"]: c["status"] for c in client.get("/api/clusters").json()["queue"]}
+    assert status[1]["status"] == "labeled" and status[1]["label"] == "several"
+
+
+def test_cluster_done_counts_visible_crops_only(client):
+    # Cluster 0 shows grey:0 and grey:3; its hidden duplicates need no label.
+    r = client.post("/api/crop_label", json={
+        "cluster_id": 0, "crop_ids": ["grey:0", "grey:3"], "label": "cat_b"}).json()
+    assert r["cluster_done"]
+    status = {c["cluster_id"]: c["status"] for c in client.get("/api/clusters").json()["queue"]}
+    assert status[0]["label"] == "cat_b"
