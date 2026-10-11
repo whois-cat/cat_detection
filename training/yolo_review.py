@@ -336,7 +336,8 @@ def import_batch(catalog: Path, package: Path, confirm_empty: bool,
                 ):
                     raise ValueError(f"invalid bbox for {sid}: {bbox}")
                 conn.execute(
-                    "INSERT INTO annotations VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO annotations(sample_id,annotation_id,class_name,x,y,w,h,"
+                    "source,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?)",
                     (sid, index, "cat", x, y, w, h, "human_cvat", now),
                 )
                 object_count += 1
@@ -429,7 +430,7 @@ def queue_status(catalog: Path, root: Path, budget_gb: float = 5.0) -> dict:
                       coalesce(sum(CASE WHEN protected=1 OR status!='unreviewed'
                                         THEN jpeg_bytes ELSE 0 END),0) protected_raw_bytes,
                       min(wall_ms) oldest_ms,max(wall_ms) newest_ms
-                 FROM samples"""
+                 FROM samples WHERE status!='retired'"""
         ).fetchone()
     finally:
         conn.close()

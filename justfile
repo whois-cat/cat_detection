@@ -14,12 +14,8 @@ yolo_recordings := env_var_or_default("YOLO_RECORDINGS", "data/streamhub/recordi
 yolo_dataset    := env_var_or_default("YOLO_DATASET",    "data/yolo_dataset")
 catalog         := yolo_dataset + "/catalog.sqlite3"
 config_yaml     := env_var_or_default("CONFIG_YAML",     "config.yaml")
-review_db   := env_var_or_default("REVIEW_DB",        "data/review/reviews.db")
-manifest    := env_var_or_default("CLUSTER_MANIFEST", "data/review/clusters.json")
-# No hardcoded cat names: set REVIEW_LABELS=name1,name2,... for your cats.
-# When empty, the review UI falls back to the labels baked into the manifest.
-labels      := env_var_or_default("REVIEW_LABELS",    "")
-rec_tz      := env_var_or_default("RECORDING_TZ",     "UTC")
+# No hardcoded cat names: set CAT_NAMES=name1,name2,... for your cats.
+cat_names   := env_var_or_default("CAT_NAMES",        "")
 # Classifier crop padding; must equal cv-worker's CLASSIFIER_PAD_FRAC (docker-compose.yml).
 cat_pad_frac := env_var_or_default("CLASSIFIER_PAD_FRAC", "0.05")
 journal_db  := env_var_or_default("FEED_JOURNAL_DB",  "data/decider/feed_journal/journal.db")
@@ -93,38 +89,34 @@ setup TARGET="all":
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{TARGET}}" in
-      label)
-        uv run --with-requirements review/requirements.txt \
-            python -c "import av, fastapi, numpy, PIL, uvicorn; print('label deps ok')"
-        ;;
-      train)
-        {{CLASSIFIER_RUN}} \
-            python -c "import av, cv2, numpy, torch, torchvision; print('train deps ok')"
-        ;;
-      all)
-        uv run --with-requirements review/requirements.txt \
-            python -c "import av, fastapi, numpy, PIL, uvicorn; print('label deps ok')"
-        {{CLASSIFIER_RUN}} \
-            python -c "import av, cv2, numpy, torch, torchvision; print('train deps ok')"
-        ;;
-      *)
-        echo "setup: unknown target '{{TARGET}}' — use: label | train | all" >&2
-        exit 1
-        ;;
+      label|train|all) ;;
+      *) echo "setup: unknown target '{{TARGET}}' — use: label | train | all" >&2; exit 1 ;;
     esac
+    if [ "{{TARGET}}" != train ]; then
+        {{YOLO_LABEL_RUN}} python -c "import label_studio_sdk; print('label deps ok')"
+    fi
+    if [ "{{TARGET}}" != label ]; then
+        {{CLASSIFIER_RUN}} \
+            python -c "import av, cv2, numpy, torch, torchvision; print('train deps ok')"
+    fi
 
-# ─────────────────────── box: where is the cat ───────────────────────
-# `cat` YOLO fine-tune from streamhub recordings, in pipeline order:
-#   box-collect -> box-label (in Label Studio) -> box-sync -> box-build
-#   -> box-train -> box-eval, then `just deploy detector <run>`
+# ─────────────── detector: where the cats are (and who) ───────────────
+# One Label Studio pass labels both models: a box around every cat, and the
+# cat's name on each box (CAT_NAMES). Boxes train the detector, named boxes the
+# classifier. In pipeline order:
+#   detector-collect -> detector-label (in Label Studio) -> detector-sync
+#   -> detector-build -> detector-train -> detector-eval, then
+#   `just deploy detector <run>`; classifier-train for the names.
+# `detector-round` does collect + label in one go (e.g. weekly from cron).
 # All offline/manual; never touches the running stack or deployed models.
 
-# Frames are saved as the detector sees them (ROI + rotation). Resumable;
-# sidecar boxes are hints only. Example:
-#   just box-collect --camera black,grey --from 2026-10-01 --to 2026-10-02 --tag shaved
-# Collect frames from recordings into the catalog.
-[group('box')]
-box-collect *ARGS:
+# Frames are saved as the detector sees them (ROI + rotation). Resumable; the
+# live models' boxes and names (sidecars) are only suggestions. Examples:
+#   just detector-collect --days 7
+#   just detector-collect --camera black,grey --from 2026-10-09T00:00-04:00 --to 2026-10-11T00:00-04:00
+# Collect frames from recordings into the catalog (default: all cameras).
+[group('detector')]
+detector-collect *ARGS:
     {{YOLO_RUN}} python -m training.streamhub_dataset \
         --recordings "{{yolo_recordings}}" \
         --config "{{config_yaml}}" \
@@ -132,145 +124,98 @@ box-collect *ARGS:
         {{ARGS}}
 
 # Review-queue composition and storage usage (read-only).
-[group('box')]
-box-queue *ARGS:
+[group('detector')]
+detector-queue *ARGS:
     {{YOLO_RUN}} python -m training.yolo_review \
         --catalog "{{catalog}}" --root "{{yolo_dataset}}" \
         status {{ARGS}}
 
-# Hardest frames first (model unsure, several cats, ...), with the model's boxes
-# pre-filled; --limit N pushes a batch. First run: open the URL, log in, put
-# Account & Settings -> Access Token into .env as LABEL_STUDIO_API_KEY, run again.
-# Start Label Studio and push unreviewed frames into it.
-[group('box')]
-box-label *ARGS:
+# Hardest frames first (models unsure of a box or a name, several cats, ...),
+# with the models' boxes and names pre-filled. ARGS: --limit N (a batch),
+# --reopen-unnamed (frames reviewed before names existed, to name their cats),
+# --notify (Telegram). First run: open the URL, log in, put Account & Settings
+# -> Access Token into .env as LABEL_STUDIO_API_KEY, run again.
+# Start Label Studio and push frames to label into it.
+[group('detector')]
+detector-label *ARGS:
     {{LABEL_COMPOSE}} up -d
     {{YOLO_LABEL_RUN}} python -m training.yolo_label_studio \
-        --catalog "{{catalog}}" push {{ARGS}}
-    @echo "Label at http://localhost:{{label_studio_port}} (Label All Tasks) — when done: just box-sync"
+        --catalog "{{catalog}}" push --names "{{cat_names}}" {{ARGS}}
+    @echo "Label at http://localhost:{{label_studio_port}} (Label All Tasks) — when done: just detector-sync"
 
-# Pull submitted boxes from Label Studio back into the catalog.
-[group('box')]
-box-sync:
+# Pull submitted boxes and cat names from Label Studio back into the catalog.
+[group('detector')]
+detector-sync:
     {{YOLO_LABEL_RUN}} python -m training.yolo_label_studio \
         --catalog "{{catalog}}" pull
 
+# Collect the last DAYS days from all cameras, queue them in Label Studio and
+# say so in Telegram (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). For cron, e.g.
+#   0 9 * * 1  cd /path/to/cat_detection && just detector-round 7
+# Collect + label in one go.
+[group('detector')]
+detector-round DAYS="7":
+    just detector-collect --days {{DAYS}}
+    just detector-label --notify
+
 # Stop Label Studio (projects and annotations persist in a docker volume).
-[group('box')]
-box-label-stop:
+[group('detector')]
+detector-label-stop:
     {{LABEL_COMPOSE}} down
 
 # Build an immutable, visit-group-split dataset version from verified frames.
-[group('box')]
-box-build *ARGS:
+[group('detector')]
+detector-build *ARGS:
     {{YOLO_RUN}} python -m training.yolo_build_version \
         --catalog "{{catalog}}" --root "{{yolo_dataset}}" {{ARGS}}
 
 # Writes a report to models/trained/<run>/ and never deploys. Example:
-#   just box-train --dataset data/yolo_dataset/versions/<id> --weights yolov8n.pt
+#   just detector-train --dataset data/yolo_dataset/versions/<id> --weights yolov8n.pt
 # Fine-tune YOLO on a dataset version.
-[group('box')]
-box-train *ARGS:
+[group('detector')]
+detector-train *ARGS:
     {{YOLO_TRAIN_RUN}} python -m training.yolo_train {{ARGS}}
 
 # Evaluate a trained .pt or OpenVINO export on the held-out test split.
-[group('box')]
-box-eval *ARGS:
+[group('detector')]
+detector-eval *ARGS:
     {{YOLO_TRAIN_RUN}} python -m training.yolo_evaluate {{ARGS}}
 
 # Compare two run reports: same data/config? how long, what resources, quality delta.
-[group('box')]
-box-compare A B *ARGS:
+[group('detector')]
+detector-compare A B *ARGS:
     {{YOLO_RUN}} python -m training.compare_yolo_reports "{{A}}" "{{B}}" {{ARGS}}
 
-# ─────────────────────── cat: which cat is it ───────────────────────
-# Identity classifier, from the boxes verified with box-label/box-sync:
-#   cat-groups -> cat-label (in the browser) -> cat-train -> cat-compare,
-#   then `just deploy classifier <run>`
+# ─────────────────── classifier: which cat it is ───────────────────
+# Trained on the named boxes from detector-label/detector-sync (unknown and
+# unnamed boxes are skipped):
+#   classifier-stats -> classifier-train -> classifier-compare, then
+#   `just deploy classifier <run>`
 # Crops are cut from the catalog frames with the runtime padding (cat_pad_frac).
 
-# One feeding visit per camera becomes one group (EPISODE_GAP_SEC, default 30);
-# `--mode embedding` groups by look instead. Rebuild after each box-sync.
-# Group verified cat crops for bulk labelling.
-[group('cat')]
-cat-groups *ARGS:
-    {{CLASSIFIER_RUN}} python -m training.build_cluster_manifest \
-        --catalog "{{catalog}}" \
-        --out "{{manifest}}" \
-        --labels "{{labels}}" \
-        --pad-frac {{cat_pad_frac}} \
-        --mode time \
-        --episode-gap-sec "${EPISODE_GAP_SEC:-30}" \
-        {{ARGS}}
+# How many named boxes each cat has, per camera.
+[group('classifier')]
+classifier-stats:
+    {{YOLO_RUN}} python -m training.catalog_crops --catalog "{{catalog}}"
 
-# Name the cat in each group in the browser (bulk; split mixed groups).
-[group('cat')]
-cat-label PORT="8095":
-    CLUSTER_MANIFEST="{{manifest}}" \
-    REVIEW_DB="{{review_db}}" \
-    REVIEW_LABELS="{{labels}}" \
-    RECORDING_TZ="{{rec_tz}}" \
-    uv run --with-requirements review/requirements.txt \
-        python -m uvicorn review.cluster_app:app --host 0.0.0.0 --port {{PORT}}
-
-# Labelled crop counts and class balance, without training.
-[group('cat')]
-cat-stats *ARGS:
-    uv run python -m training.label_stats \
-        --reviews-db "{{review_db}}" \
-        --labels "{{labels}}" \
-        {{ARGS}}
-
-# Train the identity classifier from the labelled crops. Args pass through.
-[group('cat')]
-cat-train *ARGS:
+# Train the identity classifier from the named boxes. Args pass through.
+[group('classifier')]
+classifier-train *ARGS:
     {{CLASSIFIER_RUN}} python -m training.train_classifier \
         --catalog "{{catalog}}" \
-        --reviews-db "{{review_db}}" \
         --pad-frac {{cat_pad_frac}} \
         {{ARGS}}
 
 # Example:
-#   just cat-compare --candidate current=models/classifier/current \
-#                    --candidate new=models/trained/<run>/cat_classifier.pt --baseline current
-# Compare candidate classifiers on the same labelled crops.
-[group('cat')]
-cat-compare *ARGS:
+#   just classifier-compare --candidate current=models/classifier/current \
+#                           --candidate new=models/trained/<run>/cat_classifier.pt --baseline current
+# Compare candidate classifiers on the same named boxes.
+[group('classifier')]
+classifier-compare *ARGS:
     {{CLASSIFIER_RUN}} python -m training.compare_classifiers \
         --catalog "{{catalog}}" \
-        --reviews-db "{{review_db}}" \
         --pad-frac {{cat_pad_frac}} \
         {{ARGS}}
-
-# MOVES (never deletes) reviews.db + clusters.json into data/review/_backup_<ts>/
-# (restore by moving them back). The catalog is never touched. Stop cat-label
-# first. Set CONFIRM=1 to skip the prompt.
-# Start cat labelling from scratch.
-[group('cat')]
-cat-reset:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    review_db="{{review_db}}"
-    manifest="{{manifest}}"
-    targets=()
-    for f in "$review_db" "$review_db-wal" "$review_db-shm" "$manifest"; do
-        [ -e "$f" ] && targets+=("$f")
-    done
-    if [ "${#targets[@]}" -eq 0 ]; then
-        echo "cat-reset: nothing to move (no reviews.db / clusters.json found)."
-        exit 0
-    fi
-    # Back up next to the review DB, so a custom REVIEW_DB stays out of the repo.
-    backup="$(dirname "$review_db")/_backup_$(date +%Y%m%d-%H%M%S)"
-    echo "cat-reset will MOVE (not delete) into ${backup}/:"
-    for f in "${targets[@]}"; do echo "  - $f"; done
-    if [ "${CONFIRM:-0}" != "1" ]; then
-        read -r -p "Proceed? [y/N] " ans
-        case "$ans" in [yY]|[yY][eE][sS]) ;; *) echo "aborted."; exit 1 ;; esac
-    fi
-    mkdir -p "$backup"
-    for f in "${targets[@]}"; do mv -v "$f" "$backup"/; done
-    echo "cat-reset: done -> ${backup}/"
 
 # Alternatively `just up` runs the `mlflow` container UI on $MLFLOW_PORT (5000).
 # Browse MLflow experiment runs from the local file store (./data/mlflow).
@@ -313,7 +258,7 @@ rollback KIND VERSION="":
 journal-feed CAT DAYS="3":
     python3 tools/feed_log.py {{CAT}} --days {{DAYS}} --db {{journal_db}}
 
-# Run all tests (new stack, then training/review).
+# Run all tests (new stack, then training).
 [group('dev')]
 check:
     cd streamhub && go vet ./... && go test ./...
@@ -321,5 +266,5 @@ check:
     cd hubclient && uv run --quiet --python 3.12 --group dev pytest -q
     cd cv-worker && uv run --quiet --python 3.12 --group dev pytest -q
     cd decider && uv run --quiet --python 3.12 --group dev pytest -q
-    uv run --extra test python -m compileall -q training review tools
+    uv run --extra test python -m compileall -q training tools
     uv run --extra test pytest -q tests

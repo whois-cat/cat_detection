@@ -6,11 +6,13 @@ captures recordings + per-frame detection events; this package turns that
 on-disk data into datasets you can feed to a YOLO fine-tune (object
 detection) or a classifier (per-cat identity).
 
-> **Current workflow:** the classifier now trains from the YOLO catalog's
-> human-verified boxes (`just cat-groups` -> `just cat-label` -> `just cat-train`,
+> **Current workflow:** boxes and cat names are labelled together in Label
+> Studio (`just detector-label` -> `just detector-sync`); the classifier trains
+> from the named catalog boxes (`just classifier-stats` -> `just classifier-train`),
 > see [../REPO_CONTEXT.md](../REPO_CONTEXT.md#labeling-workflow) and
-> [YOLO_PIPELINE.md](YOLO_PIPELINE.md)). The `events.db` + recordings material
-> below describes the previous stack; those tools still accept `--db`/`--recordings`.
+> [YOLO_PIPELINE.md](YOLO_PIPELINE.md). The `events.db` + recordings material
+> below describes the previous stack; those tools still accept `--db`/`--recordings`
+> (with a reviews.db for labels).
 
 > If you are picking this up cold: read [../README.md](../README.md) first
 > to understand the rest of the system. The short version: a camera RTSP
@@ -189,164 +191,6 @@ standard in-repo classifier workflow below trains directly from recordings and
 
 ---
 
-## Recipe: cold-start cluster review — no old identity labels
-
-For a new classifier, do not trust the old model's names or probabilities.
-Use the detector score only as a gate for "there is probably a cat in this box",
-then cluster visually similar crops and label whole clusters. This writes no
-crop files: crops are decoded from recordings on demand and labels go into the
-separate `data/review/reviews.db`.
-
-Quick review workflow (copy-paste):
-
-```bash
-cd ~/compose-services/cat_detection_current
-
-# Start a clean review pass (MOVES the old reviews.db + clusters.json aside).
-CONFIRM=1 just cat-reset
-
-# Build a compact, review-only manifest (one episode = one cluster, deduped,
-# hard-capped at 16 crops per cluster).
-REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-RECORDING_TZ=UTC \
-just cat-groups \
-  --min-score 0.5 \
-  --mode time \
-  --episode-gap-sec 30 \
-  --dedupe-window-sec 10 \
-  --max-cluster-size 16
-
-# Bulk-label in the browser at http://localhost:8095
-REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-RECORDING_TZ=UTC \
-just cat-label 8095
-```
-
-The detailed stages below explain each step and its options.
-
-**Stage A — build the cluster manifest** (runs in a detector image because it
-already has PyAV/OpenCV/Numpy, and often torch via ultralytics). Low-confidence
-boxes are dropped first (`--min-score`, default 0.7).
-
-`--min-score` is the **detector** confidence ("there is probably a cat in this
-box"), NOT identity confidence — at cold start there is no trusted identity
-model yet, so the detector score is used only as a gate for which crops enter
-review. The manifest stores compact embeddings so mixed clusters can be split
-later in the browser.
-
-```bash
-REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-just cat-groups --min-score 0.7
-```
-
-If the live detector event pool is polluted by static false positives, rebuild
-review-only events from the recordings with the non-quantized YOLO path:
-
-```bash
-just train-rescan --conf 0.3 --imgsz 512 --sample-interval-sec 1
-just cat-groups --model offline-yolov8n --min-score 0.5 --clusters 100
-```
-
-`just cat-groups` writes `data/review/clusters.json` by default. Useful
-overrides: `EVENTS_DB`, `RECORDINGS_ROOT`, `CLUSTER_MANIFEST`, `RECORDING_TZ`,
-`--camera`, `--model`, `--clusters`, `--default-rotate-deg`.
-
-The manifest is review-only and compact: `--max-cluster-size` is a **hard cap**
-on the crops actually written per cluster (the rest are dropped, not hidden),
-and near-identical crops are deduped within a per-camera window first
-(`--dedupe-window-sec`, `--dedupe-threshold`, `--max-cluster-size`). So the
-manifest size is bounded by `clusters × max-cluster-size`: with ~600 clusters
-and `--max-cluster-size 16` expect roughly **5k–10k crops**, not the ~200k of
-the old "keep everything, hide most" manifests. The review UI shows and labels
-exactly the crops in the manifest. Use `--max-cluster-size 0` only when you
-really want every (deduped) crop in the review UI.
-
-Validate a generated manifest with `just label-validate` (hard cap respected,
-indices valid, no hidden/collapsed fields).
-
-Static false positives can be masked before review. Add tight
-`ignore_regions` to `cameras.yaml` only for hard false-positive objects such as
-the feeder body/lid: detections whose box is mostly covered by those
-camera-normalized regions are dropped by the detector and by
-`build_cluster_manifest`. Do not put the bowl/food area into `ignore_regions`,
-because that can remove real cat detections and future review crops. Use
-`food_region` for the bowl-level monitor instead; it is a soft observation zone
-and is not used by review/training filters. For one-off experiments, pass
-`--ignore-region grey:0.35,0.02,0.68,0.34`. Use tight regions so real cats next
-to or above the feeder are not removed. Tune the cutoff with
-`--ignore-region-min-coverage` (default `0.8`).
-
-Embedding choice:
-
-- `--embedding auto` (default) uses cached ImageNet EfficientNet-B0 features
-  when available, otherwise falls back to deterministic visual texture/color
-  features. This keeps the command usable offline.
-- `--embedding efficientnet --allow-download` lets torchvision fetch ImageNet
-  weights if the machine has network access.
-- `--embedding visual` is fastest and dependency-light, but mixed clusters are
-  more likely. Avoid `--no-store-embeddings` unless you do not need the split
-  button in the review UI.
-
-If review crops show unrelated frames or many `410 Gone` responses, first check
-timezone consistency. The Docker-side manifest builder and host-side review app
-must use the same `RECORDING_TZ` as mediamtx. The bundled `just` recipes default
-to `UTC`; override with `RECORDING_TZ=America/New_York` only if mediamtx was
-recording filenames in the server's EDT/EST timezone.
-
-**Stage B — bulk-label clusters** (host: needs `av` + FastAPI/Pillow).
-
-```bash
-just setup label                                  # once
-REVIEW_LABELS=alisa,chuzh,ellie,felisis \
-just cat-label 8095                           # http://localhost:8095
-```
-
-The page shows contact sheets per cluster. Label a pure cluster as one cat, mark
-junk as `discard`, mark uncertain crops as `unknown`, and split mixed clusters
-with `split x2` / `split x3` before labeling the child clusters. If a mixed
-cluster still is not worth splitting, mark it as `mixed` so it is not bulk-written
-into labels. Cluster labels are written as ordinary review rows keyed by
-`src_event_key`, so the training code consumes them without touching `events.db`.
-
-Corrections are **non-destructive**: they go to a *separate* writable
-`data/review/reviews.db` keyed by `src_event_key`, so the detector's rows in
-`events.db` are never touched and the database can stay read-only. Progress
-survives restart.
-
-Check label balance before training:
-
-```bash
-just cat-stats
-```
-
-The report shows trainable cat labels separately from dropped labels such as
-`discard` / `unknown`, includes zero-count expected cats from `REVIEW_LABELS`,
-and prints a simple `max/min` balance ratio.
-
-**Feeding corrections back into training.** `CropSource` carries each box's
-`events` rowid (`box.rowid` / `Sample.src_box.rowid`) and accepts a `reviews`
-map (`training.load_reviews("data/review/reviews.db")`): human labels are the
-only trusted identity labels for cold start, and `discard` / `unknown` crops are
-dropped. Unreviewed crops are ignored by `train_classifier.py` unless you
-explicitly opt into `--trust-classifier` later, after you already have a decent
-classifier.
-
-```bash
-# optional disk dataset (ImageFolder) with human labels; unreviewed crops are ignored:
-uv run python -m training.extract_classifier \
-    --recordings data/recordings --db data/events/events.db \
-    --out data/datasets/classifier --reviews-db data/review/reviews.db \
-    --min-score 0.7
-```
-
-```python
-# in-memory (no JPEGs), same review overlay:
-from training import CropSource, load_reviews
-src = CropSource(db, recordings, reviews=load_reviews("data/review/reviews.db"))
-```
-
----
-
 ## Recipe: train the identity classifier
 
 `train_classifier.py` trains a fresh EfficientNet-B0 from the recordings +
@@ -355,7 +199,7 @@ touch the runtime model — swapping is a later, separate step.
 
 ```bash
 just setup train
-just cat-train \
+just classifier-train \
     --confuse alisa,felisis \
     --pad-frac 0.15 \
     --min-recall 0.9
@@ -370,12 +214,12 @@ trainable params, and trainable/frozen param counts are logged at startup):
 - `--head-only` — **CPU-friendly**: only the classifier head trains; the backbone
   is a frozen feature extractor. Recommended low-RAM CPU combo:
   ```bash
-  just cat-train --head-only --batch-size 4 --batch-max-side 320 --num-workers 0
+  just classifier-train --head-only --batch-size 4 --batch-max-side 320 --num-workers 0
   ```
 - `--full-finetune` — the whole backbone (low LR). Passing `--head-only` with
   `--full-finetune` is rejected.
 
-`just cat-train` runs through the training uv project with the classifier
+`just classifier-train` runs through the training uv project with the classifier
 extra, so `numpy`, `av`, `torch`, and `torchvision` are installed by uv instead
 of being manually added to the system Python. On Linux, `torch` and
 `torchvision` are resolved from PyTorch's CPU-only wheel index; CUDA /
@@ -391,7 +235,7 @@ CPU); raise it when you have RAM headroom. If the machine is still tight, lower
 both:
 
 ```bash
-just cat-train --min-recall 0.85 --batch-size 4 --batch-max-side 320
+just classifier-train --min-recall 0.85 --batch-size 4 --batch-max-side 320
 ```
 
 RSS is logged before the dataset, after the first batch, and after each epoch.
@@ -439,8 +283,8 @@ What it does, and why each part:
   data captured under different — or later-changed — camera rotations trains
   together correctly. For events recorded before `rotate_deg` was persisted, pass
   `--default-rotate-deg <deg>` (one warning is logged). `rotate_deg=0` is a no-op.
-- **Crop framing.** `--pad-frac` MUST equal the detector `CLASSIFIER_PAD_FRAC`
-  and `build_cluster_manifest --pad-frac` (default 0.15 everywhere). The eval/val
+- **Crop framing.** `--pad-frac` MUST equal cv-worker's `CLASSIFIER_PAD_FRAC`
+  (0.05; the just recipes pass it). The eval/val
   transform is byte-identical to `detector/classifier.py::_preprocess`; only train
   augments (h-flip, small rotation, mild brightness/contrast, light
   random-resized-crop — no hard color jitter, since night IR is ~grayscale).
@@ -474,7 +318,7 @@ python detector/export_classifier.py \
 human-reviewed crops, with closed-set metrics and thresholded runtime behavior:
 
 ```bash
-just cat-compare \
+just classifier-compare \
     --candidate current=/opt/models/cat_classifier_openvino \
     --candidate new=models/trained/<stamp>/cat_classifier.pt \
     --baseline current \
@@ -495,7 +339,7 @@ active-learning queues, not as truth. Each week:
 1. Build/review new clusters for the recent time range.
 2. Update compact replay memory from human-reviewed crops.
 3. Train from fresh human labels plus replay memory.
-4. Compare current vs candidate with `cat-compare`.
+4. Compare current vs candidate with `classifier-compare`.
 5. Export/swap only after comparison is clean.
 
 Replay memory stores a small balanced set of compressed numpy crops (`.npz`),
@@ -514,7 +358,7 @@ To continue from the previous weekly classifier rather than ImageNet-only
 initialization, pass:
 
 ```bash
-just cat-train \
+just classifier-train \
     --init-from models/trained/<previous>/cat_classifier.pt \
     --replay-set data/replay
 ```
@@ -522,7 +366,7 @@ just cat-train \
 For regression checking against old memory:
 
 ```bash
-just cat-compare \
+just classifier-compare \
     --candidate current=/opt/models/cat_classifier_openvino \
     --candidate new=models/trained/<stamp>/cat_classifier.pt \
     --baseline current \
@@ -565,7 +409,7 @@ yolo train data=data/datasets/detector/data.yaml \
           model=yolov8n.pt imgsz=640 epochs=50
 ```
 
-The current path is [YOLO_PIPELINE.md](YOLO_PIPELINE.md): `just box-train`, then
+The current path is [YOLO_PIPELINE.md](YOLO_PIPELINE.md): `just detector-train`, then
 `just deploy detector <run>` (INT8 OpenVINO export with a quality gate).
 
 ---
@@ -615,11 +459,9 @@ training/
 ├── reviews.py        (load human corrections reviews.db → {rowid: label})
 ├── extract_classifier.py     (optional ImageFolder/JPG export from CropSource)
 ├── extract_detector.py       (one-shot script wrapping FullFrameSource)
-├── build_cluster_manifest.py (cold-start clustering manifest)
+├── streamhub_dataset.py      (detector-collect: frames + model suggestions → catalog)
+├── yolo_label_studio.py      (detector-label/-sync: boxes + cat names via Label Studio)
+├── catalog_crops.py          (named catalog boxes → classifier crops; classifier-stats)
+├── notify.py                 (optional Telegram message)
 └── train_classifier.py       (train identity classifier; best-by-val → models/trained/)
-
-../review/            (FastAPI bulk cat-label app; `just cat-label`)
-├── cluster_app.py    (bulk cluster labels; corrections → reviews.db)
-├── static/cluster.html
-└── requirements.txt  (fastapi/uvicorn/av/numpy/Pillow — no openvino/torch)
 ```

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -123,6 +125,8 @@ def _collector_args(**overrides):
         "jpeg_quality": 90,
         "budget_gb": 5.0,
         "min_per_camera_day": 2,
+        "reviewed_budget_gb": 4.0,
+        "keep_min_reviewed": 20,
         "cameras": ["black"],
         "tags": [],
     }
@@ -324,6 +328,21 @@ def test_main_writes_atomic_completed_report_without_video(tmp_path: Path):
     assert list(report_path.parent.glob("*.tmp")) == []
 
 
+def test_main_last_days_on_all_configured_cameras(tmp_path: Path):
+    config = tmp_path / "config.yaml"
+    config.write_text("cameras:\n  - id: black\n    cv: {}\n  - id: grey\n    cv: {}\n")
+    report_path = tmp_path / "collector.json"
+    common = ["--recordings", str(tmp_path / "recordings"), "--config", str(config),
+              "--out", str(tmp_path / "dataset"), "--report-json", str(report_path)]
+    assert main([*common, "--days", "7"]) == 0
+    report = json.loads(report_path.read_text())
+    assert report["cameras"] == ["black", "grey"]
+    span = datetime.fromisoformat(report["to"]) - datetime.fromisoformat(report["from"])
+    assert span == timedelta(days=7)
+    with pytest.raises(ValueError, match="either --days"):
+        main([*common, "--days", "7", "--from", "2026-10-01"])
+
+
 def test_main_records_interruption(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text("cameras:\n  - id: black\n    cv: {}\n")
@@ -345,3 +364,83 @@ def test_main_records_interruption(tmp_path: Path, monkeypatch):
     ])
     assert result == 130
     assert json.loads(report_path.read_text())["status"] == "interrupted"
+
+
+def _reviewed(conn, root: Path, sid: str, *, wall_ms: int, name: str | None = "ellie",
+              dhash: str = "0" * 16, visit: str = "v1", corrected: bool = False,
+              camera: str = "black") -> None:
+    rel = Path("images") / camera / f"{sid}.jpg"
+    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+    (root / rel).write_bytes(b"x" * 100)
+    conn.execute(
+        """INSERT INTO samples(sample_id,camera,segment_relpath,pts,wall_ms,visit_group,
+             image_relpath,width,height,jpeg_bytes,sha256,dhash,reasons_json,rotate_deg,
+             status,protected,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (sid, camera, "s.mp4", wall_ms * 90, wall_ms, visit, rel.as_posix(), 100, 100, 100,
+         "h" + sid, dhash, "[]", 0, "verified", 1, 0),
+    )
+    if name is not None:
+        conn.execute(
+            "INSERT INTO annotations(sample_id,annotation_id,class_name,x,y,w,h,source,"
+            "updated_at_ms,cat_name) VALUES(?,1,'cat',10,10,40,40,'ls',0,?)", (sid, name))
+    suggested = [{"box": [0.1, 0.1, 0.4, 0.4], "cats": {"alisa" if corrected else (name or "x"): 0.9}}]
+    conn.execute("INSERT INTO predictions(sample_id,detections_json) VALUES(?,?)",
+                 (sid, json.dumps(suggested if name is not None else [])))
+    conn.commit()
+
+
+def test_thinning_retires_duplicates_first_and_keeps_corrections(tmp_path: Path):
+    from training.streamhub_dataset import thin_reviewed
+    conn = open_catalog(tmp_path / "catalog.sqlite3")
+    day = 86_400_000
+    _reviewed(conn, tmp_path, "first", wall_ms=1 * day)
+    _reviewed(conn, tmp_path, "dup", wall_ms=1 * day + 1000)               # same look, same visit
+    _reviewed(conn, tmp_path, "other_visit", wall_ms=2 * day, visit="v2", dhash="f" * 16)
+    _reviewed(conn, tmp_path, "fixed", wall_ms=3 * day, visit="v3", dhash="0f" * 8, corrected=True)
+    retired, freed = thin_reviewed(conn, tmp_path, budget_bytes=300, keep_min=1)
+    assert (retired, freed) == (1, 100)
+    status = dict(conn.execute("SELECT sample_id,status FROM samples"))
+    assert status["dup"] == "retired" and not (tmp_path / "images/black/dup.jpg").exists()
+    # Over budget again: oldest first, the correction never (it also keeps the
+    # bucket at keep_min on its own).
+    thin_reviewed(conn, tmp_path, budget_bytes=100, keep_min=1)
+    status = dict(conn.execute("SELECT sample_id,status FROM samples"))
+    assert status["fixed"] == "verified"
+    assert status["first"] == status["other_visit"] == "retired"
+    conn.close()
+
+
+def test_thinning_keeps_a_minimum_per_cat_camera_and_month(tmp_path: Path):
+    from training.streamhub_dataset import thin_reviewed
+    conn = open_catalog(tmp_path / "catalog.sqlite3")
+    for i in range(5):
+        _reviewed(conn, tmp_path, f"e{i}", wall_ms=i * 3_600_000, visit=f"e{i}", dhash=f"{i:016x}")
+    _reviewed(conn, tmp_path, "rare", wall_ms=10, name="alisa", visit="r", dhash="f" * 16)
+    _reviewed(conn, tmp_path, "empty", wall_ms=20, name=None, visit="n", dhash="e" * 16)
+    thin_reviewed(conn, tmp_path, budget_bytes=0, keep_min=2)
+    left = {r[0] for r in conn.execute("SELECT sample_id FROM samples WHERE status='verified'")}
+    assert left == {"e3", "e4", "rare", "empty"}     # newest ellie kept, rare cat and empty kept
+    conn.close()
+
+
+def test_retired_frames_free_budget_and_are_never_pushed_again(tmp_path: Path):
+    from training.yolo_label_studio import _pending_tasks
+    conn = open_catalog(tmp_path / "catalog.sqlite3")
+    _reviewed(conn, tmp_path, "gone", wall_ms=1)
+    conn.execute("UPDATE samples SET status='retired' WHERE sample_id='gone'")
+    conn.commit()
+    assert _pending_tasks(conn, ["ellie", "unknown"]) == []
+    assert enforce_budget(conn, tmp_path, budget_bytes=0) == (0, 0)
+    conn.close()
+
+
+def test_version_hardlinks_to_catalog_images_take_no_extra_space(tmp_path: Path):
+    image = tmp_path / "images/black/a.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"x" * 100)
+    linked = tmp_path / "versions/v1/images/train/a.jpg"
+    linked.parent.mkdir(parents=True)
+    os.link(image, linked)
+    assert derived_storage_bytes(tmp_path) == 0
+    image.unlink()                                  # only the version holds it now
+    assert derived_storage_bytes(tmp_path) == 100

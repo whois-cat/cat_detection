@@ -114,7 +114,7 @@ def require_min_classes(classes: list[str]) -> None:
     if len(classes) < 2:
         raise SystemExit(
             "need at least 2 labeled classes to train the identity classifier; "
-            f"found classes: {classes}. Review more crops (just cat-label) or "
+            f"found classes: {classes}. Name more boxes (just detector-label) or "
             "check your drop labels / review labels."
         )
 
@@ -799,13 +799,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--catalog", type=Path, default=None,
-                    help="YOLO catalog.sqlite3: train on its human-verified boxes "
+                    help="YOLO catalog.sqlite3: train on its human-verified boxes, "
+                         "labelled with the cat names picked in Label Studio "
                          "(replaces the legacy --db + --recordings source)")
     ap.add_argument("--db", type=Path, default=None, help="legacy: previous stack's events.db")
     ap.add_argument("--recordings", type=Path, default=None,
                     help="legacy: previous stack's recordings root")
     ap.add_argument("--reviews-db", type=Path, default=None,
-                    help="reviews.db with human corrections (strongly recommended)")
+                    help="legacy --db source only: reviews.db with the human labels")
     ap.add_argument("--camera", default=None)
     ap.add_argument("--model", default=None, help="detector model filter (default: all)")
     ap.add_argument("--confuse", default="",
@@ -840,8 +841,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="same-camera timestamp window (s) for near-duplicate "
                          "replay-vs-eval leakage detection")
     ap.add_argument("--pad-frac", type=float, default=0.15,
-                    help="crop context padding — MUST match the detector "
-                         "CLASSIFIER_PAD_FRAC and build_cluster_manifest --pad-frac")
+                    help="crop context padding — MUST match cv-worker's "
+                         "CLASSIFIER_PAD_FRAC (the just recipes pass it)")
     ap.add_argument("--default-rotate-deg", type=int, default=0,
                     help="rotation to assume for events recorded BEFORE rotate_deg "
                          "was persisted (set to the camera's rotate_deg then)")
@@ -976,9 +977,9 @@ def main() -> None:
                  ", ".join(f"{d.actual}->{d.predicted}" for d in dangerous))
 
     # --- collect crop refs/metadata only; pixels are decoded per batch later ---
-    review_rows = load_review_rows(args.reviews_db) if args.reviews_db else {}
+    review_rows = load_review_rows(args.reviews_db) if args.reviews_db and args.catalog is None else {}
     reviews = {key: row.label for key, row in review_rows.items()}
-    if not review_rows and args.reviews_db:
+    if not review_rows and args.reviews_db and args.catalog is None:
         reviews = load_reviews(args.reviews_db)
     log.info("loaded %d human corrections", len(reviews))
 
@@ -997,26 +998,16 @@ def main() -> None:
     unavailable = 0
     warned_missing_rotate = False
     if args.catalog is not None:
-        # Verified catalog boxes; identity comes ONLY from human reviews (there is
-        # no stored classifier guess to --trust here).
+        # Verified catalog boxes, labelled with the cat name picked for each box
+        # in Label Studio (never a classifier guess); unnamed boxes are skipped.
         for crop in load_catalog_crops(args.catalog, camera=args.camera):
             scanned += 1
-            review_row = review_rows.get(crop.key)
-            human = review_row.label if review_row is not None else reviews.get(crop.key)
-            label = decide_label(None, None, human, False, args.trust_conf)
+            label = decide_label(None, None, crop.name, False, args.trust_conf)
             if label is None:
                 continue
             x, y, w, h = crop.box
             box = Box(x=x, y=y, w=w, h=h, cat=None, score=1.0, track_id=None, rowid=crop.key)
-            meta = Meta(
-                label=label, camera=crop.camera, wall_ms=crop.wall_ms, rowid=crop.key,
-                duplicate_group_id=(
-                    review_row.duplicate_group_id if review_row is not None else None),
-                suspicious_score=(
-                    review_row.suspicious_score if review_row is not None else 0.0),
-                sampling_reason=(
-                    review_row.sampling_reason if review_row is not None else None),
-            )
+            meta = Meta(label=label, camera=crop.camera, wall_ms=crop.wall_ms, rowid=crop.key)
             ref = CatalogCropRef(crop.camera, crop.wall_ms, box, crop.image_relpath)
             fresh_items.append(TrainItem(meta=meta, ref=ref, image=None, replay=None))
     conn = open_db_ro(args.db) if args.catalog is None else None

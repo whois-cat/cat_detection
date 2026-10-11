@@ -22,13 +22,18 @@ Key properties:
 - **Leakage guard.** Exact-duplicate images are de-duplicated before splitting;
   near-duplicates (dhash) across splits are counted and reported.
 - **No image copies.** Images are hardlinked from the catalog store, so a
-  version costs kilobytes of labels/metadata, not a second copy of every frame.
+  version costs kilobytes of labels/metadata, not a second copy of every frame
+  — until the catalog thins a frame out: then the version alone holds it.
+- **Few versions kept.** After a build, versions other than the newest
+  ``--keep-versions`` and the ones the deployed detector (current and previous)
+  was trained on are deleted, so thinned-out frames really free their space.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -334,6 +339,40 @@ def record_version(conn, version_id: str, version_dir: Path, manifest_hash: str,
     conn.commit()
 
 
+def deployed_datasets(models_root: Path) -> set[str]:
+    """Dataset versions the deployed detector (current and previous) was trained on."""
+    keep = set()
+    for link in ("current", "previous"):
+        meta = models_root / "detector" / link / "metadata.json"
+        try:
+            dataset = json.loads(meta.read_text(encoding="utf-8")).get("dataset")
+        except (OSError, ValueError):
+            continue
+        if dataset:
+            keep.add(dataset)
+    return keep
+
+
+def prune_versions(catalog: Path, versions_dir: Path, *, keep_newest: int,
+                   keep: set[str] = frozenset()) -> list[str]:
+    """Delete dataset versions other than the newest ``keep_newest`` and ``keep``."""
+    versions = sorted(p.name for p in versions_dir.iterdir()
+                      if p.is_dir() and not p.name.startswith(".")) if versions_dir.is_dir() else []
+    doomed = [v for v in versions[:max(0, len(versions) - keep_newest)] if v not in keep]
+    if not doomed:
+        return []
+    conn = open_catalog(catalog)
+    try:
+        for version in doomed:
+            shutil.rmtree(versions_dir / version)
+            conn.execute("DELETE FROM dataset_version_samples WHERE version_id=?", (version,))
+            conn.execute("DELETE FROM dataset_versions WHERE version_id=?", (version,))
+        conn.commit()
+    finally:
+        conn.close()
+    return doomed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", type=Path, default=Path("data/yolo_dataset/catalog.sqlite3"))
@@ -350,6 +389,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-groups", type=int, default=6,
                         help="warn below this many independent visit groups")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--keep-versions", type=int, default=2,
+                        help="keep this many newest versions (plus the deployed detector's); "
+                             "older ones are deleted. 0 keeps everything")
+    parser.add_argument("--models-root", type=Path, default=Path("models"),
+                        help="where models/detector/{current,previous} live")
     return parser
 
 
@@ -362,6 +406,12 @@ def main(argv: list[str] | None = None) -> int:
         group_gap_sec=args.group_gap_sec, dup_threshold=args.dup_threshold,
         min_groups=args.min_groups, seed=args.seed, version_id=args.version_id,
     )
+    if args.keep_versions > 0:
+        keep = deployed_datasets(args.models_root)
+        for version in prune_versions(args.catalog, out, keep_newest=args.keep_versions, keep=keep):
+            print(f"  removed old dataset version {version}")
+        if keep:
+            print(f"  kept for the deployed detector: {', '.join(sorted(keep))}")
     return 0
 
 

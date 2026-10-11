@@ -59,9 +59,11 @@ feeder services are stopped (see Migration).
 ### Commands
 
 `just up | down | ps | logs [service] | status | check`, `just webui-dev` (hot
-reload against a running streamhub). Labeling/training: `just box-*` (where is
-the cat: collect, label boxes, train YOLO) and `just cat-*` (which cat: group,
-name, train the classifier); `just` lists them in pipeline order.
+reload against a running streamhub). Labeling/training: `just detector-*`
+(collect frames, label boxes and cat names in Label Studio, train YOLO;
+`just detector-round 7` collects and queues a week) and `just classifier-*`
+(train the cat-identity classifier from the named boxes); `just` lists them in
+pipeline order.
 
 ## Migration from the previous stack
 

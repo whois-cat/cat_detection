@@ -35,7 +35,8 @@ def _insert_sample(conn, root: Path, *, sample_id: str, camera: str, wall_ms: in
     )
     for index, (x, y, w, h) in enumerate(boxes, 1):
         conn.execute(
-            "INSERT INTO annotations VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO annotations(sample_id,annotation_id,class_name,x,y,w,h,source,"
+            "updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?)",
             (sample_id, index, "cat", x, y, w, h, "human_cvat", 0),
         )
 
@@ -123,3 +124,21 @@ def test_build_version_refuses_without_reviewed_samples(tmp_path: Path):
         build_version(root / "catalog.sqlite3", root, root / "versions",
                       val_frac=0.15, test_frac=0.15, group_gap_sec=120.0,
                       dup_threshold=3, min_groups=1, seed=1)
+
+
+def test_old_versions_are_pruned_except_the_deployed_ones(tmp_path: Path):
+    from training.yolo_build_version import deployed_datasets, prune_versions
+    catalog = tmp_path / "catalog.sqlite3"
+    open_catalog(catalog).close()
+    versions = tmp_path / "versions"
+    for name in ("v20261001-a", "v20261005-b", "v20261008-c", "v20261011-d"):
+        (versions / name / "images").mkdir(parents=True)
+    models = tmp_path / "models" / "detector"
+    (models / "versions" / "yolo-1").mkdir(parents=True)
+    (models / "versions" / "yolo-1" / "metadata.json").write_text('{"dataset": "v20261001-a"}')
+    (models / "current").symlink_to("versions/yolo-1")
+    keep = deployed_datasets(tmp_path / "models")
+    assert keep == {"v20261001-a"}
+    removed = prune_versions(catalog, versions, keep_newest=2, keep=keep)
+    assert removed == ["v20261005-b"]
+    assert sorted(p.name for p in versions.iterdir()) == ["v20261001-a", "v20261008-c", "v20261011-d"]

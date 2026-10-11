@@ -64,7 +64,7 @@ def test_single_class_version_is_rejected_with_rebuild_hint(tmp_path: Path):
         "manifest_sha256": hashlib.sha256(
             json.dumps(samples, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
     }))
-    with pytest.raises(ValueError, match="box-build"):
+    with pytest.raises(ValueError, match="detector-build"):
         load_dataset(dataset.version_dir)
 
 

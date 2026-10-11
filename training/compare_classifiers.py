@@ -3,13 +3,12 @@
 Examples:
 
     uv run python -m training.compare_classifiers \
-        --db data/events/events.db \
-        --recordings data/recordings \
-        --reviews-db data/review/reviews.db \
-        --candidate current=/opt/models/cat_classifier_openvino \
+        --catalog data/yolo_dataset/catalog.sqlite3 \
+        --candidate current=models/classifier/current \
         --candidate new=models/trained/20260612-120000/cat_classifier.pt
 
-The evaluator trusts only reviews.db labels. It decodes crops from recordings in
+The evaluator trusts only human labels: the cat names picked in Label Studio
+(catalog), or reviews.db for the legacy --db source. It decodes crops in
 memory and reports closed-set metrics plus thresholded runtime behavior. Replay
 sets are reported separately as forgetting/regression memory, not blended into
 the headline promotion metrics.
@@ -192,7 +191,8 @@ def main() -> None:
     ap.add_argument("--db", type=Path, default=None, help="legacy: previous stack's events.db")
     ap.add_argument("--recordings", type=Path, default=None,
                     help="legacy: previous stack's recordings root")
-    ap.add_argument("--reviews-db", type=Path, required=True)
+    ap.add_argument("--reviews-db", type=Path, default=None,
+                    help="legacy --db source only: reviews.db with the human labels")
     ap.add_argument("--candidate", action="append", type=parse_candidate, required=True,
                     help="NAME=PATH; PATH is trained .pt or OpenVINO classifier dir")
     ap.add_argument("--baseline", default=None, help="candidate name to compare against")
@@ -211,12 +211,14 @@ def main() -> None:
     args = ap.parse_args()
     if args.catalog is None and (args.db is None or args.recordings is None):
         ap.error("pass --catalog, or the legacy --db + --recordings")
+    if args.catalog is None and args.reviews_db is None:
+        ap.error("the legacy --db source needs --reviews-db")
 
     from training import CropSource, CropUnavailable, load_reviews
     from training.replay import load_replay_set
 
     thresholds = [float(v) for v in args.thresholds.split(",") if v.strip()]
-    review_labels = load_reviews(args.reviews_db)
+    review_labels = load_reviews(args.reviews_db) if args.catalog is None else {}
     candidates = [(name, load_model(path)) for name, path in args.candidate]
 
     src = None if args.catalog is not None else CropSource(
@@ -236,7 +238,7 @@ def main() -> None:
     if args.catalog is not None:
         from training.catalog_crops import load_catalog_crops, read_catalog_crop
         for crop in load_catalog_crops(args.catalog, camera=args.camera):
-            label = review_labels.get(crop.key)
+            label = crop.name     # picked in Label Studio
             if label is None or label in DROP_LABELS:
                 continue
             try:

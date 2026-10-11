@@ -34,7 +34,7 @@ Full, un-annotated frames. Sidecar detections are **hints only** (selection
 reasons), never labels. Resumable and incremental (safe to re-run / cron).
 
 ```bash
-just box-collect \
+just detector-collect \
   --camera black,grey \
   --from 2026-10-01 --to 2026-10-02 \
   --tag shaved           # optional range tag, e.g. the shaved-cat period
@@ -48,7 +48,20 @@ separate table from any future human labels.
 Key knobs (all have defaults; see `--help`):
 `--candidate-interval-sec 5`, `--regular-interval-sec 300`, `--visit-gap-sec 90`,
 `--visit-sample-interval-sec 20`, `--max-visit-samples 6`, `--dedupe-threshold 3`,
-`--low-confidence 0.35`, `--budget-gb 5`, `--report-json run.json`.
+`--low-confidence 0.35`, `--budget-gb 5`, `--reviewed-budget-gb 4`,
+`--keep-min-reviewed 20`, `--report-json run.json`.
+
+**Storage limit.** `--budget-gb` caps the whole image store; reviewed frames get
+`--reviewed-budget-gb` of it, the rest holds frames waiting for review (the
+oldest, least interesting unreviewed ones are dropped first). When reviewed
+frames outgrow their share, the least useful are *retired* (image deleted, row
+kept as `status='retired'` so the frame is never collected again): first
+near-duplicates within a visit, then the oldest frames of whichever (camera,
+cat name, month) group is largest. Never retired: frames where you corrected
+the models (moved/added/removed a box, changed a name), and the last
+`--keep-min-reviewed` frames of any (camera, cat name, month) group — so every
+cat, camera and season stays represented. Dataset versions hold hardlinks, so a
+retired frame frees its space once no kept version uses it (see section 3).
 
 A **visit** is a run of activity (a YOLO detection **or** frame-to-frame motion
 **or** low confidence **or** multiple boxes) with gaps `< --visit-gap-sec`; so
@@ -59,18 +72,20 @@ not depend on YOLO.
 Check the queue any time (read-only):
 
 ```bash
-just box-queue
+just detector-queue
 ```
 
-## 2. Label boxes in the browser (Label Studio, under the hood)
+## 2. Label boxes and cat names in the browser (Label Studio, under the hood)
 
 No COCO, no zips, no manual config. Label Studio runs locally and serves the
-collected frames straight from the catalog folder; the model's boxes are
-pre-filled as suggestions.
+collected frames straight from the catalog folder; the live models' boxes and,
+per box, the classifier's cat name are pre-filled as suggestions. Set the cat
+names once in `.env`: `CAT_NAMES=alisa,chuzh,ellie,felisis` (`unknown` is added
+for "a cat, not sure which").
 
 **First time only** — start it and get an access token:
 ```bash
-just box-label        # starts Label Studio at http://localhost:8080 (localhost only)
+just detector-label        # starts Label Studio at http://localhost:8080 (localhost only)
 # open it (SSH tunnel if remote: ssh -L 8080:localhost:8080 <server>), log in with
 # LABEL_STUDIO_USERNAME/PASSWORD from .env, then copy
 # Account & Settings -> Access Token into .env as LABEL_STUDIO_API_KEY
@@ -78,24 +93,37 @@ just box-label        # starts Label Studio at http://localhost:8080 (localhost 
 
 **Each round:**
 ```bash
-just box-label           # starts LS if needed + pushes unreviewed frames (with suggestions)
+just detector-label           # starts LS if needed + pushes unreviewed frames (with suggestions)
 # in the project click "Label All Tasks": Submit (Ctrl/Cmd+Enter) then moves to the
 # next frame. Opening a single task from the table does NOT auto-advance.
 # label in the browser: one box per cat (head + body), class `cat`; fix/add/delete.
-# no cat names here — which cat it is gets labelled later with `just cat-label`.
+# select a box to see "Which cat?" and pick its name (keys 1..n); every box needs one.
 # a frame submitted with no box = confirmed-empty negative. Untouched = stays unreviewed.
-just box-sync            # pull submitted boxes back into the catalog (verified)
+just detector-sync            # pull submitted boxes + names back into the catalog (verified)
 ```
 
-Frames are pushed hardest first (`priority` column: 0 model unsure, 1 several
-boxes, 2 visual change, 3 visit sample, 4 regular), so the first few hundred
-teach the model the most. Tasks pushed before priorities existed get the column
-patched in on the next push; sort the Data Manager by `priority` before "Label
-All Tasks" to walk them in that order.
+Frames are pushed hardest first (`priority` column: 0 detector unsure, 1
+classifier unsure of a name, 2 several boxes, 3 visual change, 4 visit sample,
+5 regular, 6 names only), so the first few hundred teach the models the most.
+Unlabelled tasks still holding an older suggestion are re-imported with the
+current one; others get the column patched on the next push. Sort the Data
+Manager by `priority` before "Label All Tasks" to walk them in that order.
+
+Frames verified before names existed keep their boxes but have no names:
+`just detector-label --reopen-unnamed` queues them again ("names only", last)
+with the boxes as they were and the names suggested; the old Label Studio tasks
+are backed up to `data/yolo_dataset/label_studio_backups/` and replaced. Until
+such a frame is submitted again, the catalog keeps its boxes.
+
+**Regular rounds:** `just detector-round 7` = `detector-collect --days 7` (all
+cameras) + `detector-label --notify`; with `TELEGRAM_BOT_TOKEN` and
+`TELEGRAM_CHAT_ID` in `.env` it messages how many frames wait and how many the
+models are unsure about, with a link (`LABEL_STUDIO_PUBLIC_URL`). Weekly from
+cron is plenty; frames only train after you submit them.
 
 Because the model pre-fills boxes, most frames are "accept/adjust", and you only
-draw from scratch where YOLO was wrong. `just box-label --limit 300` pushes a
-smaller first batch. Stop the server with `just box-label-stop` (projects and
+draw from scratch where YOLO was wrong. `just detector-label --limit 300` pushes a
+smaller first batch. Stop the server with `just detector-label-stop` (projects and
 labels persist in a docker volume).
 
 > Label Studio itself is a third-party service pinned in `docker-compose.label.yml`.
@@ -106,11 +134,15 @@ labels persist in a docker volume).
 ## 3. Build an immutable dataset version
 
 ```bash
-just box-build --val-frac 0.15 --test-frac 0.15
+just detector-build --val-frac 0.15 --test-frac 0.15
 ```
 
 - Splits by **visit group across all cameras** (related observations of one
   visit never straddle train/val/test).
+- Keeps only the newest `--keep-versions` (2) versions plus the ones the
+  deployed detector (`current`, `previous`) was trained on; older ones are
+  deleted. Deploy needs the version a run was trained on, so deploy a run
+  before building two newer versions.
 - Group→split assignment is **stable** (hash of the group id), so adding data
   later does not reshuffle existing groups.
 - Exact-duplicate images are de-duplicated before the split; near-duplicates
@@ -132,7 +164,7 @@ Output: `data/yolo_dataset/versions/<version_id>/` with `data.yaml`,
 ## 4. Fine-tune (from a pretrained `.pt`, not an INT8 export)
 
 ```bash
-just box-train \
+just detector-train \
   --dataset data/yolo_dataset/versions/<version_id> \
   --weights yolov8n.pt \
   --imgsz 640 --epochs 50 --device cpu
@@ -151,12 +183,12 @@ bases:
 - from the previous fine-tune (incremental): `--weights models/trained/<prev>/weights/best.pt`.
 
 **Mixing in old versions (anti-forgetting).** Verified samples stay in the
-catalog, so a fresh `box-build` already includes old visits. When you
+catalog, so a fresh `detector-build` already includes old visits. When you
 train on a version that does *not* contain older appearances (e.g. a recent-only
 version), mix them back with `--replay-version` (repeatable):
 
 ```bash
-just box-train \
+just detector-train \
   --dataset data/yolo_dataset/versions/<recent> \
   --weights yolov8n.pt \
   --replay-version data/yolo_dataset/versions/<older> \
@@ -171,9 +203,9 @@ group) are dropped, so mixing never inflates evaluation. The run report records
 ## 5. Evaluate / compare base .pt vs INT8
 
 ```bash
-just box-eval --dataset <version> --model models/trained/<run>/weights/best.pt
+just detector-eval --dataset <version> --model models/trained/<run>/weights/best.pt
 # tell model vs export error apart:
-just box-eval --dataset <version> --model <openvino_int8_dir>
+just detector-eval --dataset <version> --model <openvino_int8_dir>
 ```
 
 Reports precision/recall/mAP50/mAP50-95, operational TP/FP/FN at a fixed
@@ -184,7 +216,7 @@ and offline inference timing (explicitly **not** end-to-end feeder latency).
 ## 6. Compare two runs
 
 ```bash
-just box-compare models/trained/<run_a>/report.json models/trained/<run_b>/report.json
+just detector-compare models/trained/<run_a>/report.json models/trained/<run_b>/report.json
 ```
 
 ## Deploying (separate, deliberate decision)

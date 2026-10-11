@@ -250,7 +250,7 @@ def load_dataset(path: Path, *, require_splits: tuple[str, ...] = ()) -> Dataset
         raise ValueError(
             f"dataset version {version_dir.name} does not use the COCO class numbering "
             f"(cat = {CAT_CLASS_ID}); it was built before the switch. Rebuild it with "
-            "`just box-build` (same split) and retrain."
+            "`just detector-build` (same split) and retrain."
         )
 
     per_split = {split: 0 for split in ("train", "val", "test")}

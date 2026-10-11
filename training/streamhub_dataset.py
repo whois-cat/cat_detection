@@ -14,7 +14,7 @@ import sqlite3
 import stat as stat_module
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -191,6 +191,17 @@ def hamming(left: int | None, right: int) -> int:
     return 64 if left is None else (left ^ right).bit_count()
 
 
+def box_iou(a, b) -> float:
+    """IoU of two ``(x, y, w, h)`` boxes in the same units."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
 def stable_id(camera: str, pts: int) -> str:
     raw = f"streamhub-v1\0{camera}\0{pts}".encode()
     return hashlib.sha256(raw).hexdigest()[:24]
@@ -264,6 +275,7 @@ def open_catalog(path: Path) -> sqlite3.Connection:
           annotation_id INTEGER NOT NULL, class_name TEXT NOT NULL,
           x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
           source TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
+          cat_name TEXT,
           PRIMARY KEY(sample_id,annotation_id)
         );
         CREATE TABLE IF NOT EXISTS dataset_versions(
@@ -280,6 +292,10 @@ def open_catalog(path: Path) -> sqlite3.Connection:
     sample_columns = {row[1] for row in conn.execute("PRAGMA table_info(samples)")}
     if "tags_json" not in sample_columns:
         conn.execute("ALTER TABLE samples ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'")
+    # Which cat a verified box is (Label Studio), NULL until someone names it.
+    annotation_columns = {row[1] for row in conn.execute("PRAGMA table_info(annotations)")}
+    if "cat_name" not in annotation_columns:
+        conn.execute("ALTER TABLE annotations ADD COLUMN cat_name TEXT")
     batch_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_batch_samples)")}
     if "was_protected" not in batch_columns:
         conn.execute(
@@ -582,9 +598,12 @@ def _eviction_priority(row: sqlite3.Row) -> tuple[int, int]:
 
 
 def derived_storage_bytes(out_root: Path) -> int:
-    """Count persistent model-image/version files once, without following symlinks."""
-    total = 0
-    seen: set[tuple[int, int]] = set()
+    """Disk space of model-image/version files beyond the catalog images.
+
+    Version images are hardlinks: a file still linked from the catalog takes no
+    extra space, so only files whose every link lives under these directories
+    count (each once). Symlinks are not followed."""
+    links: dict[tuple[int, int], list[int]] = {}   # inode -> [links seen, nlink, size]
     for directory in (out_root / "model_images", out_root / "versions"):
         if not directory.exists():
             continue
@@ -596,23 +615,160 @@ def derived_storage_bytes(out_root: Path) -> int:
             if not stat_module.S_ISREG(file_stat.st_mode):
                 continue
             identity = (int(file_stat.st_dev), int(file_stat.st_ino))
-            if identity in seen:
-                continue
-            seen.add(identity)
-            total += int(file_stat.st_size)
-    return total
+            entry = links.setdefault(
+                identity, [0, int(file_stat.st_nlink), int(file_stat.st_size)])
+            entry[0] += 1
+    return sum(size for seen, nlink, size in links.values() if seen >= nlink)
+
+
+def _suggested_name(cats: dict | None) -> str | None:
+    return max(cats, key=cats.get) if cats else None
+
+
+def was_corrected(boxes: list[tuple], dets: list[dict], width: int, height: int) -> bool:
+    """Did the reviewer change the models' suggestion: a box added, removed or
+    moved (IoU < 0.7), or a cat name that differs from the suggested one?"""
+    suggested = []
+    for det in dets or []:
+        try:
+            x, y, w, h = (float(v) for v in det["box"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if w > 0 and h > 0:
+            suggested.append(((x * width, y * height, w * width, h * height),
+                              _suggested_name(det.get("cats"))))
+    if len(suggested) != len(boxes):
+        return True
+    for x, y, w, h, name in boxes:
+        box, suggested_name = max(suggested, key=lambda s: box_iou((x, y, w, h), s[0]))
+        if box_iou((x, y, w, h), box) < 0.7:
+            return True
+        if name and suggested_name and name != suggested_name:
+            return True
+    return False
+
+
+def _retire(conn: sqlite3.Connection, out_root: Path, sample_id: str, image_relpath: str) -> None:
+    """Drop a reviewed frame's image but keep its row (status 'retired'): dataset
+    versions that used it stay consistent and the frame is never collected again."""
+    (out_root / image_relpath).unlink(missing_ok=True)
+    conn.execute("UPDATE samples SET status='retired' WHERE sample_id=?", (sample_id,))
+    conn.commit()
+
+
+def thin_reviewed(conn: sqlite3.Connection, out_root: Path, budget_bytes: int,
+                  keep_min: int = 20, dup_threshold: int = 3) -> tuple[int, int]:
+    """Retire reviewed frames until they fit ``budget_bytes``, least useful first.
+
+    Never retired: frames where the reviewer corrected the models (a box or a
+    name), and the last ``keep_min`` frames of any (camera, cat name, month)
+    bucket ("empty" for frames without cats), so no cat, camera or season
+    disappears. Otherwise retired first: near-duplicates within a visit (same
+    cats, dhash distance <= dup_threshold), then the oldest frame of the
+    currently largest bucket."""
+    rows = conn.execute(
+        "SELECT sample_id,camera,wall_ms,visit_group,image_relpath,jpeg_bytes,dhash,width,height "
+        "FROM samples WHERE status='verified' ORDER BY wall_ms"
+    ).fetchall()
+    total = sum(int(row["jpeg_bytes"]) for row in rows)
+    if total <= budget_bytes:
+        return 0, 0
+    frames = []
+    for row in rows:
+        boxes = [tuple(b) for b in conn.execute(
+            "SELECT x,y,w,h,cat_name FROM annotations WHERE sample_id=? ORDER BY annotation_id",
+            (row["sample_id"],))]
+        pred = conn.execute("SELECT detections_json FROM predictions WHERE sample_id=?",
+                            (row["sample_id"],)).fetchone()
+        dets = json.loads(pred[0]) if pred and pred[0] else []
+        month = datetime.fromtimestamp(int(row["wall_ms"]) / 1000, timezone.utc).strftime("%Y-%m")
+        names = sorted({b[4] or "cat" for b in boxes}) or ["empty"]
+        frames.append({
+            "row": row, "names": tuple(names),
+            "buckets": [(row["camera"], name, month) for name in names],
+            "corrected": was_corrected(boxes, dets, int(row["width"]), int(row["height"])),
+        })
+    counts: dict[tuple, int] = {}
+    for frame in frames:
+        for bucket in frame["buckets"]:
+            counts[bucket] = counts.get(bucket, 0) + 1
+
+    # Near-duplicates: a later frame of the same visit and cats that looks like
+    # one already kept.
+    duplicates, kept_by_visit = [], {}
+    for frame in frames:
+        row = frame["row"]
+        key = (row["camera"], row["visit_group"], frame["names"])
+        dhash = int(row["dhash"], 16)
+        kept = kept_by_visit.setdefault(key, [])
+        if row["visit_group"] and any(hamming(k, dhash) <= dup_threshold for k in kept):
+            duplicates.append(frame)
+        else:
+            kept.append(dhash)
+    candidates = [f for f in frames if not f["corrected"]]
+    by_bucket: dict[tuple, list] = {}
+    for frame in candidates:
+        for bucket in frame["buckets"]:
+            by_bucket.setdefault(bucket, []).append(frame)   # oldest first
+
+    retired_ids: set[str] = set()
+    retired = freed = 0
+
+    def try_retire(frame) -> bool:
+        nonlocal total, retired, freed
+        row = frame["row"]
+        if row["sample_id"] in retired_ids or frame["corrected"]:
+            return False
+        if any(counts[b] <= keep_min for b in frame["buckets"]):
+            return False
+        _retire(conn, out_root, row["sample_id"], row["image_relpath"])
+        retired_ids.add(row["sample_id"])
+        for bucket in frame["buckets"]:
+            counts[bucket] -= 1
+        total -= int(row["jpeg_bytes"])
+        freed += int(row["jpeg_bytes"])
+        retired += 1
+        return True
+
+    for frame in duplicates:
+        if total <= budget_bytes:
+            return retired, freed
+        try_retire(frame)
+    while total > budget_bytes:
+        open_buckets = [b for b, fs in by_bucket.items() if fs and counts[b] > keep_min]
+        if not open_buckets:
+            break           # everything left is protected; enforce_budget reports it
+        bucket = max(open_buckets, key=lambda b: counts[b])
+        frame = by_bucket[bucket].pop(0)
+        try_retire(frame)
+    return retired, freed
 
 
 def enforce_budget(conn: sqlite3.Connection, out_root: Path, budget_bytes: int,
-                   min_per_camera_day: int = 2) -> tuple[int, int]:
-    """Evict replaceable review candidates until the image store fits.
+                   min_per_camera_day: int = 2, reviewed_budget_bytes: int = 0,
+                   keep_min_reviewed: int = 20) -> tuple[int, int]:
+    """Keep the image store within budget.
 
-    Only status=unreviewed and protected=0 rows are replaceable. The per-day
-    reserve is soft: it is evicted only after every non-reserved candidate, so
-    the hard byte limit still holds. Reviewed/versioned/protected rows are a
-    hard boundary and cause BudgetExceeded instead of silent deletion.
+    First, reviewed frames above ``reviewed_budget_bytes`` (0 = no separate
+    limit) are thinned (``thin_reviewed``). Then unreviewed candidates are
+    evicted until everything fits: only status=unreviewed and protected=0 rows
+    are replaceable, and the per-day reserve is soft (evicted only after every
+    non-reserved candidate), so the hard byte limit still holds. What remains
+    protected is a hard boundary and causes BudgetExceeded instead of silent
+    deletion.
     """
-    raw_total = int(conn.execute("SELECT coalesce(sum(jpeg_bytes),0) FROM samples").fetchone()[0])
+    thinned = thinned_bytes = 0
+    if reviewed_budget_bytes > 0:
+        thinned, thinned_bytes = thin_reviewed(conn, out_root, reviewed_budget_bytes,
+                                               keep_min_reviewed)
+    deleted, freed = _evict_unreviewed(conn, out_root, budget_bytes, min_per_camera_day)
+    return thinned + deleted, thinned_bytes + freed
+
+
+def _evict_unreviewed(conn: sqlite3.Connection, out_root: Path, budget_bytes: int,
+                      min_per_camera_day: int) -> tuple[int, int]:
+    raw_total = int(conn.execute(
+        "SELECT coalesce(sum(jpeg_bytes),0) FROM samples WHERE status!='retired'").fetchone()[0])
     derived_bytes = derived_storage_bytes(out_root)
     total = raw_total + derived_bytes
     if total <= budget_bytes:
@@ -626,7 +782,7 @@ def enforce_budget(conn: sqlite3.Connection, out_root: Path, budget_bytes: int,
     if protected_bytes > budget_bytes:
         raise BudgetExceeded(
             f"protected/reviewed images use {protected_bytes} bytes, above budget {budget_bytes}; "
-            "increase --budget-gb or archive a dataset version elsewhere"
+            "set --reviewed-budget-gb below --budget-gb, or increase --budget-gb"
         )
 
     by_day: dict[tuple[str, int], list[sqlite3.Row]] = {}
@@ -704,8 +860,13 @@ def validate_collection_args(args) -> None:
         raise ValueError("--budget-gb must be finite and non-negative")
     if args.min_per_camera_day < 0:
         raise ValueError("--min-per-camera-day must be non-negative")
-    if not args.cameras:
-        raise ValueError("at least one non-empty --camera is required")
+    if not np.isfinite(args.reviewed_budget_gb) or args.reviewed_budget_gb < 0:
+        raise ValueError("--reviewed-budget-gb must be finite and non-negative")
+    if args.budget_gb > 0 and args.reviewed_budget_gb >= args.budget_gb:
+        raise ValueError("--reviewed-budget-gb must be below --budget-gb "
+                         "(the rest holds frames waiting for review)")
+    if args.keep_min_reviewed < 0:
+        raise ValueError("--keep-min-reviewed must be non-negative")
     invalid_tags = [tag for tag in args.tags if not TAG_RE.fullmatch(tag)]
     if invalid_tags:
         raise ValueError(
@@ -733,9 +894,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recordings", type=Path, default=Path("data/streamhub/recordings"))
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
     parser.add_argument("--out", type=Path, default=Path("data/yolo_dataset"))
-    parser.add_argument("--camera", action="append", dest="cameras", required=True)
-    parser.add_argument("--from", dest="from_time", required=True, help="UTC ISO timestamp or date")
-    parser.add_argument("--to", dest="to_time", required=True, help="exclusive UTC ISO timestamp or date")
+    parser.add_argument("--camera", action="append", dest="cameras", default=[],
+                        help="camera id(s), comma-separated or repeated (default: all in --config)")
+    parser.add_argument("--from", dest="from_time", default=None,
+                        help="ISO timestamp (UTC unless it has an offset, e.g. -04:00) or date")
+    parser.add_argument("--to", dest="to_time", default=None,
+                        help="exclusive end, same format as --from")
+    parser.add_argument("--days", type=float, default=None,
+                        help="instead of --from/--to: the last N days up to now")
     parser.add_argument("--candidate-interval-sec", type=float, default=5.0)
     parser.add_argument("--regular-interval-sec", type=float, default=300.0)
     parser.add_argument("--visit-gap-sec", type=float, default=90.0)
@@ -752,6 +918,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--budget-gb", type=float, default=5.0,
                         help="hard image budget in decimal GB (default: 5.0); 0 disables")
+    parser.add_argument("--reviewed-budget-gb", type=float, default=4.0,
+                        help="part of --budget-gb for reviewed frames; above it the least "
+                             "useful are retired (default: 4.0); 0 disables")
+    parser.add_argument("--keep-min-reviewed", type=int, default=20,
+                        help="never thin a (camera, cat name, month) below this many frames")
     parser.add_argument("--min-per-camera-day", type=int, default=2,
                         help="soft reserve of unreviewed images per camera/day")
     parser.add_argument("--report-json", type=Path,
@@ -785,6 +956,17 @@ def main(argv: list[str] | None = None) -> int:
         **metrics,
     }
     try:
+        if args.days is not None:
+            if args.from_time or args.to_time:
+                raise ValueError("pass either --days or --from/--to, not both")
+            if args.days <= 0:
+                raise ValueError("--days must be positive")
+            now = datetime.now(timezone.utc)
+            args.from_time = (now - timedelta(days=args.days)).isoformat(timespec="seconds")
+            args.to_time = now.isoformat(timespec="seconds")
+            report["from"], report["to"] = args.from_time, args.to_time
+        elif not (args.from_time and args.to_time):
+            raise ValueError("pass --days N, or both --from and --to")
         args.from_ms, args.to_ms = parse_utc(args.from_time), parse_utc(args.to_time)
         if args.to_ms <= args.from_ms:
             raise ValueError("--to must be after --from")
@@ -796,6 +978,9 @@ def main(argv: list[str] | None = None) -> int:
         report["cameras"] = args.cameras
         report["tags"] = args.tags
         configs = read_camera_config(args.config)
+        if not args.cameras:
+            args.cameras = list(configs)
+            report["cameras"] = args.cameras
         unknown = sorted(set(args.cameras) - set(configs))
         if unknown:
             raise ValueError(f"unknown camera(s): {', '.join(unknown)}")
@@ -828,6 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
                     n_evicted, n_freed = enforce_budget(
                         conn, args.out, int(args.budget_gb * 1_000_000_000),
                         args.min_per_camera_day,
+                        int(args.reviewed_budget_gb * 1_000_000_000), args.keep_min_reviewed,
                     )
                     metrics["evicted_images"] += n_evicted
                     metrics["evicted_bytes"] += n_freed
@@ -842,6 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
                 n_evicted, n_freed = enforce_budget(
                     conn, args.out, int(args.budget_gb * 1_000_000_000),
                     args.min_per_camera_day,
+                    int(args.reviewed_budget_gb * 1_000_000_000), args.keep_min_reviewed,
                 )
                 metrics["evicted_images"] += n_evicted
                 metrics["evicted_bytes"] += n_freed

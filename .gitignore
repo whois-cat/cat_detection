@@ -7,7 +7,7 @@ config.yaml
 # Credentials (e.g. secrets/streamhub.env).
 secrets/
 data/
-# Human labels (training.reviews also accepts this root-level location).
+# Human labels of the previous stack (legacy reviews.db).
 /reviews.db
 # Previous stack's local files (cameras.yaml carries RTSP credentials).
 cameras.yaml

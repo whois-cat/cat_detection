@@ -268,7 +268,7 @@ def evaluate_artifact(
         raise ValueError(
             f"model {model_path.name} has cat as class {cat_id}, the dataset as {dataset.cat_id}; "
             "models trained on the earlier single-class versions need retraining on a COCO-numbered "
-            "version (`just box-build`, then `just box-train`)"
+            "version (`just detector-build`, then `just detector-train`)"
         )
     official_started = time.monotonic()
     validation = model.val(
