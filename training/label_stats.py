@@ -9,56 +9,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from training.reviews import resolve_reviews_db
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DROP_LABELS = ("discard", "unknown")
 # Matches train_classifier.py's --min-score default: boxes below this YOLO score
 # are filtered out by iter_frames before reviews are joined, so a reviewed crop
 # under it is never seen by training.
 TRAIN_MIN_SCORE_DEFAULT = 0.7
-
-
-def _has_reviews_table(path: Path) -> bool:
-    if not path.exists() or path.name.endswith(("-wal", "-shm")):
-        return False
-    conn = sqlite3.connect(str(path))
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reviews'"
-        ).fetchone()
-        return row is not None
-    except sqlite3.DatabaseError:
-        return False
-    finally:
-        conn.close()
-
-
-def resolve_reviews_db(requested: Path, *, search_roots: Iterable[Path] = ()) -> Path:
-    """Find the review DB, accepting both the canonical and old root location."""
-    candidates: list[Path] = []
-
-    def add(path: Path) -> None:
-        if path not in candidates:
-            candidates.append(path)
-
-    add(requested)
-    if not requested.is_absolute():
-        add(ROOT / requested)
-    for root in search_roots:
-        add(root / "reviews.db")
-        add(root / "data/review/reviews.db")
-    add(Path.cwd() / "reviews.db")
-    add(ROOT / "reviews.db")
-    add(ROOT / "data/review/reviews.db")
-
-    for candidate in candidates:
-        if _has_reviews_table(candidate):
-            return candidate
-
-    looked = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(
-        "reviews db not found. Looked for a SQLite DB with table 'reviews' in: "
-        f"{looked}"
-    )
 
 
 def parse_csv(raw: str | Iterable[str] | None) -> list[str]:
@@ -80,7 +38,7 @@ def parse_csv(raw: str | Iterable[str] | None) -> list[str]:
 
 def load_label_counts(reviews_db: Path) -> Counter[str]:
     if not reviews_db.exists():
-        raise FileNotFoundError(f"reviews db not found: {reviews_db}")
+        raise FileNotFoundError(f"no labels yet: {reviews_db} does not exist (`just cat-label` creates it)")
     conn = sqlite3.connect(str(reviews_db))
     try:
         try:

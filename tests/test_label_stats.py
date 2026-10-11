@@ -2,6 +2,8 @@ import json
 import sqlite3
 import subprocess
 import sys
+
+import pytest
 from collections import Counter
 
 import training.label_stats as label_stats
@@ -133,26 +135,16 @@ def test_summarize_counts_shows_missing_and_dropped_labels():
     assert "missing labels: ellie" in report
 
 
-def test_resolve_reviews_db_falls_back_to_root_reviews_db(tmp_path):
-    db = tmp_path / "reviews.db"
-    conn = sqlite3.connect(str(db))
-    try:
-        conn.execute(
-            """CREATE TABLE reviews (
-                   src_event_key INTEGER PRIMARY KEY,
-                   label TEXT NOT NULL
-               )"""
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    found = resolve_reviews_db(
-        tmp_path / "data/review/reviews.db",
-        search_roots=[tmp_path],
-    )
-
-    assert found == db
+def test_resolve_reviews_db_ignores_other_review_dbs(tmp_path, monkeypatch):
+    # A stray old reviews.db next to the requested path must not stand in for it.
+    stray = tmp_path / "reviews.db"
+    sqlite3.connect(str(stray)).execute(
+        "CREATE TABLE reviews (src_event_key INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+    monkeypatch.chdir(tmp_path)
+    requested = tmp_path / "data/review/reviews.db"
+    assert resolve_reviews_db(requested) == requested
+    with pytest.raises(FileNotFoundError, match="no labels yet"):
+        load_label_counts(resolve_reviews_db(requested))
 
 
 def test_label_stats_import_does_not_require_av():

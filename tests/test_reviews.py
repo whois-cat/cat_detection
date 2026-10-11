@@ -3,7 +3,7 @@ import sqlite3
 from training.reviews import load_review_rows, load_reviews, resolve_reviews_db
 
 
-def test_load_reviews_falls_back_to_cwd_reviews_db(tmp_path, monkeypatch):
+def test_load_reviews_reads_only_the_requested_db(tmp_path, monkeypatch):
     db = tmp_path / "reviews.db"
     conn = sqlite3.connect(str(db))
     try:
@@ -22,13 +22,14 @@ def test_load_reviews_falls_back_to_cwd_reviews_db(tmp_path, monkeypatch):
         conn.close()
 
     monkeypatch.chdir(tmp_path)
-    # Don't let the checkout's own data/review/reviews.db win the lookup.
     import training.reviews
     monkeypatch.setattr(training.reviews, "ROOT", tmp_path / "repo")
 
-    assert resolve_reviews_db("data/review/reviews.db") == db
-    assert load_reviews("data/review/reviews.db") == {10: "alisa", 11: "discard"}
-    rows = load_review_rows("data/review/reviews.db")
+    # The cwd's reviews.db is not data/review/reviews.db: no fallback to it.
+    assert load_reviews("data/review/reviews.db") == {}
+    assert resolve_reviews_db("reviews.db").resolve() == db.resolve()
+    assert load_reviews(db) == {10: "alisa", 11: "discard"}
+    rows = load_review_rows(db)
     assert rows[10].label == "alisa"
     assert rows[10].duplicate_group_id is None
     assert rows[10].suspicious_score == 0.0

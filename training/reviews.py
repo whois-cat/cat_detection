@@ -26,23 +26,12 @@ class ReviewRow:
 
 
 def resolve_reviews_db(reviews_db: Path | str) -> Path:
-    """Resolve review DB path, accepting the canonical and root-level layouts."""
+    """The review DB at exactly this path (a relative one may also be taken from
+    the repo root). No fallback to other locations: a stray old reviews.db must
+    never stand in for the one being labelled."""
     requested = Path(reviews_db)
-    candidates: list[Path] = []
-
-    def add(path: Path) -> None:
-        if path not in candidates:
-            candidates.append(path)
-
-    add(requested)
-    if not requested.is_absolute():
-        add(ROOT / requested)
-    add(Path.cwd() / "reviews.db")
-    add(ROOT / "reviews.db")
-    add(ROOT / "data/review/reviews.db")
-    for path in candidates:
-        if path.exists():
-            return path
+    if not requested.is_absolute() and not requested.exists():
+        return ROOT / requested
     return requested
 
 
