@@ -38,7 +38,12 @@ def parse_csv(raw: str | Iterable[str] | None) -> list[str]:
 
 def load_label_counts(reviews_db: Path) -> Counter[str]:
     if not reviews_db.exists():
-        raise FileNotFoundError(f"no labels yet: {reviews_db} does not exist (`just cat-label` creates it)")
+        raise FileNotFoundError(
+            f"No cat labels yet ({reviews_db} does not exist).\n"
+            "To label cats:\n"
+            "  1. just cat-groups   # group the verified cat boxes from box-sync\n"
+            "  2. just cat-label    # name the cat in each group in the browser (port 8095)\n"
+            "  3. just cat-stats    # then check the counts here")
     conn = sqlite3.connect(str(reviews_db))
     try:
         try:
@@ -374,7 +379,10 @@ def main() -> None:
     args = ap.parse_args()
 
     reviews_db = resolve_reviews_db(args.reviews_db)
-    counts = load_label_counts(reviews_db)
+    try:
+        counts = load_label_counts(reviews_db)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from None
     summary = summarize_counts(
         counts,
         expected_labels=parse_csv(args.labels),

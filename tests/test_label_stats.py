@@ -143,7 +143,7 @@ def test_resolve_reviews_db_ignores_other_review_dbs(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     requested = tmp_path / "data/review/reviews.db"
     assert resolve_reviews_db(requested) == requested
-    with pytest.raises(FileNotFoundError, match="no labels yet"):
+    with pytest.raises(FileNotFoundError, match="No cat labels yet"):
         load_label_counts(resolve_reviews_db(requested))
 
 
