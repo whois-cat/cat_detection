@@ -1,5 +1,5 @@
 """The OpenVINO parity gate judges recall at the runtime confidence threshold."""
-from training.yolo_export import quality_gate
+from training.yolo_export import gate_summary, quality_gate
 
 
 def _result(*, official_recall, fixed_recall, fp, map50_95=0.88):
@@ -34,3 +34,11 @@ def test_map_drop_and_extra_false_positives_still_fail():
     assert not _gate(base, _result(official_recall=0.97, fixed_recall=0.97, fp=4,
                                    map50_95=0.85))["passed"]
     assert not _gate(base, _result(official_recall=0.97, fixed_recall=0.97, fp=5))["passed"]
+
+
+def test_summary_names_the_failing_check():
+    base = _result(official_recall=0.97, fixed_recall=0.97, fp=4)
+    cand = _result(official_recall=0.97, fixed_recall=0.97, fp=7)
+    lines = gate_summary(base, cand, _gate(base, cand))
+    failed = [line for line in lines if "FAIL" in line]
+    assert len(failed) == 1 and "false positives 4 -> 7" in failed[0]

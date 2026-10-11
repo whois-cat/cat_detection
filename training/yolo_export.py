@@ -71,6 +71,31 @@ def quality_gate(baseline: dict[str, Any], candidate: dict[str, Any], *,
     }
 
 
+def gate_summary(baseline: dict[str, Any], candidate: dict[str, Any],
+                 gate: dict[str, Any]) -> list[str]:
+    """One line per gate check, .pt -> export, so a FAIL says what failed."""
+    base = baseline["fixed_confidence"]["overall"]
+    cand = candidate["fixed_confidence"]["overall"]
+    checks, limits = gate["checks"], gate["limits"]
+
+    def mark(check: str) -> str:
+        return "ok  " if checks[check] else "FAIL"
+
+    def num(value: Any) -> str:
+        return f"{value:.4f}" if isinstance(value, (int, float)) else "n/a"
+
+    return [
+        f"  {mark('map50_95_drop_within_limit')} mAP50-95 "
+        f"{num(baseline['official'].get('map50_95'))} -> {num(candidate['official'].get('map50_95'))}"
+        f" (may drop {limits['max_map50_95_drop']})",
+        f"  {mark('recall_drop_within_limit')} recall {num(base['recall'])} -> {num(cand['recall'])}"
+        f" (may drop {limits['max_recall_drop']})",
+        f"  {mark('false_positive_increase_within_limit')} false positives {base['fp']} -> {cand['fp']}"
+        f" (may grow {limits['max_fixed_confidence_fp_increase']})",
+        f"       missed cats {base['fn']} -> {cand['fn']}",
+    ]
+
+
 def _default_report(source: Path) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return source.resolve().parent / f"openvino-export-{stamp}.json"
@@ -165,7 +190,8 @@ def main(argv: list[str] | None = None) -> int:
             report = session.finish("completed")
             print_report_summary(report)
             print(f"OpenVINO parity gate: {'PASS' if gate['passed'] else 'FAIL'}")
-            print("Runtime model was not changed.")
+            for line in gate_summary(baseline, candidate, gate):
+                print(line)
             return 0 if gate["passed"] else 2
     except (KeyboardInterrupt, InterruptedError) as exc:
         print_report_summary(session.finish("interrupted", error=exc))

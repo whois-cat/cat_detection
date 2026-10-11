@@ -119,11 +119,14 @@ def export_detector(checkpoint: Path, out_dir: Path) -> None:
     work.mkdir()
     source = work / checkpoint.name
     shutil.copy2(checkpoint, source)
+    # The report outlives the temp dir, so a failed gate can still be read.
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    report = checkpoint.parents[2] / "yolo-reports" / f"export-{checkpoint.parents[1].name}-{stamp}.json"
     cmd = [sys.executable, "-m", "training.yolo_export",
            "--dataset", str(_training_dataset(checkpoint)), "--model", str(source),
-           "--int8", "--report", str(work / "report.json")]
+           "--int8", "--report", str(report)]
     if subprocess.run(cmd, cwd=ROOT).returncode != 0:
-        raise RuntimeError(f"detector export failed its quality gate (see {work / 'report.json'})")
+        raise RuntimeError(f"detector export failed its quality gate (see {report})")
     # Keep Ultralytics' *_openvino_model name: it recognises OpenVINO by it.
     shutil.move(str(work / f"{source.stem}_int8_openvino_model"), out_dir)
     source.unlink()
