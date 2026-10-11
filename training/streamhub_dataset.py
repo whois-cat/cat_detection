@@ -551,6 +551,9 @@ def collect_segment(args, conn: sqlite3.Connection, out_root: Path, seg: Segment
             saved += int(wrote)
             if wrote:
                 state.last_saved_hash = image_hash
+    if not seg.path.exists():
+        conn.rollback()
+        raise FileNotFoundError(f"recording deleted while scanning: {seg.relpath}")
     if segment_source_fingerprint(seg) != source_fingerprint:
         conn.rollback()
         raise RuntimeError(f"recording or labels changed while scanning {seg.relpath}; retry")
@@ -945,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
         "derived_bytes": 0,
         "managed_bytes": 0,
         "source_missing": 0,
+        "segments_vanished": 0,
     }
     report = {
         "schema": 1,
@@ -1003,9 +1007,16 @@ def main(argv: list[str] | None = None) -> int:
                 _log(f"no segments matched; check that these camera dirs exist: {searched}")
             last_log = time.monotonic()
             for index, seg in enumerate(segments, 1):
-                n_decoded, n_saved = collect_segment(
-                    args, conn, args.out, seg, states[seg.camera], configs[seg.camera]
-                )
+                try:
+                    n_decoded, n_saved = collect_segment(
+                        args, conn, args.out, seg, states[seg.camera], configs[seg.camera]
+                    )
+                except FileNotFoundError:
+                    # The pruner may delete a segment between listing and reading.
+                    conn.rollback()
+                    metrics["segments_vanished"] += 1
+                    _log(f"[{index}/{len(segments)}] {seg.relpath} deleted meanwhile (pruner), skipped")
+                    continue
                 metrics["decoded_frames"] += n_decoded
                 metrics["new_images"] += n_saved
                 metrics["segments"] += int(n_decoded > 0)
@@ -1066,7 +1077,8 @@ def main(argv: list[str] | None = None) -> int:
             f"evicted_bytes={metrics['evicted_bytes']} "
             f"catalog_images={metrics['catalog_images']} catalog_bytes={metrics['catalog_bytes']} "
             f"derived_bytes={metrics['derived_bytes']} managed_bytes={metrics['managed_bytes']} "
-            f"source_missing={metrics['source_missing']} elapsed_sec={report['elapsed_sec']:.3f}"
+            f"source_missing={metrics['source_missing']} "
+            f"segments_vanished={metrics['segments_vanished']} elapsed_sec={report['elapsed_sec']:.3f}"
         )
     return return_code
 

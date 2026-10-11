@@ -366,6 +366,27 @@ def test_main_records_interruption(tmp_path: Path, monkeypatch):
     assert json.loads(report_path.read_text())["status"] == "interrupted"
 
 
+def test_main_skips_a_segment_the_pruner_deleted_meanwhile(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("cameras:\n  - id: black\n    cv: {}\n")
+    report_path = tmp_path / "collector.json"
+    gone = Segment(path=tmp_path / "recordings/black/gone.mp4", camera="black",
+                   relpath="black/gone.mp4", start_ms=0, duration_ms=12_000)
+    monkeypatch.setattr(dataset_module, "iter_segments", lambda *_a, **_k: iter([gone, gone]))
+    result = main([
+        "--recordings", str(tmp_path / "recordings"),
+        "--config", str(config),
+        "--out", str(tmp_path / "dataset"),
+        "--from", "2026-10-08T00:00:00Z",
+        "--to", "2026-10-08T01:00:00Z",
+        "--report-json", str(report_path),
+    ])
+    assert result == 0
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "completed"
+    assert report["segments_vanished"] == 2
+
+
 def _reviewed(conn, root: Path, sid: str, *, wall_ms: int, name: str | None = "ellie",
               dhash: str = "0" * 16, visit: str = "v1", corrected: bool = False,
               camera: str = "black") -> None:
