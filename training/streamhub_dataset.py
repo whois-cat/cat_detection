@@ -332,6 +332,14 @@ def segment_source_fingerprint(seg: Segment) -> str:
     ).hexdigest()
 
 
+def threads_arg(value: str) -> int | str:
+    if value == "all":
+        return value
+    if value.isdigit() and int(value) > 0:
+        return int(value)
+    raise argparse.ArgumentTypeError("a number of cores (1, 2, ...) or 'all'")
+
+
 def selection_fingerprint(args, cv_config: dict) -> str:
     """Identify every input that can change selection or saved image bytes."""
     payload = {
@@ -502,8 +510,15 @@ def collect_segment(args, conn: sqlite3.Connection, out_root: Path, seg: Segment
     detect_roi = cv_config.get("detect_roi")
     decoded = saved = 0
     next_pts: int | None = None
+    # Without a single detection in the sidecar only keyframes are decoded:
+    # enough for the periodic and visual-change samples, and many times faster.
+    quiet = not args.full_decode and not any(row.get("dets") for row in predictions)
     with av.open(str(seg.path)) as container:
         stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        stream.thread_count = 0 if args.threads == "all" else args.threads   # 0: FFmpeg picks all
+        if quiet:
+            stream.codec_context.skip_frame = "NONKEY"
         for frame in container.decode(stream):
             if frame.pts is None:
                 continue
@@ -906,6 +921,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--days", type=float, default=None,
                         help="instead of --from/--to: the last N days up to now")
     parser.add_argument("--candidate-interval-sec", type=float, default=5.0)
+    parser.add_argument("--full-decode", action="store_true",
+                        help="decode every frame even of segments without detections (slow)")
+    parser.add_argument("--threads", type=threads_arg, default="all",
+                        help="CPU cores for video decoding: a number, or 'all' (default)")
     parser.add_argument("--regular-interval-sec", type=float, default=300.0)
     parser.add_argument("--visit-gap-sec", type=float, default=90.0)
     parser.add_argument("--visit-sample-interval-sec", type=float, default=20.0)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import pytest
 
 import training.streamhub_dataset as dataset_module
 from training.streamhub_dataset import (
+    CLOCK_RATE,
     CameraState,
     BudgetExceeded,
     Segment,
@@ -114,6 +116,8 @@ def test_catalog_keeps_predictions_separate_from_samples(tmp_path: Path):
 def _collector_args(**overrides):
     values = {
         "candidate_interval_sec": 5.0,
+        "full_decode": False,
+        "threads": "all",
         "regular_interval_sec": 300.0,
         "visit_gap_sec": 90.0,
         "visit_sample_interval_sec": 20.0,
@@ -385,6 +389,52 @@ def test_main_skips_a_segment_the_pruner_deleted_meanwhile(tmp_path: Path, monke
     report = json.loads(report_path.read_text())
     assert report["status"] == "completed"
     assert report["segments_vanished"] == 2
+
+
+def _write_video(path: Path, frames: int = 45, gop: int = 15) -> None:
+    import av
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("libx264", rate=15)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        stream.codec_context.gop_size = gop
+        stream.codec_context.time_base = Fraction(1, CLOCK_RATE)
+        for i in range(frames):
+            frame = av.VideoFrame.from_ndarray(np.full((48, 64, 3), i * 5, np.uint8), format="rgb24")
+            frame.pts = i * CLOCK_RATE // 15
+            frame.time_base = Fraction(1, CLOCK_RATE)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+@pytest.mark.parametrize("dets, full, expected", [
+    ([], False, "keyframes"),
+    ([{"box": [0.1, 0.1, 0.2, 0.2], "score": 0.9}], False, "all"),
+    ([], True, "all"),
+])
+@pytest.mark.parametrize("threads", ["all", 1])
+def test_segments_without_detections_decode_only_keyframes(tmp_path: Path, dets, full, expected,
+                                                           threads):
+    seg = Segment(camera="black", path=tmp_path / "rec/black/s.mp4", relpath="black/s.mp4",
+                  start_ms=0, duration_ms=3_000)
+    _write_video(seg.path)
+    seg.sidecar.write_text(json.dumps({"t": "cv", "pts": 0, "dets": dets}) + "\n")
+    conn = open_catalog(tmp_path / "catalog.sqlite3")
+    args = _collector_args(full_decode=full, threads=threads, from_ms=0, to_ms=10_000)
+    decoded, _saved = collect_segment(args, conn, tmp_path, seg, CameraState(), {})
+    assert (decoded < 45) == (expected == "keyframes")
+    conn.close()
+
+
+def test_threads_option_takes_a_count_or_all():
+    from training.streamhub_dataset import threads_arg
+    assert threads_arg("all") == "all"
+    assert threads_arg("2") == 2
+    for bad in ("0", "-1", "two"):
+        with pytest.raises(Exception, match="or 'all'"):
+            threads_arg(bad)
 
 
 def _reviewed(conn, root: Path, sid: str, *, wall_ms: int, name: str | None = "ellie",
