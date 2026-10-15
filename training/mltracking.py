@@ -152,6 +152,10 @@ def start_run(experiment: str, *, run_name: str | None = None,
         return _NoopRun()
     try:
         uri = resolve_tracking_uri()
+        if uri.startswith("file:"):
+            # MLflow 3 refuses the file store unless opted in; the compose UI
+            # (mlflow 2.x, --backend-store-uri file:/mlflow) reads only that.
+            os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
         mlflow.set_tracking_uri(uri)
         mlflow.set_experiment(experiment)
         run = mlflow.start_run(run_name=run_name, nested=nested)
