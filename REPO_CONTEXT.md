@@ -189,9 +189,13 @@ just classifier-compare \
   --candidate current=models/classifier/current \
   --candidate new=models/trained/<stamp>/cat_classifier.pt \
   --baseline current \
+  --test-of models/trained/<stamp> \
   --thresholds 0.7,0.8,0.9 \
   --out reports/classifier_compare.json
 ```
+
+`--test-of` keeps only the boxes in that run's test split. Without it the
+candidate is scored mostly on its own training boxes and wins unfairly.
 
 Useful checks:
 

@@ -208,8 +208,10 @@ classifier-train *ARGS:
 
 # Example:
 #   just classifier-compare --candidate current=models/classifier/current \
-#                           --candidate new=models/trained/<run>/cat_classifier.pt --baseline current
-# Compare candidate classifiers on the same named boxes.
+#                           --candidate new=models/trained/<run>/cat_classifier.pt --baseline current \
+#                           --test-of models/trained/<run>
+# Compare candidate classifiers on the same named boxes (--test-of: only the
+# boxes that run never trained on, else it wins on its own training data).
 [group('classifier')]
 classifier-compare *ARGS:
     {{CLASSIFIER_RUN}} python -m training.compare_classifiers \

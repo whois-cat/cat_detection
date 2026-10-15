@@ -54,6 +54,7 @@ from training.augment import (
     resize_short_for,
     save_augmentation_preview,
 )
+from training.catalog_crops import TEST_CROPS_FILE
 from training.mltracking import start_run
 
 log = logging.getLogger("training.train_classifier")
@@ -64,6 +65,12 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 DROP_LABELS = {"discard", "unknown"}
+
+
+def held_out_keys(metas: list, test_idx) -> list[int]:
+    """Catalog crop keys of the test split (the run never trained on them)."""
+    return sorted({metas[i].rowid for i in test_idx if metas[i].rowid is not None})
+
 
 @dataclass(frozen=True)
 class Meta:
@@ -1121,6 +1128,8 @@ def main() -> None:
     )
     check_split_leakage(episodes, train_idx, val_idx, test_idx)
     raw_split_sizes = (len(train_idx), len(val_idx), len(test_idx))
+    # Whole held-out episodes (before per-episode sampling): never trained on.
+    test_keys = held_out_keys(fresh_metas, test_idx)
     train_idx = sample_indices_for_training(
         train_idx,
         episodes,
@@ -1575,6 +1584,10 @@ def main() -> None:
     torch.save({"state_dict": model.state_dict(),
                 "class_names": classes,
                 "num_classes": len(classes)}, pt_path)
+    if args.catalog is not None and test_keys:
+        # `classifier-compare --test-of <run>` scores every model on these only.
+        (out_dir / TEST_CROPS_FILE).write_text(
+            json.dumps({"catalog_crop_keys": test_keys}), encoding="utf-8")
     meta = {
         "created": stamp,
         "class_names": classes,

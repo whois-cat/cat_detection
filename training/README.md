@@ -322,9 +322,14 @@ just classifier-compare \
     --candidate current=/opt/models/cat_classifier_openvino \
     --candidate new=models/trained/<stamp>/cat_classifier.pt \
     --baseline current \
+    --test-of models/trained/<stamp> \
     --thresholds 0.7,0.8,0.9 \
     --out reports/classifier_compare.json
 ```
+
+`--test-of` scores both only on the boxes that run kept out of training (its
+test split, recorded as `test_crops.json` in the run dir); otherwise the
+candidate is mostly scored on its own training boxes.
 
 The script decodes crops from recordings in memory and trusts only
 `reviews.db`. The conservative deploy signal is: candidate macro/min recall does

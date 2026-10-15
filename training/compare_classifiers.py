@@ -5,7 +5,11 @@ Examples:
     uv run python -m training.compare_classifiers \
         --catalog data/yolo_dataset/catalog.sqlite3 \
         --candidate current=models/classifier/current \
-        --candidate new=models/trained/20260612-120000/cat_classifier.pt
+        --candidate new=models/trained/20260612-120000/cat_classifier.pt \
+        --test-of models/trained/20260612-120000
+
+``--test-of <run>`` scores every candidate only on that run's held-out test
+crops: the other named boxes trained it, so on them it would win unfairly.
 
 The evaluator trusts only human labels: the cat names picked in Label Studio
 (catalog), or reviews.db for the legacy --db source. It decodes crops in
@@ -183,6 +187,18 @@ def verdict(results: dict, baseline: str | None, threshold_key: str) -> dict:
     return out
 
 
+def held_out_keys(run: Path) -> set[int]:
+    """Catalog crop keys a training run kept out of training (its test split)."""
+    from training.catalog_crops import TEST_CROPS_FILE
+    run_dir = run.parent if run.is_file() else run
+    path = run_dir / TEST_CROPS_FILE
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} not found: --test-of needs a run trained from the catalog with a "
+            "test split (just classifier-train) after held-out crops were recorded")
+    return set(json.loads(path.read_text(encoding="utf-8"))["catalog_crop_keys"])
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--catalog", type=Path, default=None,
@@ -208,11 +224,16 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--thresholds", default="0.5,0.7,0.8,0.9")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--test-of", type=Path, default=None, metavar="RUN",
+                    help="only the test crops of this training run (models/trained/<run>), "
+                         "which it never trained on; needed for a fair comparison")
     args = ap.parse_args()
     if args.catalog is None and (args.db is None or args.recordings is None):
         ap.error("pass --catalog, or the legacy --db + --recordings")
     if args.catalog is None and args.reviews_db is None:
         ap.error("the legacy --db source needs --reviews-db")
+    if args.test_of is not None and args.catalog is None:
+        ap.error("--test-of works with --catalog only")
 
     from training import CropSource, CropUnavailable, load_reviews
     from training.replay import load_replay_set
@@ -237,9 +258,12 @@ def main() -> None:
     primary_pred: dict[str, list[Prediction]] = {name: [] for name, _model in candidates}
     if args.catalog is not None:
         from training.catalog_crops import load_catalog_crops, read_catalog_crop
+        only = held_out_keys(args.test_of) if args.test_of is not None else None
         for crop in load_catalog_crops(args.catalog, camera=args.camera):
             label = crop.name     # picked in Label Studio
             if label is None or label in DROP_LABELS:
+                continue
+            if only is not None and crop.key not in only:
                 continue
             try:
                 image = read_catalog_crop(args.catalog.parent, crop.image_relpath,
@@ -292,6 +316,7 @@ def main() -> None:
         "n": len(primary_true),
         "classes": sorted(set(primary_true)),
         "baseline": args.baseline,
+        "test_of": str(args.test_of) if args.test_of else None,
         "results": results,
         "replay_n": len(replay_true),
         "replay_classes": sorted(set(replay_true)),
@@ -299,7 +324,9 @@ def main() -> None:
         "verdict": verdict(results, args.baseline, threshold_key),
     }
 
-    print(f"primary reviewed crops: n={len(primary_true)} classes={sorted(set(primary_true))}")
+    scope = f"held-out test crops of {args.test_of}" if args.test_of else "all named crops"
+    print(f"primary reviewed crops ({scope}): n={len(primary_true)} "
+          f"classes={sorted(set(primary_true))}")
     for name, m in results.items():
         print(
             f"{name}: n={m['n']} acc={m['accuracy']:.3f} "

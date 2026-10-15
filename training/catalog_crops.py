@@ -28,6 +28,8 @@ from .db import Box
 from .sources import CropUnavailable, _pad_crop
 
 CAT_CLASS = "cat"
+# Written into a classifier run dir: crop keys of its test split (never trained on).
+TEST_CROPS_FILE = "test_crops.json"
 
 
 def crop_key(sample_id: str, annotation_id: int) -> int:
