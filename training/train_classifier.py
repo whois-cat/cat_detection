@@ -800,6 +800,24 @@ def configure_finetune(model, *, head_only: bool, full_finetune: bool):
     return trainable, mode, n_trainable, n_frozen
 
 
+def freeze_frozen_batchnorm(model) -> int:
+    """Keep BatchNorm layers whose weights are frozen in eval mode while training.
+
+    model.train() would otherwise keep updating their running statistics from the
+    (augmented, small) training batches while their weights stay fixed; the drift
+    compounds layer by layer and the model is right in train mode but wrong in
+    eval mode — what runtime uses. Returns the number of layers frozen."""
+    import torch.nn as nn
+    frozen = 0
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            params = list(module.parameters())
+            if params and not any(p.requires_grad for p in params):
+                module.eval()
+                frozen += 1
+    return frozen
+
+
 # ------------------------------------------------------------------- main -----
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1497,6 +1515,7 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        freeze_frozen_batchnorm(model)
         running = 0.0
         seen = 0
         batch_rng = random.Random(args.seed + epoch)
