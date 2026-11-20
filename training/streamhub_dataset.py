@@ -491,6 +491,21 @@ def write_sample(
     return True
 
 
+def decode_frames(container, stream) -> Iterator["av.VideoFrame"]:
+    """Decode a stream packet by packet, skipping packets FFmpeg rejects.
+
+    A recording can hold a damaged packet (camera glitch, interrupted write);
+    the frames around it are still good, so one bad packet must not cost the
+    segment, let alone the whole collection run.
+    """
+    for packet in container.demux(stream):
+        try:
+            frames = packet.decode()
+        except av.error.InvalidDataError:
+            continue
+        yield from frames
+
+
 def collect_segment(args, conn: sqlite3.Connection, out_root: Path, seg: Segment,
                     state: CameraState, cv_config: dict) -> tuple[int, int]:
     stat = seg.path.stat()
@@ -519,7 +534,7 @@ def collect_segment(args, conn: sqlite3.Connection, out_root: Path, seg: Segment
         stream.thread_count = 0 if args.threads == "all" else args.threads   # 0: FFmpeg picks all
         if quiet:
             stream.codec_context.skip_frame = "NONKEY"
-        for frame in container.decode(stream):
+        for frame in decode_frames(container, stream):
             if frame.pts is None:
                 continue
             decoded += 1
@@ -968,6 +983,7 @@ def main(argv: list[str] | None = None) -> int:
         "managed_bytes": 0,
         "source_missing": 0,
         "segments_vanished": 0,
+        "segments_unreadable": 0,
     }
     report = {
         "schema": 1,
@@ -1036,6 +1052,13 @@ def main(argv: list[str] | None = None) -> int:
                     metrics["segments_vanished"] += 1
                     _log(f"[{index}/{len(segments)}] {seg.relpath} deleted meanwhile (pruner), skipped")
                     continue
+                except av.error.FFmpegError as exc:
+                    # A segment FFmpeg cannot read at all (damaged container):
+                    # skip it rather than abort the run.
+                    conn.rollback()
+                    metrics["segments_unreadable"] += 1
+                    _log(f"[{index}/{len(segments)}] {seg.relpath} unreadable ({exc}), skipped")
+                    continue
                 metrics["decoded_frames"] += n_decoded
                 metrics["new_images"] += n_saved
                 metrics["segments"] += int(n_decoded > 0)
@@ -1097,7 +1120,8 @@ def main(argv: list[str] | None = None) -> int:
             f"catalog_images={metrics['catalog_images']} catalog_bytes={metrics['catalog_bytes']} "
             f"derived_bytes={metrics['derived_bytes']} managed_bytes={metrics['managed_bytes']} "
             f"source_missing={metrics['source_missing']} "
-            f"segments_vanished={metrics['segments_vanished']} elapsed_sec={report['elapsed_sec']:.3f}"
+            f"segments_vanished={metrics['segments_vanished']} "
+            f"segments_unreadable={metrics['segments_unreadable']} elapsed_sec={report['elapsed_sec']:.3f}"
         )
     return return_code
 

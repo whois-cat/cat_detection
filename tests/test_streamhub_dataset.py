@@ -391,6 +391,49 @@ def test_main_skips_a_segment_the_pruner_deleted_meanwhile(tmp_path: Path, monke
     assert report["segments_vanished"] == 2
 
 
+def test_decode_frames_skips_a_damaged_packet_and_keeps_the_rest():
+    import av
+    from training.streamhub_dataset import decode_frames
+
+    class Packet:
+        def __init__(self, frames=(), bad=False):
+            self.frames, self.bad = list(frames), bad
+
+        def decode(self):
+            if self.bad:
+                raise av.error.InvalidDataError(1094995529, "Invalid data found when processing input")
+            return self.frames
+
+    class Container:
+        def demux(self, _stream):
+            return iter([Packet(["f1"]), Packet(bad=True), Packet(["f2", "f3"])])
+
+    assert list(decode_frames(Container(), None)) == ["f1", "f2", "f3"]
+
+
+def test_main_skips_an_unreadable_segment(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("cameras:\n  - id: black\n    cv: {}\n")
+    report_path = tmp_path / "collector.json"
+    broken = Segment(path=tmp_path / "recordings/black/broken.mp4", camera="black",
+                     relpath="black/broken.mp4", start_ms=0, duration_ms=12_000)
+    broken.path.parent.mkdir(parents=True)
+    broken.path.write_bytes(b"\x00garbage, not a video" * 64)
+    monkeypatch.setattr(dataset_module, "iter_segments", lambda *_a, **_k: iter([broken]))
+    result = main([
+        "--recordings", str(tmp_path / "recordings"),
+        "--config", str(config),
+        "--out", str(tmp_path / "dataset"),
+        "--from", "1970-01-01T00:00:00Z",
+        "--to", "1970-01-01T01:00:00Z",
+        "--report-json", str(report_path),
+    ])
+    assert result == 0
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "completed"
+    assert report["segments_unreadable"] == 1
+
+
 def _write_video(path: Path, frames: int = 45, gop: int = 15) -> None:
     import av
     path.parent.mkdir(parents=True, exist_ok=True)
