@@ -22,6 +22,7 @@ from training.yolo_label_studio import (
     image_url,
     prediction_results,
     sample_task,
+    stale_tasks,
 )
 
 
@@ -212,3 +213,14 @@ def test_push_message_says_what_waits():
     assert "40 frames" in text and "12 new" in text and "5 need a look" in text
     assert text.endswith("http://ls/projects/1/data")
     assert "nothing" in push_message({"waiting": 0, "pushed": 0, "needs_a_look": 0}, "x")
+
+
+def test_unlabelled_tasks_of_frames_gone_from_the_catalog_are_stale():
+    tasks = [
+        {"id": 1, "data": {"sample_id": "live"}},
+        {"id": 2, "data": {"sample_id": "evicted"}},                          # budget deleted it
+        {"id": 3, "data": {"sample_id": "evicted-but-labelled"}, "total_annotations": 1},
+        {"id": 4, "data": {}},                                                # not ours
+    ]
+    assert [t["id"] for t in stale_tasks(tasks, {"live"})] == [2]
+    assert stale_tasks(tasks, set()) == []        # empty/wrong catalog deletes nothing

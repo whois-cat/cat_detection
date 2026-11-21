@@ -310,6 +310,21 @@ def _is_labelled(task: dict) -> bool:
     return bool(task.get("total_annotations") or task.get("annotations"))
 
 
+def stale_tasks(tasks: Iterable[dict], live_ids: set[str]) -> list[dict]:
+    """Unlabelled tasks whose frame is gone from the catalog.
+
+    The collector's storage budget deletes unreviewed frames (image and row),
+    including ones already pushed; their tasks would only show a broken image.
+    Labelled tasks are kept as the review history, tasks without a sample_id
+    are not ours, and an empty catalog (wrong path?) removes nothing."""
+    if not live_ids:
+        return []
+    return [task for task in tasks
+            if not _is_labelled(task)
+            and task["data"].get("sample_id") is not None
+            and task["data"]["sample_id"] not in live_ids]
+
+
 def _suggestion_version(task: dict) -> str | None:
     predictions = task.get("predictions") or []
     return predictions[-1].get("model_version") if predictions else None
@@ -346,8 +361,15 @@ def push(url: str, api_key: str, catalog: Path, names: Iterable[str],
     try:
         pending = _pending_tasks(conn, names)
         unnamed = _unnamed_tasks(conn, names)
+        live_ids = {row[0] for row in conn.execute(
+            "SELECT sample_id FROM samples WHERE status!='retired'")}
     finally:
         conn.close()
+
+    stale = stale_tasks(existing.values(), live_ids)
+    for old in stale:
+        project.make_request("DELETE", f"/api/tasks/{old['id']}")
+        existing.pop(old["data"].get("sample_id"), None)
 
     replace: list[dict] = []    # existing tasks to delete before re-importing
     fresh: list[dict] = []
@@ -394,6 +416,7 @@ def push(url: str, api_key: str, catalog: Path, names: Iterable[str],
     waiting = [t for t in project.get_tasks(only_ids=False) if not _is_labelled(t)]
     result = {
         "project_id": project.id, "pushed": len(fresh), "replaced": len(replace),
+        "removed_stale": len(stale),
         "reprioritised": reprioritised, "reopened": reopened,
         "waiting": len(waiting),
         "needs_a_look": sum(1 for t in waiting
