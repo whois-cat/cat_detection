@@ -23,6 +23,7 @@ from training.yolo_label_studio import (
     prediction_results,
     sample_task,
     stale_tasks,
+    prediction_score,
 )
 
 
@@ -224,3 +225,35 @@ def test_unlabelled_tasks_of_frames_gone_from_the_catalog_are_stale():
     ]
     assert [t["id"] for t in stale_tasks(tasks, {"live"})] == [2]
     assert stale_tasks(tasks, set()) == []        # empty/wrong catalog deletes nothing
+
+
+def test_prediction_score_is_the_least_confident_box_or_name():
+    dets = [{"box": [0.1, 0.1, 0.2, 0.2], "score": 0.92, "cats": {"ellie": 0.81, "alisa": 0.19}},
+            {"box": [0.5, 0.5, 0.2, 0.2], "score": 0.40}]
+    results = prediction_results(dets, NAMES)
+    assert [r.get("score") for r in results] == [0.92, 0.81, 0.40]
+    assert prediction_score(results) == 0.40
+    task = sample_task({"sample_id": "s", "camera": "black", "wall_ms": 1,
+                        "image_relpath": "images/black/s.jpg"}, dets, NAMES)
+    assert task["predictions"][0]["score"] == 0.40
+
+
+def test_frame_without_scored_boxes_has_no_prediction_score():
+    task = sample_task({"sample_id": "s", "camera": "black", "wall_ms": 1,
+                        "image_relpath": "images/black/s.jpg"}, [])
+    assert "score" not in task["predictions"][0]
+    assert prediction_score(prediction_results([{"box": [0.1, 0.1, 0.2, 0.2]}])) is None
+
+
+def test_task_columns_let_the_data_manager_filter_by_suggested_cat():
+    dets = [{"box": [0.1, 0.1, 0.2, 0.2], "score": 0.92, "cats": {"ellie": 0.81, "alisa": 0.19}},
+            {"box": [0.5, 0.5, 0.2, 0.2], "score": 0.40, "cats": {"alisa": 0.97}}]
+    task = sample_task({"sample_id": "s", "camera": "grey", "wall_ms": 1_795_199_814_454,
+                        "image_relpath": "images/grey/s.jpg"}, dets, NAMES)
+    data = task["data"]
+    assert data["cats"] == "alisa,ellie"
+    assert data["name_score"] == 0.81 and data["box_score"] == 0.4
+    assert data["time"].startswith("2026-11-2")
+    empty = sample_task({"sample_id": "e", "camera": "grey", "wall_ms": 1,
+                         "image_relpath": "images/grey/e.jpg"}, [], NAMES)["data"]
+    assert empty["cats"] == "" and empty["name_score"] is None and empty["box_score"] is None

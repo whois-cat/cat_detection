@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,7 +36,9 @@ NAME_CONTROL = "cat_name"
 UNKNOWN_NAME = "unknown"       # a cat, but not sure which one: not trained on
 PROJECT_TITLE = "cat-detection YOLO boxes"
 # Tasks whose suggestion is older than this are refreshed while still unlabelled.
-MODEL_VERSION = "boxes+names"
+# Bumped when suggestions change shape: unlabelled tasks holding an older
+# version are re-imported on the next push ("+score": Prediction score column).
+MODEL_VERSION = "boxes+names+score"
 # A suggested name below this classifier probability puts the frame up front.
 NAME_UNSURE_BELOW = 0.8
 # Must sit under LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT in docker-compose.label.yml;
@@ -108,17 +111,60 @@ def prediction_results(dets: Iterable[dict], names: Iterable[str] = ()) -> list[
         region_id = f"r{len(results)}"
         geometry = {"x": max(0.0, x * 100), "y": max(0.0, y * 100),
                     "width": w * 100, "height": h * 100, "rotation": 0}
-        results.append({
+        rect = {
             "id": region_id, "from_name": "label", "to_name": "image",
             "type": "rectanglelabels", "value": {**geometry, "rectanglelabels": [LABEL_NAME]},
-        })
+        }
+        box_score = _score(det.get("score"))
+        if box_score is not None:
+            rect["score"] = box_score
+        results.append(rect)
         suggestion = suggested_name(det.get("cats"), names)
         if suggestion is not None:
             results.append({
                 "id": region_id, "from_name": NAME_CONTROL, "to_name": "image",
                 "type": "choices", "value": {**geometry, "choices": [suggestion[0]]},
+                "score": suggestion[1],
             })
     return results
+
+
+def _score(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def local_time(wall_ms: int) -> str:
+    """Readable frame time (this machine's timezone); sorts like wall_ms."""
+    return datetime.fromtimestamp(int(wall_ms) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def suggestion_columns(results: Iterable[dict]) -> dict:
+    """Task columns to filter/sort the suggestions by in the Data Manager:
+    the suggested names (``cats``, comma-separated, empty when none) and the
+    least confident name probability / detector score (None when absent)."""
+    results = list(results)
+    names = sorted({r["value"]["choices"][0] for r in results if r.get("from_name") == NAME_CONTROL})
+    name_scores = [r["score"] for r in results
+                   if r.get("from_name") == NAME_CONTROL and r.get("score") is not None]
+    box_scores = [r["score"] for r in results
+                  if r.get("type") == "rectanglelabels" and r.get("score") is not None]
+    return {
+        "cats": ",".join(names),
+        "name_score": round(min(name_scores), 3) if name_scores else None,
+        "box_score": round(min(box_scores), 3) if box_scores else None,
+    }
+
+
+def prediction_score(results: Iterable[dict]) -> float | None:
+    """Label Studio's per-task Prediction score: the least confident part of
+    the suggestion (any box's detector score or name probability), so sorting
+    it ascending puts the frames the models are least sure about first. None
+    when nothing is scored (e.g. an empty frame)."""
+    scores = [r["score"] for r in results if r.get("score") is not None]
+    return min(scores) if scores else None
 
 
 # Review order: frames the models are most likely wrong about first. Lower =
@@ -167,12 +213,18 @@ def sample_task(sample: dict, dets: Iterable[dict], names: Iterable[str] = (),
             "sample_id": sample["sample_id"],
             "camera": sample["camera"],
             "wall_ms": sample["wall_ms"],
+            "time": local_time(sample["wall_ms"]),
             "reasons": ",".join(reasons),
             "priority": task_priority(reasons),
         }
     }
     results = prediction_results(dets, names)
-    task["predictions"] = [{"model_version": MODEL_VERSION, "result": results}]
+    task["data"].update(suggestion_columns(results))
+    prediction: dict[str, Any] = {"model_version": MODEL_VERSION, "result": results}
+    score = prediction_score(results)
+    if score is not None:
+        prediction["score"] = score
+    task["predictions"] = [prediction]
     return task
 
 
