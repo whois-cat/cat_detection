@@ -455,6 +455,15 @@ class DangerousConfusion:
     reason: str = ""
 
 
+def resolve_device(device: str) -> str:
+    """``auto`` -> "cuda" when torch sees a GPU, else "cpu"; anything else is
+    used as given (cpu, cuda, cuda:1, mps)."""
+    if device != "auto":
+        return device
+    import torch
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def load_dangerous_confusions(path: Path) -> list[DangerousConfusion]:
     """Load dangerous confusion pairs from a YAML or JSON file. Accepts either a
     top-level list or a mapping with a ``dangerous_confusions`` key:
@@ -895,6 +904,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help=argparse.SUPPRESS)
     ap.add_argument("--torch-threads", type=int, default=min(4, os.cpu_count() or 1),
                     help="limit PyTorch CPU worker threads; set 0 to leave default")
+    ap.add_argument("--device", default="auto",
+                    help="auto (default: cuda when torch sees a GPU, else cpu), cpu, cuda, cuda:1")
     ap.add_argument("--lr", type=float, default=None, help="default 1e-3 head / 1e-4 full")
     ap.add_argument("--init-from", type=Path, default=None,
                     help="optional previous cat_classifier.pt checkpoint to fine-tune from")
@@ -1403,6 +1414,7 @@ def main() -> None:
                 if batch is None:
                     continue
                 x, y, batch_kept = batch
+                x, y = x.to(device), y.to(device)
                 logits = model(x)
                 batch_means.append((float(criterion_report(logits, y)), x.size(0)))
                 y_true.extend(y.tolist())
@@ -1414,7 +1426,9 @@ def main() -> None:
     counts = np.bincount([cls_to_idx[metas[j].label] for j in train_idx],
                          minlength=len(classes)).astype(np.float64)
     weights = len(train_idx) / (len(classes) * np.maximum(counts, 1))
-    ce_weight = torch.tensor(weights, dtype=torch.float32)
+    device = resolve_device(args.device)
+    log.info("device: %s", device)
+    ce_weight = torch.tensor(weights, dtype=torch.float32, device=device)
     log.info("train per-class counts: %s", dict(zip(classes, counts.astype(int))))
 
     # --- model: EfficientNet-B0 (ImageNet), new head ---
@@ -1438,6 +1452,7 @@ def main() -> None:
 
     if args.head_only and args.full_finetune:
         raise SystemExit("--head-only and --full-finetune are mutually exclusive")
+    model.to(device)
     params, finetune_mode, n_trainable, n_frozen = configure_finetune(
         model, head_only=args.head_only, full_finetune=args.full_finetune,
     )
@@ -1525,6 +1540,7 @@ def main() -> None:
             if batch is None:
                 continue
             x, y, _ = batch
+            x, y = x.to(device), y.to(device)
             optim.zero_grad()
             out = model(x)
             loss = criterion(out, y)          # weighted — drives gradients (unchanged)
@@ -1559,7 +1575,7 @@ def main() -> None:
                     (abs(macro - best["macro_recall"]) <= 1e-6 and cross < best["cross"]))
         if improved:
             best.update(macro_recall=macro, cross=cross, epoch=epoch,
-                        state={k: v.clone() for k, v in model.state_dict().items()})
+                        state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
             since_improved = 0
         else:
             since_improved += 1
@@ -1600,7 +1616,8 @@ def main() -> None:
     out_dir = args.out_root / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
     pt_path = out_dir / "cat_classifier.pt"
-    torch.save({"state_dict": model.state_dict(),
+    # CPU tensors: the checkpoint must load (export, --init-from) without a GPU.
+    torch.save({"state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                 "class_names": classes,
                 "num_classes": len(classes)}, pt_path)
     if args.catalog is not None and test_keys:
@@ -1631,7 +1648,7 @@ def main() -> None:
         "keep_suspicious_per_episode": args.keep_suspicious_per_episode,
         "init_from": str(args.init_from) if args.init_from else None,
         "full_finetune": args.full_finetune, "head_only": args.head_only,
-        "finetune_mode": finetune_mode, "best_epoch": best["epoch"],
+        "finetune_mode": finetune_mode, "best_epoch": best["epoch"], "device": device,
         "val_metrics": metrics, "test_metrics": test_metrics,
         "counts_train": dict(zip(classes, counts.astype(int).tolist())),
     }

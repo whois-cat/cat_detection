@@ -21,6 +21,7 @@ from training.yolo_common import (
     link_or_copy,
     load_dataset,
     print_report_summary,
+    resolve_device,
     sha256_file,
     ultralytics_data_yaml,
     validate_training_weights,
@@ -271,7 +272,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto",
+                        help="auto (default: GPU 0 when CUDA is available, else cpu), cpu, 0, ...")
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=15)
@@ -285,6 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.device = resolve_device(args.device)
     code, _report = train(
         dataset_path=args.dataset, weights_path=args.weights,
         replay_paths=args.replay_versions or [],

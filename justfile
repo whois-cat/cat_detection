@@ -7,7 +7,11 @@ COMPOSE := "docker compose"
 # torch + openvino + av (the cv-worker image has them).
 CLUSTER_SERVICE := env_var_or_default("CLUSTER_SERVICE", "cv-worker")
 TRAINING_RUN := "uv run --project training"
-CLASSIFIER_RUN := TRAINING_RUN + " --extra classifier"
+# Torch build for training: cpu (default) or gpu (CUDA; set TRAINING_TORCH=gpu in
+# .env on the NVIDIA box). Training then runs on the GPU when torch sees one.
+training_torch := env_var_or_default("TRAINING_TORCH", "cpu")
+TORCH_EXTRA := " --extra " + training_torch
+CLASSIFIER_RUN := TRAINING_RUN + " --extra classifier" + TORCH_EXTRA
 
 # Shared path/label defaults (override via the matching env var).
 yolo_recordings := env_var_or_default("YOLO_RECORDINGS", "data/streamhub/recordings")
@@ -21,7 +25,7 @@ cat_pad_frac := env_var_or_default("CLASSIFIER_PAD_FRAC", "0.05")
 journal_db  := env_var_or_default("FEED_JOURNAL_DB",  "data/decider/feed_journal/journal.db")
 streamhub_port := env_var_or_default("STREAMHUB_PORT", "8096")
 YOLO_RUN       := TRAINING_RUN
-YOLO_TRAIN_RUN := TRAINING_RUN + " --extra yolo"
+YOLO_TRAIN_RUN := TRAINING_RUN + " --extra yolo" + TORCH_EXTRA
 YOLO_LABEL_RUN := TRAINING_RUN + " --extra label"
 LABEL_COMPOSE  := COMPOSE + " -f docker-compose.label.yml"
 # One-off command in the cv-worker image (torch + openvino + ultralytics, the
@@ -97,7 +101,7 @@ setup TARGET="all":
     fi
     if [ "{{TARGET}}" != label ]; then
         {{CLASSIFIER_RUN}} \
-            python -c "import av, cv2, numpy, torch, torchvision; print('train deps ok')"
+            python -c "import av, cv2, numpy, torch, torchvision; print('train deps ok: torch', torch.__version__, 'cuda', torch.cuda.is_available())"
     fi
 
 # ─────────────── detector: where the cats are (and who) ───────────────

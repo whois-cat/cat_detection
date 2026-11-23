@@ -24,10 +24,11 @@ from training.yolo_common import (
     convert_termination_to_interrupt,
     load_dataset,
     print_report_summary,
-    ultralytics_data_yaml,
+    resolve_device,
     resolve_model_cat_id,
     sample_subsets,
     sha256_tree,
+    ultralytics_data_yaml,
 )
 
 
@@ -309,7 +310,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto",
+                        help="auto (default: GPU 0 when CUDA is available, else cpu), cpu, 0, ...")
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--conf", type=float, default=0.25, help="fixed-confidence operational pass")
     parser.add_argument("--iou", type=float, default=0.5, help="NMS and TP matching IoU")
@@ -319,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.device = resolve_device(args.device)
     preparation_started = time.monotonic()
     dataset = load_dataset(args.dataset, require_splits=("test",))
     model_path = validate_model_artifact(args.model)

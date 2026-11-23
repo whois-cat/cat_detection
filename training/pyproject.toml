@@ -20,30 +20,43 @@ dependencies = [
 # psutil lets the YOLO run report measure job-vs-system CPU/RAM honestly;
 # yolo_common degrades gracefully to self peak RSS when it is absent.
 yolo       = ["ultralytics", "psutil"]
-# train_classifier.py needs only torch + torchvision. On Linux, uv is configured
-# below to resolve both from PyTorch's CPU-only wheel index so it does not pull
-# nvidia-* CUDA runtime wheels on machines without a GPU.
+# train_classifier.py needs only torch + torchvision (from `cpu` or `gpu`, below).
+classifier = ["scikit-learn", "mlflow>=2.14"]
+# Which torch build: exactly one of these, chosen by the justfile from
+# TRAINING_TORCH (default cpu; `gpu` on the NVIDIA training box). On Linux `cpu`
+# comes from PyTorch's CPU-only index, so machines without a GPU do not pull the
+# nvidia-* CUDA runtime wheels; `gpu` comes from the CUDA 12.4 index. On macOS
+# both resolve to the PyPI wheels.
 #
-# Pin a KNOWN-GOOD compatible pair (matches the project's main .venv). Without a
-# pin, uv grabs the latest torch; during a release window the matching
-# torchvision macOS/arm64 wheel may not be on PyPI yet, so uv falls back to the
-# Linux-only CPU-index build (e.g. torchvision==X+<hash>) which has no macOS
-# wheel and the install fails. torch 2.5.1 / torchvision 0.20.1 ship both
-# macOS-arm64 (PyPI) and Linux CPU-index wheels.
-classifier = ["torch==2.5.1", "torchvision==0.20.1", "scikit-learn", "mlflow>=2.14"]
+# Pin a KNOWN-GOOD compatible pair. Without a pin, uv grabs the latest torch;
+# during a release window the matching torchvision macOS/arm64 wheel may not be
+# on PyPI yet and the install fails. torch 2.5.1 / torchvision 0.20.1 ship
+# macOS-arm64 (PyPI), Linux CPU-index and Linux CUDA-index wheels.
+cpu = ["torch==2.5.1", "torchvision==0.20.1"]
+gpu = ["torch==2.5.1", "torchvision==0.20.1"]
 # Drive Label Studio for box + cat-name review (push frames, pull labels). The legacy
 # SDK Client API is what training.yolo_label_studio uses.
 label      = ["label-studio-sdk<1"]
 
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]
+
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cpu", marker = "platform_system == 'Linux'" },
+    { index = "pytorch-cpu", extra = "cpu", marker = "platform_system == 'Linux'" },
+    { index = "pytorch-cu124", extra = "gpu", marker = "platform_system == 'Linux'" },
 ]
 torchvision = [
-    { index = "pytorch-cpu", marker = "platform_system == 'Linux'" },
+    { index = "pytorch-cpu", extra = "cpu", marker = "platform_system == 'Linux'" },
+    { index = "pytorch-cu124", extra = "gpu", marker = "platform_system == 'Linux'" },
 ]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true

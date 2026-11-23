@@ -37,6 +37,18 @@ LIFECYCLE_FILES = (
 )
 
 
+def resolve_device(device: str) -> str:
+    """``auto`` -> the first CUDA GPU ("0") when torch sees one, else "cpu";
+    any other value (cpu, 0, 0,1, mps, ...) is passed through unchanged."""
+    if device != "auto":
+        return device
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    return "0" if torch.cuda.is_available() else "cpu"
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 

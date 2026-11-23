@@ -221,9 +221,20 @@ trainable params, and trainable/frozen param counts are logged at startup):
 
 `just classifier-train` runs through the training uv project with the classifier
 extra, so `numpy`, `av`, `torch`, and `torchvision` are installed by uv instead
-of being manually added to the system Python. On Linux, `torch` and
-`torchvision` are resolved from PyTorch's CPU-only wheel index; CUDA /
-`nvidia-*` wheels are not needed for this project.
+of being manually added to the system Python.
+
+Two torch builds, picked by `TRAINING_TORCH` in `.env` (for `classifier-*` and
+`detector-train/eval`):
+
+- `cpu` (default): on Linux from PyTorch's CPU-only index, no CUDA /
+  `nvidia-*` wheels. For the server that runs the stack and for laptops.
+- `gpu`: CUDA 12.4 build (needs an NVIDIA driver that supports CUDA 12.4). Set
+  `TRAINING_TORCH=gpu` on the training box. `--device auto` (the default for
+  `classifier-train`, `detector-train` and `detector-eval`) then trains on the
+  GPU whenever torch sees one, and on the CPU otherwise.
+
+Check which one is active: `just setup train` prints the torch build and
+whether CUDA is available.
 
 The trainer is CPU/server friendly by default: cold-start training indexes only
 human-reviewed trainable crop refs, not the whole detector pool, and decodes
