@@ -487,6 +487,19 @@ def load_dangerous_confusions(path: Path) -> list[DangerousConfusion]:
     return out
 
 
+def unique_dangerous(pairs: list[DangerousConfusion]) -> list[DangerousConfusion]:
+    """Each (actual, predicted) direction once — `--confuse` and the YAML file
+    may name the same pair, which would otherwise be reported and counted twice."""
+    seen: set[tuple[str, str]] = set()
+    out: list[DangerousConfusion] = []
+    for pair in pairs:
+        key = (pair.actual, pair.predicted)
+        if key not in seen:
+            seen.add(key)
+            out.append(pair)
+    return out
+
+
 def dangerous_from_confuse(confuse) -> list[DangerousConfusion]:
     """Back-compat: treat a `--confuse a,b` pair as dangerous in BOTH directions."""
     cs = sorted(c for c in confuse if c)
@@ -1008,6 +1021,7 @@ def main() -> None:
     dangerous = dangerous_from_confuse(confuse)
     if args.dangerous_confusions:
         dangerous += load_dangerous_confusions(args.dangerous_confusions)
+    dangerous = unique_dangerous(dangerous)
     if dangerous:
         log.info("dangerous confusions configured: %s",
                  ", ".join(f"{d.actual}->{d.predicted}" for d in dangerous))
@@ -1728,7 +1742,7 @@ def main() -> None:
         # Only when dangerous confusions were actually configured.
         if dangerous:
             (out_dir / "dangerous_confusions.json").write_text(json.dumps({
-                "configured": [{"actual": d.actual, "predicted": d.predicted, "action": d.action}
+                "configured": [{"actual": d.actual, "predicted": d.predicted, "reason": d.reason}
                                for d in dangerous],
                 "val": metrics.get("dangerous_confusions", []),
                 "test": (test_metrics or {}).get("dangerous_confusions", []),

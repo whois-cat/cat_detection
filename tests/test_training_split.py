@@ -280,3 +280,14 @@ def test_per_camera_and_per_group_breakdowns():
     # No metadata → empty, no crash.
     assert per_camera_confusion(y_true, y_pred, classes, []) == {}
     assert per_group_accuracy(y_true, y_pred, []) == {}
+
+
+def test_dangerous_pairs_from_confuse_and_yaml_are_counted_once():
+    from training.train_classifier import DangerousConfusion, unique_dangerous
+    pairs = dangerous_from_confuse(["felisis", "ellie"]) + [
+        DangerousConfusion(predicted="ellie", actual="felisis", reason="feeder1"),
+        DangerousConfusion(predicted="alisa", actual="felisis"),
+    ]
+    out = [(d.actual, d.predicted) for d in unique_dangerous(pairs)]
+    assert sorted(out) == [("ellie", "felisis"), ("felisis", "alisa"), ("felisis", "ellie")]
+    assert len(out) == 3
